@@ -1,0 +1,10 @@
+# src/peers/templates/modes/implement/mode.yaml
+name: implement
+version: 1
+description: |
+  End-to-end feature implementation from a markdown PLAN.md with
+  reviewer-only checkoffs, frozen contracts (acceptance.sh / e2e.sh /
+  PLAN.original.md), per-step traceability, 3-class coverage delta,
+  and tamper-evident contracts. Standalone in v1 (not composable with
+  audit/security/thorough). See docs/MODES_IMPLEMENT.md.
+requires: []

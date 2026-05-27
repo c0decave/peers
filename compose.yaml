@@ -1,0 +1,24 @@
+services:
+  peers:
+    build:
+      context: .
+      dockerfile: Containerfile
+    # Map the host user into the container so bind-mounts are
+    # readable/writeable without juggling build-time UID/GID args.
+    # Equivalent to `podman run --userns=keep-id`.
+    userns_mode: "keep-id"
+    volumes:
+      # Mount the TARGET project at /work. Default: cwd.
+      # Override:  TARGET=/path/to/target-project podman compose up
+      - ${TARGET:-./}:/work
+      - ${HOME:?HOME must be set}/.claude:/home/peer/.claude
+      - ${HOME:?HOME must be set}/.codex:/home/peer/.codex
+      - peer-cache:/home/peer/.cache
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    stdin_open: true
+    tty: true
+volumes:
+  peer-cache:

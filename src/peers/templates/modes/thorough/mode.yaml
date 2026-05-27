@@ -1,0 +1,5 @@
+# src/peers/templates/modes/thorough/mode.yaml
+name: thorough
+version: 1
+description: "Anti-convergence-theater: HARD-gate on N consecutive clean ticks + skeptic-pass + aggressive-honesty soft goals"
+requires: []

@@ -1,0 +1,551 @@
+# src/peers/templates/modes/implement/goals.yaml
+#
+# Schicht-1 hard gates for implement-mode (Task 2.8).
+#
+# Seven implement-mode-specific gates wired to checks/ in this mode dir
+# (auto-discovered by `peers run-check`), plus three reused audit-mode
+# gates (no-prior-regression, lint-clean, tests-pass) referenced via the
+# same cmd strings as audit/goals.yaml to keep operator semantics stable.
+#
+# Budget: 12h max_runtime_s (vs audit's 6h) -- implement-mode has more
+# surface (per-step commit ↔ PLAN.md round-trips, frozen contracts,
+# 3-class coverage per step). Override per-project via .peers/config.yaml.
+
+budget:
+  max_runtime_s: 43200    # 12h
+  max_iterations: 200
+
+goals:
+  # ---- Implement-mode-specific gates (Schicht 1, Tasks 2.1–2.7) ----
+
+  - id: plan-checklist-empty
+    type: hard
+    description: |
+      PLAN.md has no open `- [ ]` step items. The implementation is by
+      definition incomplete while any step remains unchecked; the loop
+      must not claim success.
+    cmd: "python3 -m peers.cli run-check plan_checklist_empty"
+    pass_when: "exit_code == 0"
+
+  - id: acceptance-pass
+    type: hard
+    description: |
+      Frozen `.peers/contracts/acceptance.sh` exits 0. Contract SHA is
+      verified before execution so a peer cannot tamper with the script
+      to short-circuit the gate.
+    cmd: "python3 -m peers.cli run-check acceptance_pass"
+    pass_when: "exit_code == 0"
+
+  - id: e2e-pass
+    type: hard
+    description: |
+      Conditional: only projects whose plan declares a UI surface
+      (`surfaces: [web|gui|...]`) carry an `e2e.sh` contract. Skipped
+      (exit 0) when `.peers/contracts/e2e.sh` is absent. When present,
+      SHA-verified, then executed; non-zero exit fails the gate.
+    cmd: "python3 -m peers.cli run-check e2e_pass"
+    pass_when: "exit_code == 0"
+
+  - id: plan-step-traceable
+    type: hard
+    description: |
+      Every checked `- [x]` step in PLAN.md carries a trailing `(SHA)`
+      annotation that resolves to a real commit, and (when the step
+      declares `- touches:`) the commit's changed files intersect that
+      list. Grounds the "done" claim in git history, not vibes.
+    cmd: "python3 -m peers.cli run-check plan_step_traceable"
+    pass_when: "exit_code == 0"
+
+  - id: plan-original-preserved
+    type: hard
+    description: |
+      Every STEP-N from the frozen `.peers/PLAN.original.md` still
+      appears in the live PLAN.md. Additions are allowed; silent
+      removals/renames (scope-drop) are rejected.
+    cmd: "python3 -m peers.cli run-check plan_original_preserved"
+    pass_when: "exit_code == 0"
+
+  - id: coverage-3class-delta
+    type: hard
+    description: |
+      Per-step 3-class coverage gate: every checked step's commit must
+      add at least one happy + edge + sad test (classification via the
+      same KIND_RE vocabulary as audit-mode's whole-tree coverage_3class).
+      Steps without commit_sha are deferred to plan-step-traceable.
+    cmd: "python3 -m peers.cli run-check coverage_3class_delta"
+    pass_when: "exit_code == 0"
+
+  - id: contracts-unchanged
+    type: hard
+    description: |
+      Frozen contracts in `.peers/contracts/` (acceptance.sh, optional
+      e2e.sh) and `.peers/PLAN.original.md` match the sha256 fingerprints
+      recorded in `.peers/contracts.sha` at project init. Tamper-evident
+      anchor against peers rewriting acceptance to make it trivially pass.
+    cmd: "python3 -m peers.cli run-check contracts_unchanged"
+    pass_when: "exit_code == 0"
+
+  - id: checkoff-by-other-peer
+    type: hard
+    description: |
+      Schicht-2 anti-cheat backup for the `pre-commit-reviewer-checkoff`
+      hook (Task 3.1). Scans git log post-hoc: for every `[x]` step in
+      PLAN.md with declared `touches:`, verifies the commit that toggled
+      it from `[ ]` to `[x]` was authored by a different peer than the
+      last commit modifying each touched file. Catches violations from
+      PRE-EXISTING commits the hook never saw (e.g. hook not installed
+      at the time, or commits imported from elsewhere).
+    cmd: "python3 -m peers.cli run-check checkoff_by_other_peer"
+    pass_when: "exit_code == 0"
+
+  - id: delivery-report-complete
+    type: hard
+    description: |
+      Schicht-3 convergence anchor: verifies DELIVERY.md exists and maps
+      every PLAN.md step (regardless of state) to a structured entry
+      with `**Commit:**`, `**Tests:**`, and `**Justification:**` fields.
+      Commit values `PENDING` and `BLOCKED` are allowed as Schicht-4
+      escape valves; SHA validity is enforced by plan-step-traceable,
+      not here. Forces the peers to produce a human-readable closeout
+      report before they can claim convergence.
+    cmd: "python3 -m peers.cli run-check delivery_report_complete"
+    pass_when: "exit_code == 0"
+
+  - id: no-shortcut-markers
+    type: hard
+    description: |
+      Schicht-5 cleanliness gate. Forbids TODO / FIXME / XXX / HACK /
+      PLACEHOLDER / STUB and concrete-class `raise NotImplementedError`
+      anywhere under `src/`. Abstract / Protocol bases are exempted via
+      AST inspection. Legitimate escapes require BOTH a
+      `# JUSTIFIED: <reason>` annotation on the offending line AND a
+      reviewer-signed entry in `.peers/justifications.log` (hash-chained
+      audit trail; see peers_ctl.justifications). Catches the failure
+      mode where the loop leaves half-finished placeholders behind as
+      long as acceptance happens to pass.
+    cmd: "python3 -m peers.cli run-check no_shortcut_markers"
+    pass_when: "exit_code == 0"
+
+  - id: no-empty-bodies
+    type: hard
+    description: |
+      Schicht-5 cleanliness gate (Task 5.3). AST-scans `src/` for
+      function / method / class bodies that are *just* `pass`, `...`,
+      or a lone docstring -- declared surfaces with no implementation.
+      Exempts `@abstractmethod`-decorated functions and members of
+      classes whose bases textually match `Protocol` / `ABC` / `ABCMeta`
+      (with or without `abc.` / `typing.` prefix). Closes the hole
+      where `no-shortcut-markers` is satisfied (no forbidden vocabulary)
+      but the body itself is structurally empty.
+    cmd: "python3 -m peers.cli run-check no_empty_bodies"
+    pass_when: "exit_code == 0"
+
+  - id: no-skipped-tests
+    type: hard
+    description: |
+      Schicht-5 cleanliness gate (Task 5.4). Scans `tests/` for skip
+      markers (`@pytest.mark.skip[if]`, `@unittest.skip[If|Unless]`,
+      `pytest.skip(...)` calls, `xit` / `xdescribe`) and rejects them
+      unless escaped via BOTH a `# SKIP-REASON: <text>` comment on the
+      line immediately above the marker AND a reviewer-signed entry
+      in `.peers/justifications.log` for the marker line (reuses the
+      Task 5.2 justifications infrastructure). Catches the cheapest
+      failure mode: skipping a failing test to make tests-pass go
+      green.
+    cmd: "python3 -m peers.cli run-check no_skipped_tests"
+    pass_when: "exit_code == 0"
+
+  - id: blind-review
+    type: hard
+    description: |
+      Schicht-6 honesty gate (Task 6.1). Verifies that the
+      implementer-peer's `IMPLEMENTATION_NOTES.md` AND the
+      reviewer-peer's `REVIEW_NOTES.md` both exist at the project
+      root and each contain >= 20 words. Optionally, if `CONCERNS.md`
+      is present and carries a literal `[BLIND-REVIEW-MISMATCH]`
+      marker (filed by either peer when independent descriptions
+      diverge from the actual tree), the gate fails. Structural-only
+      enforcement: the behavioural invariant ("reviewer did not read
+      IMPLEMENTATION_NOTES.md before writing REVIEW_NOTES.md") lives
+      in the Phase 0 prompt templates and cannot be checked post-hoc
+      from the filesystem.
+    cmd: "python3 -m peers.cli run-check blind_review"
+    pass_when: "exit_code == 0"
+
+  - id: concerns-resolved
+    type: hard
+    description: |
+      Schicht-6 honesty gate (Task 6.3). `CONCERNS.md` is the
+      structured pessimism log peers maintain across the run; each
+      entry is an `## Concern N -- <summary>` H2 block with a
+      `status:` line drawn from a closed vocabulary (`open` |
+      `addressed (commit: <sha>)` | `[USER-ACK] (reason: ...)`).
+      Fails when any `open` / missing / malformed status is found,
+      OR when `CONCERNS.md` is empty -- across a multi-tick implement
+      run, zero filed concerns is rubber-stamping, not perfection.
+      This gate is the convergence anchor; running it in other
+      contexts is a misuse of the gate. Also warns (still passes) when
+      every concern was raised at the same tick (batched pessimism).
+    cmd: "python3 -m peers.cli run-check concerns_resolved"
+    pass_when: "exit_code == 0"
+
+  - id: no-unresolved-blocks
+    type: hard
+    description: |
+      Schicht-4 escape-valve gate (Task 7.2). The implement-mode parser
+      recognises five step-state markers (Task 7.1): `[ ]` / `[x]` plus
+      `[PARTIAL]`, `[BLOCKED]`, `[BLOCKED-ACK]`. A `[BLOCKED]` step is
+      legitimate DURING a run (loop hit something it cannot finish on
+      its own: missing API key, external service down, upstream dep
+      unreleased) but must be resolved before convergence: either
+      flipped to `[x]` or explicitly acknowledged by the operator via
+      `peers-ctl ack-block` (Task 7.3), which rewrites the marker to
+      `[BLOCKED-ACK]`. This gate fails if any step is in bare `blocked`
+      state; `partial` / `open` are caught by `plan-checklist-empty`
+      and don't fail here.
+    cmd: "python3 -m peers.cli run-check no_unresolved_blocks"
+    pass_when: "exit_code == 0"
+
+  - id: honesty-audit
+    type: hard
+    description: |
+      Schicht-6 honesty gate (Task 6.4). Final convergence anchor: the
+      tick before the loop is allowed to declare `complete`, both peers
+      must answer three hard questions about the implementation in
+      `HONESTY_AUDIT.md` at the project root:
+        - `### Weakest part`         -- most fragile / under-thought part
+        - `### Likely uncaught bug`  -- failure mode the test suite misses
+        - `### Skipped or shortcut`  -- what was punted and why it was safe
+      Structural-only enforcement: requires >= 2 `## <peer>` H2 sections
+      (default peers `## claude` + `## codex`; extra peers like
+      `## gemini` are allowed and also validated), each containing all
+      three H3 subsections (case-insensitive matching), each with > 5
+      words of substantive prose. The behavioural half ("answers must
+      be honest, not boilerplate") is human-in-the-loop -- no post-hoc
+      filesystem check can prove a peer wasn't phoning it in.
+    cmd: "python3 -m peers.cli run-check honesty_audit"
+    pass_when: "exit_code == 0"
+
+  # ---- Soft cleanliness gates (Schicht 5, Task 5.5) ----
+  #
+  # Five advisory scanners that emit findings to stdout. Each is a
+  # cmd-based check under `checks/` but is registered here as a soft
+  # goal because the verdict is reviewer-judgement, not pass/fail:
+  # the reviewer peer runs the script via `peers run-check <name>`
+  # and decides whether each finding is a real omission or an
+  # intentional shape. The scripts themselves always exit 0; their
+  # value is the stdout listing.
+
+  - id: no-stub-returns-review
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check no_stub_returns` and review
+      the output. The scanner lists every function under `src/` whose
+      only body (after an optional docstring) is `return None`,
+      `return {}`, `return []`, `return ""`, `return 0`, or
+      `return False`. Abstract / Protocol surfaces are already
+      exempted. For each remaining finding, decide:
+
+        - Real omission -> file a Bug-Report ("STUB: <module>.<name>
+          declares a surface but returns a stub literal; PLAN.md
+          claims this step is done").
+        - Intentional placeholder for a follow-up step -> require
+          the implementer to either implement it or pull the step
+          out of the current PLAN.md.
+
+      Reply {"pass": bool, "notes": "stub-returns: N findings, M filed"}.
+
+  - id: no-commented-code-review
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check no_commented_code` and
+      review the output. The scanner flags runs of >3 consecutive
+      `#`-prefixed lines in `src/` whose comment bodies look like
+      Python source (contain `=`, `(`, `[`, `{`, or start with a
+      keyword like `def` / `import` / `return`). License headers and
+      short prose blocks are not flagged. For each finding:
+
+        - Dead code left behind -> demand deletion (git history
+          preserves it).
+        - False positive (prose that happens to contain `=` etc.)
+          -> note in the review and move on.
+
+      Reply {"pass": bool, "notes": "commented-code: N blocks, M filed"}.
+
+  - id: min-impl-size-per-step-review
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check min_impl_size_per_step`
+      and review the output. For every `[x]` step with a `(SHA)`
+      annotation, the scanner counts substantive added `src/` LOC
+      (excluding blank + comment-only lines) and warns when it's
+      below 10. Steps with `- trivial_step: true` (or `- trivial: true`)
+      in their PLAN.md entry are exempt. For each finding:
+
+        - Step is genuinely larger than the diff suggests because
+          most of the work landed in a *different* commit -> demand
+          the PLAN.md step's `(SHA)` annotation be corrected to point
+          at the commit that holds the actual implementation.
+        - Step is small because the work is small -> demand the step
+          carry `- trivial_step: true` so future audits don't re-warn.
+        - Step is small because the implementer punted -> file a
+          Bug-Report.
+
+      Reply {"pass": bool, "notes": "min-impl-size: N warnings, M filed"}.
+
+  - id: test-to-code-ratio-review
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check test_to_code_ratio` and
+      review the output. For every `[x]` step with a `(SHA)`
+      annotation, the scanner compares substantive added LOC under
+      `tests/` versus `src/` for that commit and warns when
+      `test_loc < 0.5 * src_loc`. Steps with `- pure_refactor: true`
+      are exempt; commits that add no `src` LOC at all are treated
+      as well-covered. For each finding:
+
+        - Under-tested -> demand additional tests or file a
+          Bug-Report covering the gap.
+        - Genuinely a pure refactor that was missed at PLAN time
+          -> demand the step carry `- pure_refactor: true`.
+
+      Reply {"pass": bool, "notes": "t2c-ratio: N warnings, M filed"}.
+
+  - id: no-mock-in-impl-review
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check no_mock_in_impl` and
+      review the output. The scanner AST-walks every `.py` file under
+      `src/` and lists imports of `unittest.mock`, `pytest_mock`,
+      or the standalone `mock` package. `tests/` is never scanned.
+      For each finding:
+
+        - Production code reaching for a mocking library is almost
+          always either left-over test scaffolding (move it to
+          `tests/`) or a fake dependency that should be a real
+          interface (file a Bug-Report).
+
+      Reply {"pass": bool, "notes": "mock-in-impl: N imports, M filed"}.
+
+  # ---- Phase 8 soft gates: Schicht 3 + Schicht 6 drift prevention ----
+  #
+  # Three advisory gates that target failure modes the earlier gates
+  # don't see: thin test-skepsis bookkeeping, architecture drift
+  # against the Phase 0 intent, and missing inter-step coherence
+  # reviews. All three exit 0 always; the reviewer peer reads the
+  # findings and acts via filed Bug-Reports.
+
+  - id: test-skeptic-review
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 3
+    prompt: |
+      Run `python3 -m peers.cli run-check test_skeptic_review` and
+      review the output. The reviewer is expected to keep
+      `TEST_SKEPSIS.md` at the project root with one entry per
+      recently-added test, each making a concrete claim of the form:
+
+        - tests/unit/test_foo.py::test_happy - if I remove line 42
+          from src/foo.py the test catches it because <concrete
+          assertion that would now fire>.
+
+      The scanner flags entries that:
+
+        - contain boilerplate phrases (`looks fine`, `looks good`,
+          `passes`, `lgtm`) -- the reviewer skimmed without thinking,
+        - lack any `src/...` or `line N` reference -- the entry does
+          not pin a concrete line,
+        - are < 10 words of substantive prose.
+
+      For each finding: demand the reviewer rewrite the entry with a
+      concrete failure-mode claim, or file a Bug-Report covering the
+      missing test coverage.
+
+      Reply {"pass": bool, "notes": "test-skeptic: N findings, M filed"}.
+
+  - id: architecture-coherent
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check architecture_coherent` and
+      review the output. The scanner compares
+      `ARCHITECTURE.actual.md` (regenerated at convergence) against
+      `ARCHITECTURE.intended.md` (frozen at Phase 0) and flags
+      either:
+
+        - structural divergence (>= 2 H2 headings differ between the
+          two files), or
+        - large body divergence (unified-diff ratio >= 0.5)
+
+      UNLESS PLAN.md contains a documented `## Architecture Amendment`
+      section or an `Architecture-Amendment:` footer line.
+
+      For each finding:
+
+        - Genuine drift -> demand the implementer either steer
+          `ARCHITECTURE.actual.md` back toward intended, or document
+          the change as an `## Architecture Amendment` block in
+          PLAN.md.
+        - Missing files (Phase 0 or convergence didn't run) -> file
+          a Bug-Report against the orchestrator.
+
+      Reply {"pass": bool, "notes": "architecture: N findings, M filed"}.
+
+  - id: inter-step-coherence
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 3
+    prompt: |
+      Run `python3 -m peers.cli run-check inter_step_coherence` and
+      review the output. Every 3 completed `[x]` steps trigger a
+      "stitch" review: the reviewer writes an H2 entry in `STITCH.md`
+      at the project root explaining how the recent batch of steps
+      fits together -- duplications, dangling connections, seams.
+
+      The scanner flags:
+
+        - > 3 checked steps but no STITCH.md at all,
+        - STITCH.md present but one or more H2 sections have < 20
+          words of body prose.
+
+      For each finding: demand the reviewer append a substantive
+      `## Stitch <N> -- STEP-A..STEP-B` entry to STITCH.md before the
+      next tick, or file a Bug-Report if a real integration issue
+      surfaced during the stitch review.
+
+      Reply {"pass": bool, "notes": "stitch: N findings, M filed"}.
+
+  # ---- Phase 8.4 opt-in advisory gates (Schicht 6 honesty opt-ins) ----
+  #
+  # Five OPT-IN advisory gates. Each script auto-skips (exit 0) when its
+  # opt-in trigger is not present, so registering them here is harmless
+  # for projects that don't want them. Triggers are PLAN.md Meta keys
+  # or environment variables -- see each gate's docstring.
+
+  - id: honesty-audit-peer-gemini
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check honesty_audit_peer_gemini`
+      (opt-in via PLAN.md Meta `honesty_audit_peer: <name>`).
+      When the project declares an extra honesty-audit peer (e.g.
+      `gemini`), the gate verifies HONESTY_AUDIT.md carries a matching
+      `## <name>` H2 section. Missing section -> demand the named peer
+      add their three subsections, or remove the opt-in declaration.
+      Skipped output (`skipped (opt-in not enabled)`) means the
+      project has no third-peer honesty audit configured -- pass.
+
+      Reply {"pass": bool, "notes": "extra-peer-honesty: N findings"}.
+
+  - id: mutation-sample
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check mutation_sample` (opt-in via
+      PLAN.md Meta `mutation_testing: true`). Stub placeholder for
+      future mutmut / cosmic-ray integration: when opted in, emits a
+      "not yet implemented" notice. Reviewer either runs the tool of
+      their choice manually and records findings, or accepts the
+      deferral. Skipped output means no mutation-testing opt-in -- pass.
+
+      Reply {"pass": bool, "notes": "mutation-sample: deferred/run"}.
+
+  - id: weasel-scan
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check weasel_scan`. Scans PLAN.md
+      + DELIVERY.md for hedging phrases (`should work`, `appears to`,
+      `probably`, `I think`, `seems to`, `we believe`, etc.). For each
+      hit: demand the writer replace the hedging with what was actually
+      verified, or name the unknown explicitly. This gate is soft by
+      registration (always exits 0); a hard variant would require
+      dual-registration as `type: hard`.
+
+      Reply {"pass": bool, "notes": "weasel-scan: N hits, M rewritten"}.
+
+  - id: diff-vs-claim
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check diff_vs_claim`. Heuristic
+      content-word overlap between each `[x] [STEP-N] ... (SHA)` step's
+      text and the referenced commit's subject + changed files. Zero
+      overlap -> finding. For each finding: either ask the implementer
+      to amend the commit message / step text to share vocabulary, or
+      accept that terminology differs intentionally (and add a note to
+      DELIVERY.md so the divergence is documented). Always exits 0.
+
+      Reply {"pass": bool, "notes": "diff-vs-claim: N divergences, M ok"}.
+
+  - id: confidence-calibration
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 5
+    prompt: |
+      Run `python3 -m peers.cli run-check confidence_calibration`
+      (opt-in via PLAN.md Meta `confidence_calibration: true`). When
+      opted in, every `[x]` step must carry `  - confidence: N/5`
+      (N in {1..5}); missing or N<4 emits a soft warning. For each
+      low-confidence checkoff: demand the reviewer look harder before
+      the loop converges (re-read tests, run acceptance manually,
+      consider an additional sanity check). Skipped output means no
+      opt-in -- pass.
+
+      Reply {"pass": bool, "notes": "confidence-calibration: N/M low"}.
+
+  # ---- Reused from audit (same cmd strings to keep semantics stable) ----
+
+  - id: no-prior-regression
+    type: hard
+    description: |
+      No commit since the peers baseline introduces a regression in the
+      test suite. Reused verbatim from audit-mode.
+    cmd: "python3 .peers/checks/no_regression.py ."
+    pass_when: "exit_code == 0"
+
+  - id: lint-clean
+    type: hard
+    description: |
+      `ruff check` reports no errors. Reused verbatim from audit-mode.
+    cmd: "ruff check . 2>&1 || true"
+    pass_when: "regex('error', stdout + stderr) == None"
+
+  - id: tests-pass
+    type: hard
+    description: |
+      The full pytest suite is green. Skips/xfails must carry a non-
+      generic reason ≥20 chars explaining WHY the skip is safe; the
+      companion check `tests-no-unjustified-skip-or-fail` (audit-mode)
+      enforces that and should be enabled alongside this gate via the
+      project's standalone audit run. Reused verbatim from audit-mode.
+    cmd: "python3 -m pytest"
+    pass_when: "exit_code == 0"

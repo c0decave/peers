@@ -1,0 +1,32 @@
+# peers-egress-proxy: tinyproxy with a hostname allow-list.
+#
+# Phase-2 hardening B2 (post-v9 audit synthesis, see
+# docs/plans/2026-05-26-peers-audit-synthesis.md). The main peers
+# container shares this proxy's network namespace via
+# `--network=container:peers-egress-proxy_<project>` and routes all
+# HTTPS through 127.0.0.1:3128. Filter restricts CONNECT to a small
+# set of LLM-API hosts; everything else is denied.
+#
+# Build:    podman build -f proxy/Containerfile.proxy \
+#               -t peers-egress-proxy:dev proxy/
+# Override: PEERS_CTL_EGRESS_PROXY_IMAGE=peers-egress-proxy:dev
+# Bypass:   PEERS_CTL_NO_EGRESS_PROXY=1
+
+FROM alpine:3.20
+
+RUN apk add --no-cache tinyproxy ca-certificates
+
+COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
+COPY filter-allow.txt /etc/tinyproxy/filter
+
+# tinyproxy needs writable runtime + log dirs. The runtime container
+# runs with --read-only --tmpfs /run/tinyproxy --tmpfs /var/log/tinyproxy
+# (see _build_proxy_argv); ensure the paths exist on the image so
+# mounting the tmpfs over them does not surprise the daemon.
+RUN mkdir -p /run/tinyproxy /var/log/tinyproxy \
+    && chown -R tinyproxy:tinyproxy /run/tinyproxy /var/log/tinyproxy
+
+USER tinyproxy
+EXPOSE 3128
+
+ENTRYPOINT ["tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]

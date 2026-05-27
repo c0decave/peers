@@ -1,0 +1,52 @@
+goals:
+  - id: skeptic-pass
+    type: soft
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 1
+    prompt: |
+      Der vorige Audit kam zu "alles grün". Das ist verdächtig.
+      Gehe JEDES src-File nochmal durch und finde mind. 1 Bug den die
+      vorigen Rounds übersehen haben. Wenn nach gewissenhafter Suche
+      wirklich nichts:
+      - dokumentiere KONKRET welche 5 Failure-Modes du geprüft +
+        ausgeschlossen hast (pro Datei oder pro Modul)
+      - reply {"pass": true, "notes": "skeptic-pass: <N files reviewed, M failure-modes excluded with rationale>"}
+      Pauschal-"sauber" wird vom anderen peer rejected.
+
+      ZUSÄTZLICH: prüfe jeden @pytest.mark.skip / @pytest.mark.xfail im
+      tests/-Baum. Ist die `reason=` Begründung TATSÄCHLICH solide oder
+      versteckt sich da ein echter Bug der einfach silenced wurde? Wenn
+      verdächtig → file Bug-Report. „TODO"/„FIXME"/„flaky" als Begründung
+      ist immer verdächtig — der entsprechende hard-goal-check
+      `tests-no-unjustified-skip-or-fail` würde das eh rejecten, aber
+      du musst zusätzlich semantisch prüfen ob die Begründung *stimmt*.
+
+  - id: aggressive-honesty
+    type: soft
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 3
+    prompt: |
+      Strengere Honesty-Variante. Du bist NICHT fertig solange du nicht
+      für JEDEN src-Top-Level-Pfad konkret begründen kannst:
+      - Welche 3+ Failure-Modes hast du dort geprüft?
+      - Welche 2+ Sicherheitslücken-Kategorien hast du geprüft?
+      - Welches Test-coverage-Loch hast du explizit als "nicht in
+        scope" markiert (statt es einfach zu übersehen)?
+      Bei jedem "keine Ahnung, hab ich nicht angeschaut": file
+      Bug-Report:investigate-<X> mit severity info JETZT.
+      Reply {"pass": true, "notes": "<pfad>: <findings> | ..."}.
+      Pauschal-"alles geprüft" wird rejected.
+
+  - id: convergence-reached
+    type: hard
+    description: "N=3 consecutive ticks ohne neue blocking/shallow-Bug-Reports. Default N=3; override via .peers/config.yaml goals.convergence_n."
+    cmd: "python3 .peers/checks/convergence_reached.py ."
+    pass_when: "exit_code == 0"
+
+  - id: all-peers-healthy
+    type: hard
+    description: "Fails when any peer is `unavailable`. Operator action required — silent degrade-and-skip is no longer accepted."
+    cmd: "python3 .peers/checks/all_peers_healthy.py ."
+    pass_when: "exit_code == 0"

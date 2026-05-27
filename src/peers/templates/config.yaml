@@ -1,0 +1,128 @@
+# Peers loop configuration. See `peers --help` for full reference.
+
+driver: orchestrator          # orchestrator | hooks (peers tick) | sessions
+comm: git                     # git | hybrid (git for code + files for messages)
+
+# declare peers as an ordered list so n>=2 setups are
+# possible. Legacy `tools: {claude: ..., codex: ...}` shape is also
+# accepted and auto-promoted.
+peers:
+  - name: claude
+    tool: claude
+    # `{PROMPT}` is substituted with the current peer prompt at runtime.
+    #
+    # Token/USD tracking: claude in default text mode is silent about
+    # token usage, so `budget.max_usd` is effectively off. Switch to
+    # `--output-format json` (single envelope at the end of the run)
+    # or `--output-format stream-json --verbose` (one JSON line per
+    # event, last line carries the totals) to enable budget tracking:
+    #
+    #   argv: ["claude", "-p", "--dangerously-skip-permissions",
+    #          "--output-format", "json", "{PROMPT}"]
+    #
+    # Trade-off: handoff detection is unaffected (substrate reads git
+    # commits, not stdout content), but human-readable peer logs become
+    # JSON instead of plain text. Run `peers report` to summarize.
+    argv: ["claude", "-p", "--dangerously-skip-permissions", "{PROMPT}"]
+    prompt_mode: argv-substitute     # claude/codex don't read prompts from stdin
+
+  - name: codex
+    tool: codex
+    # `--dangerously-bypass-approvals-and-sandbox` disables codex's
+    # internal bubblewrap `workspace-write` sandbox. We rely on the
+    # outer peers container (cap-drop=ALL, no-new-privileges,
+    # pids-limit, user-ns) as the sandbox boundary instead. Without
+    # this flag, codex's workspace-write mode treats `.git/` as
+    # read-only and silently blocks `git commit`, producing
+    # `no-handoff head=no-new-commit` ticks and DEGRADED state
+    # even when codex produced valid fixes.
+    argv: ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "{PROMPT}"]
+    prompt_mode: argv-substitute
+
+  # Example 3-peer setup (uncomment + adjust to enable):
+  # - name: claude-2
+  #   tool: claude
+  #   argv: ["claude", "-p", "--dangerously-skip-permissions", "{PROMPT}"]
+  #   prompt_mode: argv-substitute
+
+budget:
+  max_iterations: 200
+  max_runtime_s: 21600        # 6 hours total wall clock
+  max_consecutive_failures: 5
+  # max_tokens: 1_000_000     # optional cap on total tokens (claude+codex)
+  # max_usd: 50.0             # optional cap on accumulated USD spend
+  # max_usd_mode controls how `max_usd` is enforced:
+  #   auto (default) — inspect claude/codex auth files; if any peer is
+  #     API-key-billed → hard; if all peers are OAuth-billed → warn.
+  #     ↳ matches the real billing model (OAuth users pay a flat
+  #       subscription; per-token USD is informational only).
+  #   hard — exit on cap.
+  #   warn — log a one-time warning at the threshold; do NOT exit.
+  #   off  — ignore `max_usd` entirely.
+  max_usd_mode: auto
+
+health:
+  # Kill the peer only if it has produced NO output for this many seconds
+  # (i.e. it appears genuinely stuck, not just thinking long). Heavy
+  # stacks (~25 goals + many soft reviews) can have peers think 20-40
+  # min between outputs. 30 min is a sane default; bump higher for
+  # slower models or extra-large prompts.
+  idle_timeout_s: 1800               # 30 min
+  # Hard safety ceiling for runaway processes; should be much higher
+  # than the typical per-tick duration. 4h covers thorough's deeper
+  # reviews; tune down if you only run --modes=audit.
+  absolute_max_runtime_s: 14400      # 4 hours
+  # Per-stream output buffer cap. Outputs larger than this get head/tail-
+  # truncated, with a marker line in the middle. Raise for chatty peers
+  # (e.g. claude --debug or codex with verbose ROM dumps).
+  buf_cap_bytes: 2097152             # 2 MiB
+  # Regex patterns to look for in stdout/stderr; first match classifies
+  # the run as api-error and kills the child immediately.
+  #
+  # Self-referential trap to avoid: naive patterns ("Rate limit
+  # exceeded", "API error 5xx", "Authentication failed") match their
+  # OWN echo whenever a peer `cat`'d this very config.yaml. The form
+  # below requires an ERROR/FATAL log keyword on the SAME line as
+  # the failure mode. Real codex/claude error logs always carry such
+  # a keyword (e.g. `2026-... ERROR codex_core::client: API error
+  # 503: service unavailable`); a YAML quoted-list echo (`    -
+  # "API error 5[0-9][0-9]"`) does not.
+  #
+  # (?im) = case-insensitive + multi-line (^ matches every line start).
+  #
+  # `[^"\n]*?` (not `.*`) sits between line-start and the ERROR/FATAL
+  # keyword. This blocks two follow-up traps: (a) peer runs `grep
+  # ERROR tests/` and the quoted test fixture content matches; (b)
+  # YAML block-scalar dumps span multiple lines without quotes so a
+  # bare `.*` would scan across line boundaries. Strict single-line,
+  # quote-free prefix is required.
+  error_patterns:
+    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\brate.?limit\\b"
+    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bAPI[ _-]?error\\b[^\"\\n]*?\\b5[0-9][0-9]\\b"
+    - "(?im)^Error:\\s*rate[_-]?limit"
+
+  # halt_patterns trigger an IMMEDIATE `peer-unavailable:<peer>`
+  # exit_event instead of the silent degrade-after-3 path. Intended
+  # for classes the operator MUST address (OAuth expired, quota
+  # exhausted, invalid API key); silently degrading wastes the run's
+  # budget on a peer that can never recover by itself.
+  #
+  # Quota/usage_limit patterns also require an ERROR/FATAL keyword on
+  # the same line: the substrate's OWN goal description text mentions
+  # "quota exhausted" as the user-facing reason, and a peer dumping
+  # that yaml to stderr would otherwise false-positive. ERROR/FATAL
+  # anchoring + `[^"\n]*?` line-bounded prefix closes that variant.
+  halt_patterns:
+    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bauthentication[ _-]?(failed|error)\\b"
+    - "(?im)^Error:\\s*authentication[_-]?(error|failed)"
+    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\b(invalid|missing|expired)[ _-]?api[ _-]?key\\b"
+    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bquota[ _-]?exhausted\\b"
+    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\busage[ _-]?limit[ _-]?(reached|exceeded|exhausted)\\b"
+
+# Hard-goal commands (pytest, ruff, custom checks) run with a
+# per-command wall-clock timeout. Default 120 s suffices for small
+# projects; raise it for large repos whose `pytest -q` legitimately
+# takes longer (large test suites typically peg at 75-150 s
+# depending on cache state).
+goals:
+  timeout_s: 120

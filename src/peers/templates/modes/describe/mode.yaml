@@ -1,0 +1,12 @@
+name: describe
+version: 1
+description: |
+  Iterative documentation mode. Peers WRITE the project's spec docs
+  (SPEC.md, ARCHITECTURE.md, DESIGN.md) — they do not audit. Two peers
+  alternate: one drafts/extends, the other reviews+corrects, until N
+  consecutive ticks produce no substantive doc edits. Use this mode
+  BEFORE audit/security modes on a repo that lacks structured docs.
+
+  Not composable with audit/security modes in v1 (use one OR the other
+  per run; cherry-pick the produced docs to a follow-up audit run).
+requires: []

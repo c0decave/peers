@@ -1,0 +1,108 @@
+# Peers goals. The `self-review-on-handoff` gate is non-negotiable and
+# ships enabled. Add your project-specific gates below.
+
+goals:
+  - id: self-review-on-handoff
+    type: hard
+    description: |
+      Every handoff commit must contain a `## Self-Review` body section
+      and a `Self-Review: pass` trailer.
+    cmd: "python3 -m peers.cli run-check verify_self_review"
+    pass_when: "exit_code == 0"
+
+  # bug-hunt protocol. Cannot finish until each peer has done
+  # 2 rounds of bug-hunting against the other's diff AND no crit/high/
+  # med severity bugs are open. See BUG_HUNT_BLOCK in the prompt for
+  # the commit/trailer schema.
+  - id: bug-hunt-clean
+    type: hard
+    description: |
+      Zero unresolved bugs at severity crit/high/med (per Bug-Report /
+      Bug-Resolves trailers in git history).
+    cmd: "python3 -m peers.bug_hunt gate ."
+    pass_when: "exit_code == 0"
+
+  - id: bug-hunt-round-1
+    type: soft
+    description: |
+      Round 1: each peer reads the OTHER peer's diff since baseline and
+      files any defects they find as `Bug-Report:` commits (severity
+      crit/high/med/low/info, fix_by=<the-other-peer>). Pass when both
+      peers report "round 1 complete" (consensus_needed: 2).
+    prompt: |
+      Round 1 bug-hunt:
+      - Read the OTHER peer's diff since `peers-baseline`
+        (`git log peers-baseline..HEAD --author=<other>` is a starting
+        point — but consider ALL their commits via the `Peer:` trailer).
+      - For each defect you find, file a `Bug-Report:` commit (see
+        BUG_HUNT_BLOCK in the system prompt for the JSON+trailer schema).
+      - Severity ladder: crit (data loss / RCE / crash) > high (broken
+        feature / wrong output) > med (degraded UX / perf cliff) >
+        low (style/nit) > info (note).
+      - When you have nothing more to report this round, reply with
+        the soft-review JSON: {"pass": true, "notes": "round 1 done,
+        N bugs filed"}.
+      Hunt actively — don't just defend against what tests already cover.
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 1
+
+  - id: bug-hunt-round-2
+    type: soft
+    description: |
+      Round 2 (same protocol as round 1) — after round-1 fixes have
+      landed, look again. Different cases come into view once obvious
+      bugs are gone.
+    prompt: |
+      Round 2 bug-hunt: re-read the OTHER peer's diff (including any
+      round-1 fixes they made). File any new defects as `Bug-Report:`
+      commits per BUG_HUNT_BLOCK. Reply
+      {"pass": true, "notes": "round 2 done"} when nothing new.
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 1
+
+  - id: test-coverage-3-class
+    type: soft
+    description: |
+      Each non-trivial unit/integration test should cover all three
+      case classes: happy (correct input → correct output), edge
+      (boundaries/empty/unicode/etc.), sad (invalid input / exceptions).
+      Each peer reviews the OTHER peer's tests for 3-class coverage.
+    prompt: |
+      Open every test file the OTHER peer wrote. For each non-trivial
+      feature under test, verify there are tests for happy, edge, and
+      sad cases (see THOROUGH_TESTING_BLOCK in the system prompt for
+      what counts). Reject `assert True` placeholders. Reply
+      {"pass": bool, "notes": "...", "missing": [list-of-features]}.
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 2
+
+  # Sentinel: delete this entry once you have added real project goals
+  # below. While this is in place, the peers loop will never declare
+  # itself complete — preventing a vacuous "done" on a fresh repo.
+  - id: placeholder-replace-me
+    type: hard
+    description: |
+      DELETE this entry from .peers/goals.yaml once you have added real
+      project-specific goals (tests, coverage, lint, docs, ...).
+    cmd: "false"
+    pass_when: "exit_code == 0"
+
+  # === Examples — uncomment / edit ========================================
+  # - id: tests-pass
+  #   type: hard
+  #   cmd: "pytest -q"
+  #   pass_when: "exit_code == 0"
+  #
+  # - id: typecheck
+  #   type: hard
+  #   cmd: "mypy src/"
+  #   pass_when: "exit_code == 0"
+
+# NOTE: the `cmd:` value of every goal is executed as a shell string
+# (sh -c) in the target repo with the same privileges as the peers
+# process. Treat this file as code: do not source it from untrusted
+# repos. Same applies to any `regex(...)` / `json(...)` arguments in
+# `pass_when` — they read from / inside the target's cwd.

@@ -1,0 +1,4 @@
+# src/peers/templates/modes/audit/mode.yaml
+name: audit
+version: 1
+description: "Bug-hunt + happy/edge/sad coverage + secrets + deps + API-stability + regression + diff-size gates"

@@ -1,0 +1,70 @@
+goals:
+  - id: description-files-present
+    type: hard
+    description: |
+      SPEC.md, ARCHITECTURE.md, and DESIGN.md exist at the repo root,
+      each at least 500 characters. These are the deliverables of the
+      describe run; without them the mode hasn't produced anything yet.
+    cmd: "python3 .peers/checks/description_files_present.py ."
+    pass_when: "exit_code == 0"
+
+  - id: description-sections-present
+    type: hard
+    description: |
+      The three description files have the required sections — SPEC.md
+      contains `## Threat Model`, `## Invariants`, `## API`;
+      ARCHITECTURE.md contains `## Components` and `## Data Flow`;
+      DESIGN.md contains `## Decisions` and `## Tradeoffs`. Each
+      section heading must be followed by at least 50 chars of content,
+      otherwise a peer can pass by inserting empty headings.
+    cmd: "python3 .peers/checks/description_sections_present.py ."
+    pass_when: "exit_code == 0"
+
+  - id: description-converged
+    type: hard
+    description: |
+      The last N commits touching the description files (default N=2,
+      override via .peers/config.yaml goals.describe_convergence_n) are
+      non-substantive: each adds <100 lines AND adds no new `##`-level
+      section AND has <50% deletion ratio. Substantive edits in the
+      most recent N commits indicate the doc is still in flux — the
+      peer-loop should continue.
+    cmd: "python3 .peers/checks/description_converged.py ."
+    pass_when: "exit_code == 0"
+
+  - id: describe-skeptic-pass
+    type: soft
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 1
+    prompt: |
+      Du reviewst SPEC.md, ARCHITECTURE.md, DESIGN.md — nicht source-code.
+      Such SPEZIFISCH:
+        - Welche claims sind nicht durch source-evidence belegt? (etwa
+          "We use OAuth" — wo im code passiert das?)
+        - Welche tradeoffs werden nur einseitig dargestellt? ("Wir haben
+          X gewählt weil's einfacher ist" — gegen WAS?)
+        - Welche sections sind leer-formuliert? (Threat-model die nur
+          "wir validieren input" sagt ohne attack-surface zu nennen)
+        - Welche missing sections würden den doc-set komplettieren?
+      Reply {"pass": true, "notes": "describe-skeptic-pass: <konkrete reviews>"}
+      Pauschal-"sieht gut aus" wird rejected — der andere peer braucht
+      konkrete diffs/section-namen/zitierte-claims.
+
+  - id: describe-tradeoff-honesty
+    type: soft
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 2
+    prompt: |
+      Strikte Tradeoff-Honesty in DESIGN.md. Für JEDE design-decision in
+      `## Decisions` muss `## Tradeoffs` mindestens 3 explizite tradeoffs
+      enthalten. Verboten ohne weitere Begründung:
+        - "obviously the right choice"
+        - "it just works"
+        - "simple solution"
+        - "industry standard"
+      Statt: nenne konkret was wir AUFGEBEN durch die Entscheidung, was
+      die ALTERNATIVE wäre, warum WIR die Kosten der Alternative höher
+      bewerten. Reply mit pass=true + Liste der geprüften decisions:
+      {"pass": true, "notes": "decisions reviewed: [D1, D2, ...], all have ≥3 tradeoffs each"}.

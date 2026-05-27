@@ -1,0 +1,129 @@
+#!/bin/sh
+# Pre-commit hook: enforce reviewer-only checkoffs for implement-mode.
+#
+# Rejects commits where the same peer that implemented a step's
+# `touches:` files is also marking the step `[x]` in PLAN.md.
+#
+# Schicht 2 anti-cheat: forces the OTHER peer to checkoff after review.
+set -e
+
+# 1. Did this commit touch PLAN.md?
+if ! git diff --cached --name-only | grep -qx PLAN.md; then
+  exit 0  # no PLAN.md change, no-op
+fi
+
+# 2+. Delegate parsing/enforcement to embedded Python (robust diff/PLAN parser)
+python3 - <<'PYEOF'
+import re
+import subprocess
+import sys
+import pathlib
+
+diff = subprocess.run(
+    ["git", "diff", "--cached", "--", "PLAN.md"],
+    capture_output=True, text=True,
+).stdout
+
+# Parse step ID from removed-then-added pairs
+removed_open = set()   # STEP-N that was [ ]
+added_done = set()     # STEP-N that became [x]
+step_pattern = re.compile(r"^([+-])\s*-\s*\[([ xX])\]\s*\[(STEP-\d+)\]")
+for line in diff.splitlines():
+    m = step_pattern.match(line)
+    if m:
+        sign, mark, sid = m.groups()
+        if sign == "-" and mark == " ":
+            removed_open.add(sid)
+        elif sign == "+" and mark in ("x", "X"):
+            added_done.add(sid)
+
+checkoffs = removed_open & added_done
+if not checkoffs:
+    sys.exit(0)
+
+# Read CURRENT (staged) PLAN.md to find touches: for each checked-off step.
+# Use the index version so we see what's about to be committed.
+plan_text = subprocess.run(
+    ["git", "show", ":PLAN.md"],
+    capture_output=True, text=True,
+).stdout
+if not plan_text:
+    # Fallback to working tree
+    try:
+        plan_text = pathlib.Path("PLAN.md").read_text()
+    except OSError:
+        plan_text = ""
+
+# Build per-step sub-attr blocks: lines starting with two-space indent following
+# the step header.
+step_blocks = {}
+current_id = None
+header_re = re.compile(r"^- \[[ xX]\] \[(STEP-\d+)\]")
+for line in plan_text.splitlines():
+    m = header_re.match(line)
+    if m:
+        current_id = m.group(1)
+        step_blocks[current_id] = []
+    elif current_id is not None and line.startswith("  -"):
+        step_blocks[current_id].append(line)
+    elif current_id is not None and line and not line.startswith(" "):
+        # Block ended (new top-level item or blank-separated section)
+        current_id = None
+
+touches_re = re.compile(r"^\s*-\s*touches:\s*(.+?)\s*$")
+
+current_email = subprocess.run(
+    ["git", "config", "user.email"],
+    capture_output=True, text=True,
+).stdout.strip()
+
+violations = []
+for sid in sorted(checkoffs):
+    block = step_blocks.get(sid, [])
+    touches_files = []
+    for sub in block:
+        m = touches_re.match(sub)
+        if m:
+            raw = m.group(1).strip()
+            # Strip optional [list] / [a, b] wrappers
+            raw = raw.strip("[]")
+            for f in raw.split(","):
+                f = f.strip().strip("\"'")
+                if f:
+                    touches_files.append(f)
+    if not touches_files:
+        print(
+            f"warn: {sid} marked [x] but has no touches: — cannot enforce "
+            "reviewer-only-checkoff",
+            file=sys.stderr,
+        )
+        continue
+    for tf in touches_files:
+        res = subprocess.run(
+            ["git", "log", "-1", "--format=%ae", "--", tf],
+            capture_output=True, text=True,
+        )
+        last_author = res.stdout.strip()
+        if not last_author:
+            # File new in this commit or not yet tracked — can't enforce
+            continue
+        if last_author == current_email:
+            violations.append((sid, tf, last_author, current_email))
+
+if violations:
+    print("REJECTED: reviewer-only-checkoff violation", file=sys.stderr)
+    for sid, tf, la, ce in violations:
+        print(f"  {sid}: file {tf} was last modified by {la}", file=sys.stderr)
+        print(
+            f"         current committer is {ce} — cannot checkoff own work",
+            file=sys.stderr,
+        )
+    print(
+        "  hint: implement-mode requires the OTHER peer to mark steps [x] "
+        "after review",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+sys.exit(0)
+PYEOF

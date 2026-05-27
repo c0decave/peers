@@ -1,0 +1,124 @@
+goals:
+  - id: self-review-on-handoff
+    type: hard
+    description: "Every handoff commit includes a self-review."
+    cmd: "python3 -m peers.cli run-check verify_self_review"
+    pass_when: "exit_code == 0"
+
+  - id: tests-pass
+    type: hard
+    description: |
+      The full test suite is green. If a test is skipped or expected to
+      fail, the marker MUST carry a non-generic reason (≥20 chars,
+      mentioning WHY the skip/xfail is safe — e.g., platform-only code
+      path, manually verified upstream fix). The companion check
+      `tests-no-unjustified-skip-or-fail` enforces this; do not bypass
+      it by adding empty/TODO/FIXME reasons.
+    cmd: "python3 -m pytest"
+    pass_when: "exit_code == 0"
+
+  - id: tests-no-unjustified-skip-or-fail
+    type: hard
+    description: |
+      Every @pytest.mark.skip / @pytest.mark.xfail (and module-level
+      `pytestmark`) carries a reason ≥20 chars that explains WHY the
+      test is safely silenced — i.e., why production correctness is
+      preserved despite the test not running. Generic reasons
+      ("TODO", "FIXME", "broken", "flaky", "later", "wip") are rejected.
+      @pytest.mark.skipif is treated leniently because its condition
+      argument documents WHY, so any non-empty reason suffices.
+    cmd: "python3 .peers/checks/tests_no_unjustified_skip_or_fail.py ."
+    pass_when: "exit_code == 0"
+
+  - id: tests-cover-happy-edge-sad
+    type: hard
+    description: "Non-trivial code has happy, edge, and sad tests."
+    cmd: "python3 .peers/checks/coverage_3class.py src tests"
+    pass_when: "exit_code == 0"
+
+  - id: lint-clean
+    type: hard
+    cmd: "ruff check . 2>&1 || true"
+    pass_when: "regex('error', stdout + stderr) == None"
+
+  - id: type-clean
+    type: hard
+    cmd: "mypy src/ 2>&1 || true"
+    pass_when: "regex('error', stdout + stderr) == None"
+
+  - id: bug-hunt-clean
+    type: hard
+    description: "No open crit/high/med bug reports."
+    cmd: "python3 -m peers.bug_hunt gate ."
+    pass_when: "exit_code == 0"
+
+  - id: tdd-reproduces-bug
+    type: hard
+    description: "Blocking bug fixes have a prior failing-test commit."
+    cmd: "python3 -m peers.bug_hunt gate-tdd ."
+    pass_when: "exit_code == 0"
+
+  - id: no-secrets-committed
+    type: hard
+    cmd: "python3 .peers/checks/scan_secrets.py ."
+    pass_when: "exit_code == 0"
+
+  - id: deps-justified
+    type: hard
+    cmd: "python3 .peers/checks/deps_justified.py ."
+    pass_when: "exit_code == 0"
+
+  - id: api-stable
+    type: hard
+    cmd: "python3 .peers/checks/api_stable.py ."
+    pass_when: "exit_code == 0"
+
+  - id: no-prior-regression
+    type: hard
+    cmd: "python3 .peers/checks/no_regression.py ."
+    pass_when: "exit_code == 0"
+
+  - id: diff-size-per-resolve
+    type: hard
+    cmd: "python3 .peers/checks/diff_size_per_resolve.py ."
+    pass_when: "exit_code == 0"
+
+  - id: bug-hunt-round-1-deep
+    type: soft
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 1
+    prompt: |
+      Round 1 deep audit. Read source and tests, file each real defect as
+      one Bug-Report commit with honest severity. Include happy/edge/sad
+      test gaps and security or resource-boundary issues.
+
+  - id: bug-hunt-round-2-cross-review
+    type: soft
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 1
+    prompt: |
+      Round 2 cross-review. Read the other peer's diff since peers-baseline
+      and file Bug-Reports for incomplete fixes, missing TDD reproduction,
+      regressions, bundled changes, or weak tests.
+
+  - id: tests-3-class-review
+    type: soft
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 2
+    prompt: |
+      Review changed tests for happy, edge, and sad coverage. Reject
+      assert-true, purely happy-path tests, and tests that only prove the
+      function returns something.
+
+      Also: review every @pytest.mark.skip / .xfail / .skipif and
+      module-level pytestmark introduced or modified in this turn. The
+      `reason=` must concretely explain WHY the skip is safe — i.e.,
+      why production correctness is preserved even though the test no
+      longer runs. Generic reasons ("TODO", "FIXME", "broken", "flaky",
+      "later") are rejected at hard-goal level; you also reject reasons
+      that LOOK long but say nothing substantive (e.g., "this test is
+      currently being investigated and will be fixed soon" — that's not
+      a justification, that's a promise). Demand the WHY-IT-IS-SAFE.

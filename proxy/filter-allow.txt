@@ -1,0 +1,40 @@
+# peers-egress-proxy allow-list (one host-regex per line, anchored).
+#
+# tinyproxy uses POSIX extended regex; the syntax here matches hostnames
+# from HTTP CONNECT requests. Lines starting with `#` are comments.
+#
+# Initial set (Phase-2 hardening B2):
+#   - Anthropic API + telemetry endpoints (claude CLI)
+#   - OpenAI API endpoints (codex CLI)
+#   - Statsig.com — claude code feature gates
+#   - Sentry ingest for claude code (errors)
+#
+# How to extend (when v10 logs proxy 403s):
+#   1. Tail proxy logs: podman logs -f peers-egress-proxy_<project>
+#   2. Identify denied host
+#   3. Confirm it is a legitimate LLM-API endpoint (not telemetry-only)
+#   4. Add an anchored regex line below
+#   5. Rebuild the proxy image
+#
+# Rule of thumb: deny by default. Only LLM API + Anthropic-controlled
+# infrastructure. NO third-party telemetry wildcards — those are
+# exfiltration channels (e.g. attacker-controlled sentry-org would
+# match `*.ingest.sentry.io` and accept tunneled data into their own
+# Sentry account; see code-review finding C2).
+
+^api\.anthropic\.com$
+^api\.openai\.com$
+# v10 lesson: codex OAuth-subscription mode opens a WebSocket to
+# `wss://chatgpt.com/backend-api/codex/responses` — chatgpt.com is
+# the legitimate OpenAI subscription backend (multi-tenant by user
+# account, not by attacker-registerable org), so wildcard is safe.
+^chatgpt\.com$
+.*\.chatgpt\.com$
+
+# --- speculative entries removed pending empirical evidence ---
+# `statsig.anthropic.com`, `claude.ai`, `*.claude.ai` were initially
+# added on the assumption that claude-code's SDK calls them for
+# feature-flag / session flows. Both v9 (no proxy) and v10's
+# observed traffic showed only api.anthropic.com from the claude
+# side. If a future run shows `refused on filtered domain` for any
+# of these, add them back with a real-traffic citation.
