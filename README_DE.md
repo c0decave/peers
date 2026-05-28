@@ -6,12 +6,11 @@ laufen lässt. Beide (oder mehrere) Seiten machen Code, prüfen die
 Arbeit der anderen und arbeiten so lange weiter, bis alle definierten
 Ziele grün sind.
 
-- Vollständiges Design: [docs/plans/2026-05-20-peers-claude-codex-design.md](docs/plans/2026-05-20-peers-claude-codex-design.md)
-- Phase-3-Design (n-peer + peers-ctl): [docs/plans/2026-05-20-peers-phase3-design.md](docs/plans/2026-05-20-peers-phase3-design.md)
-- Phase-2-Closure-Report: [docs/2026-05-20-phase2-closure-report.md](docs/2026-05-20-phase2-closure-report.md)
-- Erfahrungen aus dem ersten Real-World-Lauf: [docs/2026-05-20-dogfood-report.md](docs/2026-05-20-dogfood-report.md)
-- Dogfood Round 2 (Phase-3-Scaffolds): [docs/2026-05-20-dogfood-r2-report.md](docs/2026-05-20-dogfood-r2-report.md)
-- Englische Fassung: [README.md](README.md)
+> English version: [README.md](README.md).
+
+- **HOWTO: kompletter Audit + Fix an einer existierenden App**: [docs/HOWTO-audit-and-fix_DE.md](docs/HOWTO-audit-and-fix_DE.md) — [English version](docs/HOWTO-audit-and-fix.md)
+- **`implement`-Mode (Feature aus PLAN.md bauen)**: [docs/MODES_IMPLEMENT_DE.md](docs/MODES_IMPLEMENT_DE.md) — [EN](docs/MODES_IMPLEMENT.md)
+- Security-Modell: [docs/SECURITY_DE.md](docs/SECURITY_DE.md) — [EN](docs/SECURITY.md)
 
 ---
 
@@ -374,6 +373,12 @@ peers status
 tail -f .peers/log/runs.jsonl
 # eine JSON-Zeile pro Tick mit reichhaltigen Audit-Feldern
 
+peers-ctl dashboard --live
+# Multi-Projekt-Live-Ansicht mit Alerts und neuesten Events
+
+peers-ctl dashboard --project mein-projekt
+# Single-Projekt-Drilldown mit jüngsten Runs und Bug-Reports
+
 git log --oneline
 # echte Code-Änderungen der Peers, jede mit eigenen Trailern
 
@@ -583,6 +588,6 @@ Eigenschaften:
   `soft_reviews_seen/ingested/rejected`.
 
 Weiterführend:
-- [docs/HOWTO-audit-and-fix.md](docs/HOWTO-audit-and-fix.md) — Audit + Fix einer existierenden Anwendung
+- [docs/HOWTO-audit-and-fix_DE.md](docs/HOWTO-audit-and-fix_DE.md) — Audit + Fix einer existierenden Anwendung (deutsche Anleitung)
 - [docs/MODES_IMPLEMENT.md](docs/MODES_IMPLEMENT.md) — Operator-Referenz für `implement`-Mode
 - [docs/SECURITY.md](docs/SECURITY.md) — Threat-Model + Layer-Mitigations

@@ -1,11 +1,11 @@
-"""Reviewer-signed justifications log for shortcut-marker escapes (Task 5.2).
+"""Reviewer-signed justifications log for cleanliness-gate escapes (Task 5.2).
 
 Companion infrastructure for the ``no-shortcut-markers`` hard gate
-(Task 5.1). The gate forbids TODO/FIXME/XXX/HACK/PLACEHOLDER/STUB and
-NotImplementedError in concrete classes under ``src/``. Legitimate
-escapes carry a ``# JUSTIFIED: <reason>`` annotation on the offending
-line *and* a reviewer-signed entry in ``.peers/justifications.log``;
-both halves are required, mirroring the
+(Task 5.1). The gate forbids the implement-mode shortcut vocabulary
+and incomplete concrete override markers under ``src/``. Legitimate
+escapes carry a reviewer annotation on the offending line *and* a
+reviewer-signed entry in ``.peers/justifications.log``; both halves
+are required, mirroring the
 ``checkoff-by-other-peer`` two-key principle (annotation in code by
 the implementer, sign-off in the log by the reviewer).
 
@@ -63,6 +63,9 @@ _HASH_CHAIN_PREFIX_LEN = 16
 
 class JustificationError(ValueError):
     """Raised when the justifications log is broken or tampered."""
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(message or "justifications log verification failed")
 
 
 def _sha256_hex(data: bytes) -> str:

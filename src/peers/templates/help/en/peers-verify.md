@@ -49,7 +49,7 @@ None directly; per-check `cmd:` strings may consume project env.
 ## SEE ALSO
 - `peers report --help-man` — broader project rollup (state + ticks).
 - `peers info --help-man` — config dump (peers/goals/budget).
-- `docs/HOWTO-audit-and-fix.md` — section "8) Abnahme".
+- `docs/HOWTO-audit-and-fix.md` — section "8) Acceptance".
 
 ## NOTES
 - Soft goals are NOT re-evaluated here (they require peer reviews).

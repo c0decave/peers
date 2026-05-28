@@ -44,6 +44,43 @@ _STOP_POLL_INTERVAL_S = 0.25
 # cgroup limit. The sweep itself is cheap (one os.listdir + stat read
 # per /proc/[pid]) and only fires when peers is PID 1.
 _ZOMBIE_SWEEP_INTERVAL_S = 2.0
+_CLAUDE_JSONL_LIVENESS_WINDOW_S = 60
+
+
+def claude_session_jsonl_path(cwd: str | Path) -> Path | None:
+    """Return claude's session-jsonl directory for an absolute cwd.
+
+    Claude stores per-session jsonl files below
+    ``~/.claude/projects/<encoded-cwd>/`` where slashes in the absolute
+    working directory are replaced by ``-``. The returned path is the
+    directory; callers can inspect the newest ``*.jsonl`` file inside it.
+    """
+    home = os.environ.get("HOME")
+    if not home:
+        return None
+    cwd_s = str(cwd)
+    if not cwd_s.startswith("/"):
+        return None
+    encoded = "-" + cwd_s.lstrip("/").replace("/", "-")
+    return Path(home) / ".claude" / "projects" / encoded
+
+
+def jsonl_mtime_within(jsonl_dir: Path, within_seconds: int) -> bool:
+    """True iff any session jsonl in ``jsonl_dir`` was touched recently."""
+    if within_seconds <= 0 or not jsonl_dir.is_dir():
+        return False
+    threshold = time.time() - within_seconds
+    try:
+        candidates = list(jsonl_dir.glob("*.jsonl"))
+    except OSError:
+        return False
+    for path in candidates:
+        try:
+            if path.stat().st_mtime >= threshold:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _utf8_size(text: str) -> int:
@@ -77,7 +114,8 @@ class _PatternSearchTimeout(Exception):
 
 
 class _AlarmTimeout(Exception):
-    pass
+    def __init__(self) -> None:
+        super().__init__("pattern search timed out")
 
 
 def _search_pattern(pat: re.Pattern, text: str) -> re.Match | None:
@@ -155,6 +193,11 @@ class RunResult:
     # quota-exhausted shapes where retrying is useless and the
     # operator must intervene.
     halt_required: bool = False
+    # True when stdout/stderr were quiet past idle_timeout_s, but the
+    # claude session jsonl was still being updated. This is the
+    # print-mode false-idle escape hatch: liveness is stdout OR jsonl.
+    jsonl_liveness_fallback_used: bool = False
+    jsonl_liveness_fallbacks: int = 0
 
 
 class _StreamCollector:
@@ -584,6 +627,7 @@ class HealthGuard:
             stdin_thread.start()
 
         classification: str | None = None
+        jsonl_liveness_fallbacks = 0
         # halt_required is sticky once set (a halt-class match
         # cannot be downgraded by a later transient match). The orchestrator
         # reads this off RunResult and translates into a peer-unavailable
@@ -647,6 +691,15 @@ class HealthGuard:
                 now = time.monotonic()
 
                 if (now - last_output) > idle_timeout_s:
+                    jsonl_dir = claude_session_jsonl_path(self.cwd)
+                    if jsonl_dir is not None and jsonl_mtime_within(
+                        jsonl_dir,
+                        within_seconds=_CLAUDE_JSONL_LIVENESS_WINDOW_S,
+                    ):
+                        jsonl_liveness_fallbacks += 1
+                        with shared_lock:
+                            shared["last_output_t"] = now
+                        continue
                     classification = "idle-timeout"
                     self._terminate_and_reap(proc)
                     rc = proc.returncode
@@ -767,4 +820,6 @@ class HealthGuard:
             matched_error_snippet=matched_snippet,
             matched_error_source=matched_source,
             halt_required=halt_required,
+            jsonl_liveness_fallback_used=jsonl_liveness_fallbacks > 0,
+            jsonl_liveness_fallbacks=jsonl_liveness_fallbacks,
         )

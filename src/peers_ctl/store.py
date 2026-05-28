@@ -504,6 +504,14 @@ def _probe_project_alive(p: Project) -> bool | None:
     return is_pid_alive(p.pid)
 
 
+def _release_stale_run_lock(project: Project) -> None:
+    try:
+        from peers.state_store import release_run_lock
+        release_run_lock(Path(project.path) / ".peers")
+    except Exception:
+        return
+
+
 def reconcile(store: Store) -> None:
     """Update each project's `state` from the current liveness probe.
 
@@ -555,6 +563,7 @@ def reconcile(store: Store) -> None:
                     p.state = "unknown"
                 continue
             # alive is False — container/PID confirmed dead.
+            _release_stale_run_lock(p)
             # Terminal states (stopped, crashed) are sticky: they were
             # set deliberately by stop_project or a prior reconcile,
             # and a fresh dead-probe is not new information.
@@ -569,6 +578,12 @@ def reconcile(store: Store) -> None:
             p.last_stopped_at = _dt.datetime.now(
                 _dt.timezone.utc
             ).isoformat()
+
+
+def reconcile_one(store: Store, name: str) -> Project | None:
+    """Reconcile the registry and return one project's fresh record."""
+    reconcile(store)
+    return store.get(name)
 
 
 def prune_logs(store: Store, older_than_days: int = 7) -> int:

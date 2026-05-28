@@ -1,5 +1,7 @@
 # `implement` mode — feature implementation from PLAN.md
 
+**Languages:** EN / [DE](MODES_IMPLEMENT_DE.md)
+
 End-to-end feature implementation driven from a markdown PLAN.md, with
 reviewer-only check-offs, frozen acceptance contracts, blind-review
 between peers, mandatory pessimism quota, a final HONESTY_AUDIT, and

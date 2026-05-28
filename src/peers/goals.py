@@ -269,7 +269,8 @@ class _JsonView:
 
 
 class _RegexTimeout(Exception):
-    pass
+    def __init__(self) -> None:
+        super().__init__("regex evaluation timed out")
 
 
 def _safe_regex_search(pattern: str, text: str) -> re.Match | None:

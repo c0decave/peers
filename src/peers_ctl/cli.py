@@ -37,7 +37,7 @@ from peers_ctl.plan_parser import PlanValidationError, parse_plan
 from peers_ctl.runner import start_project, stop_project
 from peers_ctl.store import (
     Project, Store, prune_logs, validate_project_name,
-    reconcile,
+    reconcile, reconcile_one,
 )
 
 
@@ -676,7 +676,76 @@ def cmd_amend(name: str, acceptance: str, reason: str) -> int:
     return 0
 
 
-def cmd_resume(name: str) -> int:
+def _resolve_project_dir(name: str, config_dir: Path | None = None) -> Path:
+    project = _store(config_dir).get(name)
+    if project is not None:
+        return Path(project.path)
+    return projects_root() / name
+
+
+def _read_project_budget_cap(proj_dir: Path) -> int:
+    state_path = proj_dir / ".peers" / "state.json"
+    if not state_path.is_file():
+        return 0
+    try:
+        data = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        return 0
+    budget = data.get("budget") if isinstance(data, dict) else None
+    if not isinstance(budget, dict):
+        return 0
+    cap = budget.get("max_runtime_s")
+    return cap if isinstance(cap, int) and cap > 0 else 0
+
+
+def _apply_resume_budget(
+    proj_dir: Path,
+    *,
+    max_runtime: str | None = None,
+    reset_budget: bool = False,
+) -> int | None:
+    if max_runtime is None and not reset_budget:
+        return None
+    state_path = proj_dir / ".peers" / "state.json"
+    if not state_path.is_file():
+        return None
+    try:
+        state = json.loads(read_text_no_symlink(state_path))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    budget = state.setdefault("budget", {})
+    if not isinstance(budget, dict):
+        return None
+    if reset_budget:
+        for key in (
+            "spent_runtime_s", "spent_iterations", "spent_tokens",
+            "wasted_runtime_s", "consecutive_failures",
+        ):
+            budget[key] = 0
+        budget["spent_usd"] = 0.0
+    new_cap: int | None = None
+    if max_runtime is not None:
+        delta_s, additive = parse_runtime_duration(max_runtime)
+        current = _read_project_budget_cap(proj_dir) if additive else 0
+        new_cap = current + delta_s if additive else delta_s
+        budget["max_runtime_s"] = new_cap
+    write_text_no_symlink(state_path, json.dumps(state, indent=2,
+                                                sort_keys=True))
+    return new_cap
+
+
+def cmd_resume(
+    name: str,
+    *,
+    max_runtime: str | None = None,
+    reset_budget: bool = False,
+    force: bool = False,
+    start_run: bool = False,
+    container: bool = False,
+    config_dir: Path | None = None,
+) -> int:
     """Task 4.5: clear a project's Phase-0 checkpoint marker.
 
     Removes `.peers/checkpoint_requested` and `.peers/awaiting_user`
@@ -684,19 +753,16 @@ def cmd_resume(name: str) -> int:
     normally. Idempotent: succeeds even when no markers exist
     (operator can run it defensively before any start).
 
-    Design choice (v1): this command ONLY clears markers. It does
-    not re-invoke `cmd_start` — the operator runs that explicitly
-    after reviewing RECON.md + PLAN.aligned.md +
-    ARCHITECTURE.intended.md. Keeps `resume` flag-agnostic (no need
-    to track the original `start` flags) and makes every resume an
-    explicit, fresh `start` decision.
+    By default this command only clears markers; optional budget flags
+    can extend/reset the run before the next start, and --start performs
+    the explicit relaunch in one command.
     """
     try:
         validate_project_name(name)
     except ValueError as e:
         print(f"peers-ctl: {e}", file=sys.stderr)
         return 2
-    proj_dir = projects_root() / name
+    proj_dir = _resolve_project_dir(name, config_dir)
     if not proj_dir.is_dir():
         print(f"peers-ctl: no such project: {name}", file=sys.stderr)
         return 1
@@ -724,6 +790,27 @@ def cmd_resume(name: str) -> int:
         print(f"peers-ctl: cleared marker(s): {', '.join(cleared)}")
     else:
         print(f"peers-ctl: no checkpoint markers to clear for {name!r}")
+    if (max_runtime is not None or reset_budget) and not start_run:
+        try:
+            new_cap = _apply_resume_budget(
+                proj_dir, max_runtime=max_runtime, reset_budget=reset_budget,
+            )
+        except ValueError as e:
+            print(f"peers-ctl: --max-runtime: {e}", file=sys.stderr)
+            return 1
+        if new_cap is not None:
+            print(f"peers-ctl: max_runtime_s now {new_cap}")
+        elif reset_budget:
+            print("peers-ctl: budget counters reset")
+    if start_run:
+        return cmd_start(
+            name,
+            max_runtime=max_runtime,
+            reset_budget=reset_budget,
+            force=force,
+            container=container,
+            config_dir=config_dir,
+        )
     print(f"  Next: peers-ctl start {name}  "
           "# resumes past Phase 0 into implementation")
     return 0
@@ -740,9 +827,11 @@ def cmd_remove(name: str, config_dir: Path | None = None) -> int:
     return 0
 
 
-def cmd_list(config_dir: Path | None = None) -> int:
+def cmd_list(config_dir: Path | None = None,
+             no_reconcile: bool = False) -> int:
     store = _store(config_dir)
-    reconcile(store)
+    if not no_reconcile:
+        reconcile(store)
     projects = store.list_projects()
     if not projects:
         print("(no projects — `peers-ctl add <path>` to register one)")
@@ -862,30 +951,36 @@ def _dashboard_container_name(project: Project) -> str:
     return "-"
 
 
-def cmd_dashboard(config_dir: Path | None = None) -> int:
-    store = _store(config_dir)
-    reconcile(store)
-    projects = store.list_projects()
-    if not projects:
-        print("(no projects registered)")
+def cmd_dashboard(
+    config_dir: Path | None = None,
+    *,
+    live: bool = False,
+    refresh_s: float = 2.0,
+    project: str | None = None,
+) -> int:
+    if project is not None:
+        try:
+            validate_project_name(project)
+        except ValueError as e:
+            print(f"peers-ctl: {e}", file=sys.stderr)
+            return 2
+    if live:
+        from peers_ctl.dashboard_live import run
+        return run(config_dir, refresh_s=refresh_s, project_name=project)
+    from peers_ctl.dashboard_live import (
+        DashboardProjectNotFound,
+        load_dashboard_rows,
+        render_project_detail,
+        render_snapshot,
+    )
+    if project is not None:
+        try:
+            print(render_project_detail(config_dir, project))
+        except DashboardProjectNotFound as e:
+            print(e, file=sys.stderr)
+            return e.exit_code
         return 0
-    rows: list[tuple[str, ...]] = [
-        (
-            "NAME", "STATE", "TICKS", "HARD_OPEN", "SOFT_OPEN",
-            "BLOCKING", "CONTAINER", "LAST",
-        )
-    ]
-    for project in projects:
-        repo = Path(project.path)
-        ticks, blocking, last = _project_rollup(repo)
-        hard_open, soft_open = _dashboard_goal_counts(repo)
-        rows.append((
-            project.name, project.state, str(ticks), hard_open, soft_open,
-            str(blocking), _dashboard_container_name(project), last,
-        ))
-    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
-    for row in rows:
-        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+    print(render_snapshot(load_dashboard_rows(config_dir, reconciler=reconcile)))
     return 0
 
 
@@ -960,7 +1055,8 @@ def _render_controller_report(store: Store, projects: list[Project],
 
 
 def cmd_report(name: str | None = None,
-               config_dir: Path | None = None) -> int:
+               config_dir: Path | None = None,
+               output_format: str = "text") -> int:
     """Write a controller Markdown report to the peers-ctl config dir."""
     store = _store(config_dir)
     reconcile(store)
@@ -979,6 +1075,14 @@ def cmd_report(name: str | None = None,
     if not projects:
         print("peers-ctl: no projects registered", file=sys.stderr)
         return 1
+    if output_format == "json":
+        print(json.dumps(_controller_report_json(store, projects, name),
+                         indent=2, sort_keys=True))
+        return 0
+    if output_format != "text":
+        print(f"peers-ctl: unsupported report format: {output_format}",
+              file=sys.stderr)
+        return 2
     report, errors = _render_controller_report(store, projects, name)
     filename = "REPORT.md" if name is None else f"REPORT-{name}.md"
     try:
@@ -989,6 +1093,153 @@ def cmd_report(name: str | None = None,
         return 1
     print(f"wrote {store.config_dir / filename}")
     return 1 if errors else 0
+
+
+def _state_budget_summary(state: dict) -> dict:
+    b = state.get("budget") if isinstance(state, dict) else {}
+    if not isinstance(b, dict):
+        b = {}
+    return {
+        "iterations": {
+            "used": b.get("spent_iterations", 0),
+            "max": b.get("max_iterations"),
+        },
+        "runtime_s": {
+            "used": b.get("spent_runtime_s", 0),
+            "max": b.get("max_runtime_s"),
+        },
+        "tokens": {"total": b.get("spent_tokens", 0)},
+        "usd": {"total": b.get("spent_usd", 0.0)},
+    }
+
+
+def _load_project_state(repo: Path) -> dict:
+    path = repo / ".peers" / "state.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(read_text_no_symlink(path))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_project_ticks(repo: Path) -> list[dict]:
+    path = repo / ".peers" / "log" / "runs.jsonl"
+    if not path.is_file():
+        return []
+    out: list[dict] = []
+    try:
+        with open_text_read_no_symlink(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict):
+                    out.append(entry)
+    except OSError:
+        return []
+    return out
+
+
+def _controller_report_json(
+    store: Store,
+    projects: list[Project],
+    scope: str | None,
+) -> dict:
+    exported_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    out_projects: list[dict] = []
+    for project in projects:
+        repo = Path(project.path)
+        state = _load_project_state(repo)
+        ticks = _load_project_ticks(repo)
+        stop_reason = None
+        for entry in reversed(ticks):
+            if entry.get("event") == "exit":
+                stop_reason = entry.get("reason")
+                break
+        try:
+            from peers.bug_hunt import summary_dict
+            bugs = summary_dict(repo)
+        except Exception:
+            bugs = {
+                "total": 0,
+                "open_blocking": 0,
+                "by_severity": {},
+                "by_cwe": {},
+                "reports": [],
+                "warnings": [],
+            }
+        goals_status = state.get("goals_status") or {}
+        soft_status = state.get("soft_status") or {}
+        out_projects.append({
+            "project": project.name,
+            "path": project.path,
+            "state": project.state,
+            "stop_reason": stop_reason,
+            "budget": _state_budget_summary(state),
+            "goals": {
+                "hard": [
+                    {"id": gid, **info}
+                    for gid, info in goals_status.items()
+                    if isinstance(info, dict)
+                ],
+                "soft": [
+                    {"id": gid, **info}
+                    for gid, info in soft_status.items()
+                    if isinstance(info, dict)
+                ],
+            },
+            "bugs": bugs,
+            "ticks": ticks,
+        })
+    return {
+        "version": 1,
+        "exported_at": exported_at,
+        "scope": scope or "all projects",
+        "config_dir": str(store.config_dir),
+        "projects": out_projects,
+    }
+
+
+def cmd_peek(
+    name: str,
+    *,
+    session: str | None = None,
+    no_follow: bool = False,
+    last: int | None = None,
+    config_dir: Path | None = None,
+) -> int:
+    store = _store(config_dir)
+    project = store.get(name)
+    if project is None:
+        print(f"peers-ctl: no such project: {name}", file=sys.stderr)
+        return 1
+    from peers.health_guard import claude_session_jsonl_path
+    from peers.peek import newest_session_jsonl, tail_session
+
+    cwd = "/work" if "container=1" in (project.notes or "") else project.path
+    jsonl_dir = claude_session_jsonl_path(cwd)
+    if jsonl_dir is None:
+        print("peers-ctl peek: HOME unset or project cwd is not absolute",
+              file=sys.stderr)
+        return 1
+    jsonl = jsonl_dir / f"{session}.jsonl" if session else (
+        newest_session_jsonl(jsonl_dir)
+    )
+    if jsonl is None or not jsonl.exists():
+        print(f"peers-ctl peek: no session jsonl in {jsonl_dir}",
+              file=sys.stderr)
+        return 1
+    try:
+        for line in tail_session(jsonl, follow=not no_follow, last=last):
+            print(line, flush=True)
+    except KeyboardInterrupt:
+        return 130
+    return 0
 
 
 def cmd_start(name: str, max_ticks: int | None = None,
@@ -1097,12 +1348,14 @@ def cmd_stop(name: str, grace_s: float = 10.0,
 
 
 def cmd_status(name: str | None = None,
-               config_dir: Path | None = None) -> int:
+               config_dir: Path | None = None,
+               no_reconcile: bool = False) -> int:
     store = _store(config_dir)
-    reconcile(store)
     if name is None:
-        return cmd_list(config_dir)
-    p = store.get(name)
+        if not no_reconcile:
+            reconcile(store)
+        return cmd_list(config_dir, no_reconcile=True)
+    p = store.get(name) if no_reconcile else reconcile_one(store, name)
     if p is None:
         print(f"peers-ctl: no such project: {name}", file=sys.stderr)
         return 1
@@ -1538,15 +1791,41 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     _add_help_man_subparser(
         sub, "list", help_text="list all projects + state")
-    _add_help_man_subparser(
+    p_dashboard = _add_help_man_subparser(
         sub, "dashboard",
         help_text="rollup view across all registered projects")
+    p_dashboard.add_argument(
+        "--live", action="store_true",
+        help="redraw the dashboard continuously until Ctrl-C",
+    )
+    p_dashboard.add_argument(
+        "--refresh-s", type=float, default=2.0,
+        help="seconds between --live refreshes (default: 2.0)",
+    )
+    p_dashboard.add_argument(
+        "--project", default=None,
+        help="show one project's detail drilldown",
+    )
 
     p_report = _add_help_man_subparser(
         sub, "report",
-        help_text="write a Markdown controller report under the config dir",
+        help_text="write a controller report under the config dir or JSON to stdout",
     )
     p_report.add_argument("name", nargs="?", default=None)
+    p_report.add_argument("--format", choices=("text", "json"),
+                          default="text")
+
+    p_peek = _add_help_man_subparser(
+        sub, "peek",
+        help_text="live-decode the newest claude session jsonl for a project",
+    )
+    p_peek.add_argument("name")
+    p_peek.add_argument("--session", default=None,
+                        help="specific claude session id without .jsonl")
+    p_peek.add_argument("--no-follow", action="store_true",
+                        help="print current events and exit")
+    p_peek.add_argument("--last", type=int, default=None,
+                        help="read only the last N raw jsonl events first")
 
     p_start = _add_help_man_subparser(
         sub, "start", help_text="start a project loop")
@@ -1632,6 +1911,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="implement-mode project name (bare name under "
              "$PEERS_PROJECTS_ROOT)",
     )
+    p_resume.add_argument("--max-runtime", type=str, default=None,
+                          metavar="DURATION")
+    p_resume.add_argument("--reset-budget", action="store_true")
+    p_resume.add_argument("--force", action="store_true")
+    p_resume.add_argument("--start", action="store_true",
+                          help="start the project after clearing markers")
+    p_resume.add_argument("--container", action="store_true",
+                          help="with --start, run inside the peers container")
 
     p_stop = _add_help_man_subparser(
         sub, "stop", help_text="stop a project loop")
@@ -1641,6 +1928,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_status = _add_help_man_subparser(
         sub, "status", help_text="status of one or all projects")
     p_status.add_argument("name", nargs="?", default=None)
+    p_status.add_argument("--no-reconcile", action="store_true",
+                          help="print registry state without probing liveness")
 
     p_review = _add_help_man_subparser(
         sub, "review", help_text="show latest handoff self-review")
@@ -1716,9 +2005,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cmd == "list":
         return cmd_list(cd)
     if args.cmd == "dashboard":
-        return cmd_dashboard(cd)
+        return cmd_dashboard(
+            cd, live=args.live, refresh_s=args.refresh_s,
+            project=args.project,
+        )
     if args.cmd == "report":
-        return cmd_report(args.name, cd)
+        return cmd_report(args.name, cd, output_format=args.format)
+    if args.cmd == "peek":
+        return cmd_peek(
+            args.name, session=args.session, no_follow=args.no_follow,
+            last=args.last, config_dir=cd,
+        )
     if args.cmd == "start":
         return cmd_start(args.name, args.max_ticks, args.max_usd,
                          max_runtime=args.max_runtime,
@@ -1732,11 +2029,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                          ),
                          checkpoint=args.checkpoint)
     if args.cmd == "resume":
-        return cmd_resume(args.project_name)
+        return cmd_resume(
+            args.project_name,
+            max_runtime=args.max_runtime,
+            reset_budget=args.reset_budget,
+            force=args.force,
+            start_run=args.start,
+            container=args.container,
+            config_dir=cd,
+        )
     if args.cmd == "stop":
         return cmd_stop(args.name, args.grace_s, cd)
     if args.cmd == "status":
-        return cmd_status(args.name, cd)
+        return cmd_status(args.name, cd, no_reconcile=args.no_reconcile)
     if args.cmd == "review":
         return cmd_review(args.name, cd)
     if args.cmd == "logs":

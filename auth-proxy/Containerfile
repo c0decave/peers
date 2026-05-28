@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+COPY src/auth_proxy /app/auth_proxy
+WORKDIR /app
+
+# Keep the runtime user unset: with rootless podman, container root maps to
+# the invoking host user, so a file-bind-mounted ~/.claude.json stays writable.
+RUN mkdir -p /auth
+
+EXPOSE 8080
+
+ENTRYPOINT ["python", "-m", "auth_proxy.server"]
+CMD ["--host", "127.0.0.1", "--port", "8080", "--token-file", "/auth/.claude.json"]

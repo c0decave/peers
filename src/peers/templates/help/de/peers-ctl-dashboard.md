@@ -7,7 +7,7 @@ Container-Name und Last-Tick-Timestamp.
 
 ## SYNOPSIS
 ```
-peers-ctl dashboard
+peers-ctl dashboard [--live] [--refresh-s SEKUNDEN] [--project NAME]
 ```
 
 ## BESCHREIBUNG
@@ -28,18 +28,34 @@ alteres   idle     12     0          0          0         -          2026-...
 - `CONTAINER` — Podman-Container-Name wenn bekannt (aus Registry-
   `notes`-Feld geparst).
 - `LAST` — jüngster `runs.jsonl`-Timestamp.
+- In `--live` zeigt `ALERT` `CRASHED`, `UNKNOWN`, `HALTED`,
+  `BUDGET`, `DEGRADED` oder `WARN`; `EVENT` zeigt das neueste
+  dekodierte Claude-Session-Event, falls vorhanden.
 
 Spalten werden auto-sized für Terminal-freundliche Breite.
 
+Mit `--project NAME` wechselt das Dashboard vom Multi-Projekt-Rollup
+in einen Single-Projekt-Drilldown. Der Drilldown zeigt die Projektzeile,
+die jüngsten `runs.jsonl`-Einträge und Bug-Report-Details. Zusammen mit
+`--live` wird auch diese Ansicht kontinuierlich neu gezeichnet.
+
 ## OPTIONS
-Keine.
+- `--live` — Dashboard kontinuierlich neu zeichnen bis Ctrl-C.
+- `--refresh-s SEKUNDEN` — Refresh-Intervall für `--live` (Default:
+  `2.0`). Muss größer als null sein.
+- `--project NAME` — Single-Projekt-Drilldown mit jüngsten Runs und
+  Bug-Reports anzeigen.
 
 ## BEISPIELE
 ```
 peers-ctl dashboard
 
-# In einer watch-Loop.
-watch -n 5 peers-ctl dashboard
+# Eingebaute Live-Ansicht.
+peers-ctl dashboard --live --refresh-s 1
+
+# Single-Projekt-Drilldown.
+peers-ctl dashboard --project meine-app
+peers-ctl dashboard --live --project meine-app
 ```
 
 ## DATEIEN
@@ -52,6 +68,7 @@ Keine.
 ## SIEHE AUCH
 - `peers-ctl list --help-man` — minimale Drei-Spalten-Form.
 - `peers-ctl status --help-man` — Single-Projekt-Deep-View.
+- `peers-ctl peek --help-man` — dekodierte Live-Claude-Session-Events.
 - `peers-ctl report --help-man` — Markdown-Rollup mit Controller-Log-
   Pfaden.
 

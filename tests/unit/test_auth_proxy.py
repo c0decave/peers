@@ -1,0 +1,224 @@
+"""Auth-proxy request forwarding and token-refresh tests."""
+from __future__ import annotations
+
+import io
+import errno
+import json
+import stat
+import urllib.error
+from pathlib import Path
+
+from auth_proxy import oauth_refresh
+from auth_proxy.oauth_refresh import refresh_claude_config
+from auth_proxy.server import forward_request
+
+
+class FakeResponse:
+    def __init__(self, status: int, body: bytes, headers=None) -> None:
+        self.status = status
+        self._body = body
+        self.headers = headers or {}
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+class MemoryTokenStore:
+    def __init__(self) -> None:
+        self.token = "old-token"
+        self.refreshes = 0
+
+    def access_token(self) -> str:
+        return self.token
+
+    def refresh(self) -> bool:
+        self.refreshes += 1
+        self.token = "new-token"
+        return True
+
+
+def test_forward_request_injects_bearer_and_strips_host_auth() -> None:
+    captured = {}
+
+    def opener(request, *, timeout):
+        captured["url"] = request.full_url
+        captured["auth"] = request.get_header("Authorization")
+        captured["host"] = request.get_header("Host")
+        captured["body"] = request.data
+        captured["timeout"] = timeout
+        return FakeResponse(200, b"ok", {"Content-Type": "application/json"})
+
+    response = forward_request(
+        "POST",
+        "/v1/messages?x=1",
+        {"Host": "attacker", "Authorization": "Bearer stolen"},
+        b'{"hello": true}',
+        MemoryTokenStore(),
+        upstream_base="https://api.anthropic.test",
+        opener=opener,
+        timeout=3,
+    )
+
+    assert response.status == 200
+    assert response.body == b"ok"
+    assert captured == {
+        "url": "https://api.anthropic.test/v1/messages?x=1",
+        "auth": "Bearer old-token",
+        "host": None,
+        "body": b'{"hello": true}',
+        "timeout": 3,
+    }
+
+
+def test_forward_request_strips_hop_headers_from_both_directions() -> None:
+    captured = {}
+
+    def opener(request, *, timeout):
+        captured["connection"] = request.get_header("Connection")
+        captured["proxy_auth"] = request.get_header("Proxy-Authorization")
+        return FakeResponse(
+            200,
+            b"ok",
+            {
+                "Connection": "close",
+                "Transfer-Encoding": "chunked",
+                "Content-Length": "999",
+                "X-Trace": "kept",
+            },
+        )
+
+    response = forward_request(
+        "GET",
+        "/v1/messages",
+        {
+            "Connection": "keep-alive",
+            "Proxy-Authorization": "secret",
+        },
+        b"",
+        MemoryTokenStore(),
+        upstream_base="https://api.anthropic.test",
+        opener=opener,
+    )
+
+    assert captured == {"connection": None, "proxy_auth": None}
+    assert response.headers == {"X-Trace": "kept"}
+
+
+def test_forward_request_returns_502_on_upstream_connection_failure() -> None:
+    def opener(request, *, timeout):
+        raise urllib.error.URLError("connection refused")
+
+    response = forward_request(
+        "GET", "/v1/messages", {}, b"", MemoryTokenStore(),
+        upstream_base="https://api.anthropic.test", opener=opener,
+    )
+
+    assert response.status == 502
+    assert b"upstream request failed" in response.body
+
+
+def test_forward_request_refreshes_once_on_401() -> None:
+    store = MemoryTokenStore()
+    seen_auth = []
+
+    def opener(request, *, timeout):
+        seen_auth.append(request.get_header("Authorization"))
+        if len(seen_auth) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                401,
+                "expired",
+                {},
+                io.BytesIO(b"expired"),
+            )
+        return FakeResponse(200, b"retried")
+
+    response = forward_request(
+        "GET", "/v1/messages", {}, b"", store,
+        upstream_base="https://api.anthropic.test", opener=opener,
+    )
+
+    assert response.status == 200
+    assert response.body == b"retried"
+    assert store.refreshes == 1
+    assert seen_auth == ["Bearer old-token", "Bearer new-token"]
+
+
+def test_refresh_claude_config_updates_nested_token_file(tmp_path: Path) -> None:
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh",
+            "tokenUrl": "https://auth.example/token",
+            "clientId": "client-1",
+            "expiresAt": 1,
+        }
+    }), encoding="utf-8")
+    token_file.chmod(0o644)
+    captured = {}
+
+    def opener(request, *, timeout):
+        captured["url"] = request.full_url
+        captured["body"] = request.data.decode("utf-8")
+        return FakeResponse(
+            200,
+            json.dumps({
+                "access_token": "new",
+                "refresh_token": "refresh-2",
+                "expires_in": 60,
+            }).encode("utf-8"),
+        )
+
+    token = refresh_claude_config(token_file, opener=opener, now=lambda: 10)
+
+    data = json.loads(token_file.read_text(encoding="utf-8"))
+    assert token == "new"
+    assert captured["url"] == "https://auth.example/token"
+    assert "grant_type=refresh_token" in captured["body"]
+    assert "refresh_token=refresh" in captured["body"]
+    assert data["oauthAccount"]["accessToken"] == "new"
+    assert data["oauthAccount"]["refreshToken"] == "refresh-2"
+    assert data["oauthAccount"]["expiresAt"] == 70
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+
+
+def test_refresh_claude_config_rewrites_file_bind_mount_when_replace_busy(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh",
+            "tokenUrl": "https://auth.example/token",
+        }
+    }), encoding="utf-8")
+
+    def opener(request, *, timeout):
+        return FakeResponse(
+            200,
+            json.dumps({
+                "access_token": "new",
+                "refresh_token": "refresh-2",
+            }).encode("utf-8"),
+        )
+
+    def busy_replace(src, dst):
+        raise OSError(errno.EBUSY, "mountpoint is busy")
+
+    monkeypatch.setattr(oauth_refresh.os, "replace", busy_replace)
+
+    token = refresh_claude_config(token_file, opener=opener)
+
+    data = json.loads(token_file.read_text(encoding="utf-8"))
+    assert token == "new"
+    assert data["oauthAccount"]["accessToken"] == "new"
+    assert data["oauthAccount"]["refreshToken"] == "refresh-2"
+    assert not (tmp_path / ".claude.json.tmp").exists()

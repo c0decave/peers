@@ -1,8 +1,35 @@
 services:
+  auth-proxy:
+    build:
+      context: .
+      dockerfile: auth-proxy/Containerfile
+    volumes:
+      - ${HOME:?HOME must be set}/.claude.json:/auth/.claude.json
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m
+      - /auth:rw,nosuid,nodev,size=4m,mode=700
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--token-file"
+      - "/auth/.claude.json"
+
   peers:
     build:
       context: .
       dockerfile: Containerfile
+    depends_on:
+      - auth-proxy
+    environment:
+      ANTHROPIC_BASE_URL: "http://auth-proxy:8080"
     # Map the host user into the container so bind-mounts are
     # readable/writeable without juggling build-time UID/GID args.
     # Equivalent to `podman run --userns=keep-id`.

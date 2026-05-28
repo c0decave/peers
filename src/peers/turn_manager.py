@@ -13,7 +13,42 @@ retry budget).
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
+
+
+def _handoff_msg_path(project_root: Path) -> Path:
+    return Path(project_root) / ".peers" / "handoff-msg.txt"
+
+
+def write_handoff_msg(project_root: Path, text: str) -> Path:
+    """Write substrate handoff scratch under ``.peers/``.
+
+    Older experiments wrote a root-level ``.handoff-msg.txt`` which then
+    showed up as untracked work. This helper keeps the scratch file in
+    the control directory where it belongs.
+    """
+    path = _handoff_msg_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def sweep_legacy_handoff_msg(project_root: Path) -> None:
+    """Move/remove legacy root-level handoff scratch files best-effort."""
+    root = Path(project_root)
+    target = _handoff_msg_path(root)
+    for name in (".handoff-msg.txt", "handoff-msg.txt"):
+        legacy = root / name
+        try:
+            if not legacy.exists() or legacy.is_symlink():
+                continue
+            text = legacy.read_text(encoding="utf-8", errors="replace")
+            if not target.exists():
+                write_handoff_msg(root, text)
+            legacy.unlink()
+        except OSError:
+            continue
 
 
 class TurnManager:

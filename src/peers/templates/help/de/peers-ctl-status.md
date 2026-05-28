@@ -7,7 +7,7 @@ Projekt (JSON + embedded `peers status`), oder fällt ohne Name auf
 
 ## SYNOPSIS
 ```
-peers-ctl status [<name>]
+peers-ctl status [<name>] [--no-reconcile]
 ```
 
 ## BESCHREIBUNG
@@ -24,6 +24,8 @@ und druckt:
 ## OPTIONS
 - `name` (positional, optional) — registrierter Projektname. Wenn
   weggelassen → List-View.
+- `--no-reconcile` — Registry-State drucken, ohne vorher PID/Container-
+  Liveness zu prüfen.
 
 ## BEISPIELE
 ```

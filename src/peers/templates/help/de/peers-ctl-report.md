@@ -6,7 +6,7 @@ peers-ctl report — rendert einen controller-seitigen Markdown-Report
 
 ## SYNOPSIS
 ```
-peers-ctl report [<name>]
+peers-ctl report [<name>] [--format text|json]
 ```
 
 ## BESCHREIBUNG
@@ -23,6 +23,8 @@ sind (z.B. README fehlt / unsafe Symlink, Controller-Log unsafe).
 
 ## OPTIONS
 - `name` (positional, optional) — auf ein Projekt einschränken.
+- `--format` — `text` schreibt Markdown ins Config-Dir (Default);
+  `json` druckt einen strukturierten Export nach stdout.
 
 ## BEISPIELE
 ```
@@ -31,6 +33,9 @@ peers-ctl report
 
 # Nur eins.
 peers-ctl report meine-app
+
+# Strukturierter Export.
+peers-ctl report meine-app --format json
 ```
 
 ## DATEIEN

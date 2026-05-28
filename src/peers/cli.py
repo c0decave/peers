@@ -756,9 +756,9 @@ def _refuse_symlink_control_dir(peer_dir: Path) -> str | None:
 def _lock_file_held(lock_path: Path) -> bool | None:
     """Best-effort flock probe for status output.
 
-    ``run.lock`` is intentionally left on disk after unlock so all
-    contenders keep using the same inode. Existence alone therefore no
-    longer means the lock is held.
+    Existence alone does not mean the lock is held: older peers
+    versions left stale files behind, and current versions remove the
+    file best-effort only after releasing the flock.
     """
     import fcntl
 

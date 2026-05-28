@@ -49,7 +49,7 @@ Keine direkt; pro-Check-`cmd:`-Strings können Projekt-Env nutzen.
 ## SIEHE AUCH
 - `peers report --help-man` — breiterer Projekt-Rollup.
 - `peers info --help-man` — Konfig-Dump.
-- `docs/HOWTO-audit-and-fix.md` — Abschnitt „8) Abnahme".
+- `docs/HOWTO-audit-and-fix_DE.md` — Abschnitt „8) Abnahme".
 
 ## NOTES
 - Soft-Goals werden NICHT re-evaluiert (brauchen Peer-Reviews).

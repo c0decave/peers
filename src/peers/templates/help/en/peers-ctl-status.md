@@ -7,7 +7,7 @@ called with no name.
 
 ## SYNOPSIS
 ```
-peers-ctl status [<name>]
+peers-ctl status [<name>] [--no-reconcile]
 ```
 
 ## DESCRIPTION
@@ -25,6 +25,8 @@ prints:
 ## OPTIONS
 - `name` (positional, optional) — registered project name. If omitted,
   prints the list view.
+- `--no-reconcile` — print registry state without probing PID/container
+  liveness first.
 
 ## EXAMPLES
 ```

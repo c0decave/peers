@@ -3,19 +3,11 @@
 A small Python substrate that drives **n ≥ 2** AI coding CLIs (Claude
 Code, Codex, …) as cooperating peers toward measurable project goals.
 
-- **HOWTO: full audit + fix on an existing app**: [docs/HOWTO-audit-and-fix.md](docs/HOWTO-audit-and-fix.md)
-- **`implement` mode (build a feature from PLAN.md)**: [docs/MODES_IMPLEMENT.md](docs/MODES_IMPLEMENT.md)
-- Security model: [docs/SECURITY.md](docs/SECURITY.md)
+> Deutsche Version: [README_DE.md](README_DE.md).
 
-To re-run the hardening checklist locally:
-
-```sh
-scripts/hardening-audit.sh
-```
-
-The static subset runs in CI and the local pre-push hook; the dynamic
-run additionally requires a clean working tree and verifies that
-`peers:dev` was built from the current Git HEAD.
+- **HOWTO: full audit + fix on an existing app**: [docs/HOWTO-audit-and-fix.md](docs/HOWTO-audit-and-fix.md) — [deutsche Anleitung](docs/HOWTO-audit-and-fix_DE.md)
+- **`implement` mode (build a feature from PLAN.md)**: [docs/MODES_IMPLEMENT.md](docs/MODES_IMPLEMENT.md) — [DE](docs/MODES_IMPLEMENT_DE.md)
+- Security model: [docs/SECURITY.md](docs/SECURITY.md) — [DE](docs/SECURITY_DE.md)
 
 ## Quickstart (unattended, via the controller)
 
@@ -133,6 +125,8 @@ audit history (`.peers/state.json`, `.peers/log/runs.jsonl`) intact.
 ```sh
 peers-ctl status mything                # snapshot
 peers-ctl dashboard                     # all registered projects at once
+peers-ctl dashboard --live              # continuous redraw with alerts/events
+peers-ctl dashboard --project mything   # drilldown: recent runs + bugs
 peers-ctl tail mything                  # live tail (Ctrl-C to detach)
 tail -f /path/to/your-target-project/.peers/log/runs.jsonl   # rich per-tick audit
 peers -C /path/to/your-target-project replay 3               # inspect tick 3
@@ -270,6 +264,8 @@ peers-ctl list                             # all projects + state
 
 # Observe
 peers-ctl dashboard                        # rollup across all projects
+peers-ctl dashboard --live --refresh-s 1   # live rollup with alerts/events
+peers-ctl dashboard --project <name>        # recent runs + bug drilldown
 peers-ctl tail [<name>]                    # follow controller log
 peers-ctl logs <name> [-n 100]             # print last N lines
 peers-ctl report [<name>]                  # write controller REPORT-<n>.md
@@ -378,7 +374,9 @@ If codex (or any other peer CLI) isn't on the host but is available
 in the `peers:dev` image, run the loop inside the container:
 
 ```sh
-make build                              # one-time
+make build                              # one-time main image
+make proxy-build                        # egress sidecar
+make auth-proxy-build                   # Claude OAuth sidecar
 peers-ctl doctor                        # confirms podman + image exist
 peers-ctl start mything --container --max-ticks 20 --max-usd 5
 ```
@@ -389,7 +387,10 @@ PID is only the host-side `podman logs -f` streamer. `peers-ctl stop
 --grace-s N` uses `podman stop -t N`, then reaps the log streamer.
 
 Container mode bind-mounts the target repo, `~/.claude`, `~/.codex`,
-optional `~/.claude.json`, and optional read-only `~/.gitconfig`.
+and optional read-only `~/.gitconfig`. When `~/.claude.json` exists,
+it is mounted into the per-project `peers-auth-proxy_<name>` sidecar
+instead of the workspace container; the workspace talks to
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8080`.
 Before launch, `peers-ctl` compares the host package version with
 `peers --version` inside the image: minor/patch drift warns, major
 drift refuses start until you rebuild (`make build`).
@@ -495,7 +496,11 @@ tick counts, blocking bug counts, last activity, and README status so a
 handoff can spot missing operator docs before the next run.
 `peers-ctl dashboard` is the fast terminal view: state, ticks, open
 hard/soft goals, blocking bug count, running container name, and last
-tick timestamp for every registered project.
+tick timestamp for every registered project. Add `--live` for a
+periodic redraw that also shows alert state and the newest decoded
+Claude session event when available. Add `--project <name>` for a
+single-project drilldown with recent runs and bug reports; combine it
+with `--live` to redraw that detail view.
 
 Example `peers-ctl doctor` output:
 
@@ -860,7 +865,9 @@ table at `.peers/VERIFY.md`.
 src/
 ├── peers/                  # the substrate
 │   ├── cli.py              # peers init / run / status / tick / replay / watch / tmux
-│   ├── driver_orchestrator.py
+│   ├── driver_orchestrator.py      # public facade
+│   ├── _driver_orchestrator_impl.py # thin runtime coordinator
+│   ├── driver_*.py          # decomposed lifecycle / observability / health hooks
 │   ├── state_store.py      # schema v2 + v1 migration
 │   ├── turn_manager.py     # round-robin over n peers
 │   ├── goal_engine.py
@@ -870,10 +877,11 @@ src/
 │   ├── health_guard.py     # streaming reader + idle-timeout + truncation
 │   ├── prompt_builder.py
 │   └── templates/
-└── peers_ctl/              # the controller
+├── peers_ctl/              # the controller
     ├── cli.py              # add / remove / list / start / stop / status / review / logs / tail / prune
     ├── store.py            # registry on disk, fcntl-locked
     └── runner.py           # detached spawn + PID-recycle defence
+└── auth_proxy/             # OAuth sidecar server
 
 tests/
 ├── unit/                   # unit tests

@@ -1,0 +1,16 @@
+name: hunt-open-ended
+version: 1
+description: |
+  Open-ended bug-hunt mode: convergence is a progress signal, not a
+  terminal condition. The loop stops on budget, halt-class peer
+  unavailability, or explicit operator stop.
+terminate_on_convergence: false
+composable_with:
+  - security-cpp-memory
+  - security-devils-advocate
+  - security-owasp-web
+  - security-owasp-llm
+preconditions:
+  - file: SPEC.md
+prompts_dir: prompts
+goals_file: goals.yaml

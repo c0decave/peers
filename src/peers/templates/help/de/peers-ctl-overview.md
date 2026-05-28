@@ -66,7 +66,7 @@ peers-ctl prune --older-than-days 7
 ## SIEHE AUCH
 - `peers --help-man` für pro-Projekt-Kommandos.
 - `peers-ctl doctor` für Pre-Flight-Checks.
-- `docs/HOWTO-audit-and-fix.md` — End-to-End-Audit-Walkthrough.
+- `docs/HOWTO-audit-and-fix_DE.md` — End-to-End-Audit-Walkthrough.
 
 ## NOTES
 - Die Registry ist autoritativ für `peers-ctl`-Operationen; Projekte

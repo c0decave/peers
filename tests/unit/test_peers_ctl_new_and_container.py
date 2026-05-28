@@ -315,6 +315,54 @@ def test_build_container_argv_sets_proxy_env_vars(tmp_path: Path) -> None:
                for s in env_specs), env_specs
 
 
+def test_auth_proxy_container_name_is_derived_from_project_name(
+    tmp_path: Path,
+) -> None:
+    from peers_ctl.runner import _auth_proxy_container_name
+    from peers_ctl.store import Project
+    p = Project(name="foo", path=str(tmp_path / "p"))
+    assert _auth_proxy_container_name(p) == "peers-auth-proxy_foo"
+
+
+def test_build_auth_proxy_argv_owns_claude_json_mount(
+    tmp_path: Path,
+) -> None:
+    from peers_ctl.runner import _build_auth_proxy_argv
+    from peers_ctl.store import Project
+    (tmp_path / ".claude.json").write_text("{}")
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+
+    argv = _build_auth_proxy_argv(p, home=tmp_path)
+
+    assert "peers-auth-proxy:dev" in argv
+    assert "--name" in argv
+    assert "peers-auth-proxy_x" in argv
+    assert f"{tmp_path / '.claude.json'}:/auth/.claude.json" in argv
+    assert "/auth:rw,nosuid,nodev,size=4m,mode=700" in argv
+    assert "--network=container:peers-egress-proxy_x" in argv
+    assert "--read-only" in argv
+
+
+def test_build_container_argv_uses_auth_proxy_without_claude_json_mount(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+
+    (tmp_path / ".claude.json").write_text("{}")
+    (tmp_path / "tgt").mkdir()
+    monkeypatch.setattr(r.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(r, "AUTH_PROXY_DISABLED", False)
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+
+    argv = r._build_container_argv(p, max_ticks=1, extra_args=())
+
+    env_specs = [argv[i + 1] for i, a in enumerate(argv)
+                 if a in ("-e", "--env") and i + 1 < len(argv)]
+    assert "ANTHROPIC_BASE_URL=http://127.0.0.1:8080" in env_specs
+    assert not any(".claude.json:/home/peer/.claude.json" in a for a in argv)
+
+
 def test_egress_proxy_can_be_disabled_via_env(
     tmp_path: Path, monkeypatch,
 ) -> None:

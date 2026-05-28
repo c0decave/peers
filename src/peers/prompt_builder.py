@@ -37,8 +37,8 @@ where X is something the spec doesn't promise won't happen). Don't
 just defend against what the test happens to send — defend against
 what a real caller can do.
 
-Don't write `assert True` tests; the substrate's anti-cheating
-revert will catch test-only diffs.
+Don't write `assert True` tests; the substrate's anti-cheating guard
+will warn on test-only diffs and may revert repeated ones.
 """.strip()
 
 

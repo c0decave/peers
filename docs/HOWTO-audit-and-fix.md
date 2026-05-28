@@ -1,176 +1,179 @@
-# HOWTO: App komplett auditieren + fixen mit peers
+# HOWTO: full audit + fix on an existing app with peers
 
-> Ziel: eine bestehende App von zwei oder mehr LLM-peers (claude + codex)
-> komplett durchprüfen lassen — jeder Bug gefunden, kritisch bewertet,
-> dann ehrlich gefixt, mit happy/edge/sad-Tests dokumentiert, alles
-> committed und gepusht. Keine Abkürzungen.
+> Goal: have an existing app inspected end-to-end by two or more
+> LLM-peers (claude + codex) — every bug found, critically triaged,
+> then honestly fixed, with happy/edge/sad tests, all committed and
+> pushed. No shortcuts.
 
-Die Anleitung ist das Resultat aus mehreren echten Dogfood-Runs auf
-Python- und JS-Projekten.
+This guide is the result of multiple real-world dogfood runs on
+Python and JS projects.
+
+> The German edition lives at
+> [HOWTO-audit-and-fix_DE.md](HOWTO-audit-and-fix_DE.md).
 
 ---
 
-## 0) Prerequisites (einmal pro Host)
+## 0) Prerequisites (one-time per host)
 
 ```sh
 cd <path-to-your-peers-checkout>
-pip install -e .[dev]                 # peers + peers-ctl auf PATH
+pip install -e .[dev]                 # peers + peers-ctl on PATH
 podman build --network=host -f Containerfile -t peers:dev .
 peers-ctl doctor                      # sanity-check
 ```
 
-`peers-ctl doctor` muss anzeigen:
-- `claude` gefunden (oder dein VSCode-Extension-Pfad)
-- `codex` gefunden
-- `peers:dev` Image gebaut
+`peers-ctl doctor` must show:
+- `claude` found (or your VSCode-extension path)
+- `codex` found
+- `peers:dev` image built
 - `podman` ≥ 4.0
-- Auth-Files vorhanden: `~/.claude/`, `~/.claude.json`, `~/.codex/`
+- Auth files present: `~/.claude/`, `~/.claude.json`, `~/.codex/`
 
-Wenn Auth fehlt: `claude login` und `codex auth login` ausführen.
+If auth is missing: run `claude login` and `codex auth login`.
 
 ---
 
-## 1) Projekt anmelden
+## 1) Register the project
 
 ```sh
-# Bare-Name landet in $PEERS_PROJECTS_ROOT (default ~/c0de/peers-c0de/).
-# Voller Pfad bleibt verbatim.
+# Bare name lands under $PEERS_PROJECTS_ROOT (default ~/c0de/peers-c0de/).
+# Full paths are taken verbatim.
 peers-ctl new myapp --container --modes=audit --spec ./myapp-spec.md
 ```
 
-`myapp-spec.md` ist eine Markdown-Beschreibung von:
-- **Was die App tut** (1–2 Absätze)
-- **Was "fertig" heißt** (concrete acceptance criteria, kein "ungefähr")
-- **Was sicher NICHT in Scope ist** (negative scope)
-- **Bekannte Schwachstellen, die die peers untersuchen sollen**
-- **Performance-Hotpaths**: Pfade die `perf-no-regression` benchmarken
-  soll (z.B. "die `parse_message`-Funktion in src/wire.py")
-- **Öffentliche API**: was darf NICHT versehentlich brechen — Liste
-  der exportierten Funktionen/Klassen/CLI-Flags (Liste hier macht
-  `api-stable`-Snapshots erst sinnvoll)
+`myapp-spec.md` is a Markdown description of:
+- **What the app does** (1–2 paragraphs)
+- **What "done" means** (concrete acceptance criteria, not "roughly")
+- **What is explicitly OUT of scope** (negative scope)
+- **Known weaknesses peers should investigate**
+- **Performance hot-paths**: paths that `perf-no-regression` should
+  benchmark (e.g. "the `parse_message` function in `src/wire.py`")
+- **Public API**: what must NOT accidentally break — list of exported
+  functions/classes/CLI flags (this list is what makes `api-stable`
+  snapshots meaningful)
 
-Je präziser SPEC.md ist, desto fokussierter der Audit. Vage SPECs
-führen zu kosmetischen Bug-Reports.
+The more precise SPEC.md is, the more focused the audit. Vague SPECs
+produce cosmetic bug reports.
 
-Fuer JavaScript/TypeScript-Projekte:
+For JavaScript/TypeScript projects:
 
 ```sh
 peers-ctl new myapp --container --modes=audit --lang=js --spec ./myapp-spec.md
 ```
 
-Unterstuetzt sind aktuell `python` (Default) und `js`. Andere Werte
-warnen und fallen auf Python-Templates zurueck, damit Scaffolding nie an
-einem Tippfehler scheitert.
+Currently supported: `python` (default) and `js`. Other values warn
+and fall back to Python templates so scaffolding never fails on a
+typo.
 
-Was angelegt wird:
+What gets created:
 ```
 ~/c0de/peers-c0de/myapp/
 ├── .peers/
-│   ├── config.yaml         # peer-Setup + Budget + Health
-│   ├── goals.yaml          # audit hard + soft goals (anpassen erlaubt)
-│   ├── SPEC.md             # Kopie deiner Spec
-│   ├── checks/             # audit Check-Scripts aus dem Template
-│   └── log/runs.jsonl      # tick-by-tick JSON, wird beim Lauf gefüllt
+│   ├── config.yaml         # peer setup + budget + health
+│   ├── goals.yaml          # audit hard + soft goals (adjust freely)
+│   ├── SPEC.md             # copy of your spec
+│   ├── checks/             # audit check scripts from the template
+│   └── log/runs.jsonl      # tick-by-tick JSON, populated as it runs
 ```
 
 ---
 
-## 2) goals.yaml — das eigentliche Audit-Programm
+## 2) goals.yaml — the actual audit program
 
-Ersetze das Default-Scaffold mit Folgendem (anpassen an deinen
-Tech-Stack). Die einzelnen Goals sind **bewusst hart konfiguriert** —
-die peers haben keinen Ausweg über "ach das ist halt komplex".
+Replace the default scaffold with the following (adapt to your tech
+stack). The individual goals are **intentionally hard-configured** —
+peers have no escape hatch via "well, this one's just complex".
 
 ```yaml
 goals:
-  # ===== HARTE GATES — alle müssen grün für "complete" =====
+  # ===== HARD GATES — all must be green for "complete" =====
 
   - id: self-review-on-handoff
     type: hard
-    description: "Jeder handoff-Commit trägt eine self-review."
+    description: "Every handoff commit carries a self-review."
     cmd: "python3 -m peers.templates.modes.audit.checks.verify_self_review"
     pass_when: "exit_code == 0"
 
   - id: tests-pass
     type: hard
-    description: "Die volle Test-Suite ist grün."
-    cmd: "python3 -m pytest -q 2>&1 || true"      # passe an dein Tool an
+    description: "The full test suite is green."
+    cmd: "python3 -m pytest -q 2>&1 || true"      # adapt to your tool
     pass_when: |
       regex('failed', stdout) == None
         and regex('passed', stdout + stderr) != None
 
   - id: tests-cover-happy-edge-sad
     type: hard
-    description: "Jede non-trivial Code-Datei in src/ hat mindestens
-      einen happy + edge + sad Test (via .peers/checks/coverage_3class.py)."
+    description: "Every non-trivial source file in src/ has at least
+      one happy + edge + sad test (via .peers/checks/coverage_3class.py)."
     cmd: "python3 .peers/checks/coverage_3class.py src tests"
     pass_when: "exit_code == 0"
 
   - id: lint-clean
     type: hard
-    cmd: "ruff check . 2>&1 || true"              # oder eslint/clippy/...
+    cmd: "ruff check . 2>&1 || true"              # or eslint/clippy/...
     pass_when: "regex('error', stdout + stderr) == None"
 
   - id: type-clean
     type: hard
-    cmd: "mypy src/ 2>&1 || true"                 # nur wenn dein Projekt typed ist
+    cmd: "mypy src/ 2>&1 || true"                 # only if your project is typed
     pass_when: "regex('error', stdout + stderr) == None"
 
   - id: bug-hunt-clean
     type: hard
-    description: "0 offene Bugs an severity crit/high/med.
-      `Bug-Defer:`-mit-Begründung gilt als geschlossen."
+    description: "0 open bugs at severity crit/high/med.
+      `Bug-Defer:`-with-rationale counts as closed."
     cmd: "python3 -m peers.bug_hunt gate ."
     pass_when: "exit_code == 0"
 
   - id: tdd-reproduces-bug
     type: hard
-    description: "Jeder Bug-Resolves an blocking-Severity hat einen
-      VORANGEHENDEN Bug-Reproduce-Commit (failing test first)."
+    description: "Every Bug-Resolves at blocking severity has a
+      PRECEDING Bug-Reproduce commit (failing test first)."
     cmd: "python3 -m peers.bug_hunt gate-tdd ."
     pass_when: "exit_code == 0"
 
   - id: no-secrets-committed
     type: hard
-    description: "Keine Credentials/Secrets im Working-Tree.
-      trufflehog ist nur ein Beispiel; jeder Scanner mit exit-1-on-find tut's."
+    description: "No credentials/secrets in the working tree.
+      trufflehog is just one example; any scanner that exits 1 on find works."
     cmd: |
       python3 .peers/checks/scan_secrets.py .
     pass_when: "exit_code == 0"
 
   - id: deps-justified
     type: hard
-    description: "Jede neu hinzugefügte runtime-dependency hat eine
-      `Dependency-Justification:`-Note in einem Bug-Report-Commit."
+    description: "Every newly added runtime dependency carries a
+      `Dependency-Justification:` trailer in a Bug-Report commit."
     cmd: |
       python3 .peers/checks/deps_justified.py .
     pass_when: "exit_code == 0"
 
   - id: api-stable
     type: hard
-    description: "Die in SPEC.md gelistete öffentliche API ist unverändert
-      ODER der Commit trägt explizit einen Breaking-API:-Trailer."
+    description: "The public API listed in SPEC.md is unchanged OR
+      the commit carries an explicit Breaking-API: trailer."
     cmd: |
       python3 .peers/checks/api_stable.py .
     pass_when: "exit_code == 0"
 
   - id: no-prior-regression
     type: hard
-    description: "Kein Test der VOR diesem Audit grün war ist jetzt rot.
-      (Verhindert dass ein Fix andere Features mitnimmt.)"
+    description: "No test that was green BEFORE this audit is now red.
+      (Prevents a fix from silently taking other features with it.)"
     cmd: |
       python3 .peers/checks/no_regression.py .
     pass_when: "exit_code == 0"
 
   - id: diff-size-per-resolve
     type: hard
-    description: "Jeder Bug-Resolves-Commit ändert ≤ 200 Zeilen netto.
-      Riesige bundled-fix-Commits sind unreviewbar."
+    description: "Every Bug-Resolves commit changes ≤ 200 lines net.
+      Huge bundled-fix commits are unreviewable."
     cmd: |
       python3 .peers/checks/diff_size_per_resolve.py .
     pass_when: "exit_code == 0"
 
-  # ===== SOFT GOALS — peers reviewen sich gegenseitig =====
+  # ===== SOFT GOALS — peers review each other =====
 
   - id: bug-hunt-round-1-deep
     type: soft
@@ -178,35 +181,35 @@ goals:
     consensus_needed: 2
     review_interval: 1
     prompt: |
-      Round 1 deep audit. KEINE ABKÜRZUNGEN. Lies JEDE Datei in src/
-      und tests/ vollständig durch — nicht skimmen.
+      Round 1 deep audit. NO SHORTCUTS. Read EVERY file in src/ and
+      tests/ in full — do not skim.
 
-      Suche nach (alle Kategorien, je 5+ Findings angestrebt):
-        - Logik-Fehler (off-by-one, falsche Conditional-Reihenfolge)
+      Look for (all categories, aim for 5+ findings each):
+        - Logic errors (off-by-one, wrong conditional ordering)
         - Race conditions / TOCTOU
-        - Error-Handling-Lücken (silently-swallowed Exceptions)
-        - Resource-Leaks (file handles, sockets, subprocess, threads)
+        - Error-handling gaps (silently-swallowed exceptions)
+        - Resource leaks (file handles, sockets, subprocess, threads)
         - Unbounded growth (lists, dicts, caches)
-        - Input-Validation an System-Boundaries fehlt
-        - Sicherheitslücken (cmd injection, path traversal, SSRF, …)
-        - API-Verträge die nicht eingehalten werden
-        - Spec-Verstöße (lies SPEC.md erneut, prüfe jedes Feature)
-        - Confabulation-Risiken: Code wo DU unsicher bist wie er
-          aufgerufen wird oder welche Inputs er kriegt. Solche
-          unsicheren Stellen MÜSSEN als `Bug-Report:investigate-<X>`
-          (severity info) gefiled werden — niemals raten.
+        - Missing input validation at system boundaries
+        - Security holes (cmd injection, path traversal, SSRF, …)
+        - API contracts not honoured
+        - Spec violations (re-read SPEC.md, check every feature)
+        - Confabulation risk: code where YOU are uncertain how it gets
+          called or which inputs it receives. Such uncertain spots
+          MUST be filed as `Bug-Report:investigate-<X>` (severity
+          info) — never guess.
 
-      File jeden Defekt als Bug-Report-Commit nach BUG_HUNT_BLOCK-Schema
-      mit ehrlicher Severity. Severity-Inflation und -Deflation sind
-      beide schädlich; begründe in `## Bug-Report` warum diese severity.
+      File every defect as a Bug-Report commit per the BUG_HUNT_BLOCK
+      schema, with honest severity. Severity inflation and deflation
+      both hurt; justify the chosen severity in `## Bug-Report`.
 
-      RATEN IST EINE ABKÜRZUNG. Wenn du nicht 100% verstehst was
-      passiert, file investigate-X statt einen falschen Bug-Report.
+      GUESSING IS A SHORTCUT. If you do not 100% understand what is
+      happening, file investigate-X instead of a wrong Bug-Report.
 
-      "Nichts gefunden" ist eine inhaltlich gehaltvolle Aussage — nur
-      reply mit {"pass": true, "notes": "round 1: N filed (M crit/high)"}
-      wenn du wirklich JEDE Datei durch hast UND begründen kannst dass
-      die offenen N nicht severity-falsch sind.
+      "Nothing found" is a substantive statement — only reply with
+      {"pass": true, "notes": "round 1: N filed (M crit/high)"} if
+      you have really read EVERY file AND can justify that the
+      remaining N are not severity-misclassified.
 
   - id: bug-hunt-round-2-cross-review
     type: soft
@@ -214,25 +217,26 @@ goals:
     consensus_needed: 2
     review_interval: 1
     prompt: |
-      Round 2: lies den DIFF des anderen peers seit peers-baseline,
-      Datei für Datei. Hat er einen Bug fix gemacht? Prüfe kritisch:
-        - Adressiert der Fix die ROOT CAUSE oder nur das Symptom?
-        - Reihenfolge: gibt es einen `Bug-Reproduce:`-Commit der VOR
-          dem `Bug-Resolves:` landet (failing test first)? Ohne den
-          ist es kein TDD-Fix.
-        - Wurden Tests für den Fix geschrieben (happy + edge + sad)?
-        - Erzeugt der Fix neue Probleme (Performance-Regression,
-          Lesbarkeit, unklare Naming, neue Race conditions)?
-        - Ist der Fix die kleinste mögliche Änderung, oder bundled-in-
-          drive-by Refactor der nicht zum Bug gehört?
-        - Hat der Fix vorher-grüne Tests rot gemacht? Wenn ja: Bug-Report.
+      Round 2: read the OTHER peer's diff since peers-baseline, file
+      by file. Did they ship a bug fix? Critique it:
+        - Does the fix address the ROOT CAUSE or just the symptom?
+        - Ordering: is there a `Bug-Reproduce:` commit landing BEFORE
+          the `Bug-Resolves:` (failing test first)? Without that
+          it's not a TDD fix.
+        - Were tests written for the fix (happy + edge + sad)?
+        - Does the fix create new problems (perf regression,
+          readability, unclear naming, new race conditions)?
+        - Is the fix the smallest possible change, or a drive-by
+          refactor bundled in that doesn't belong to the bug?
+        - Did the fix turn previously-green tests red? If so:
+          Bug-Report.
 
-      Bug-Resolves nur dann signen wenn du nach diesem Audit überzeugt
-      bist. Sonst: neuen Bug-Report `## Bug-Report` filen der erklärt
-      WIESO der Fix unzureichend ist (mit konkretem Edge-Case oder
-      Test der fehlschlagen würde). Alternativ: wenn der Fix
-      grundsätzlich falsch ist UND zu groß für diese Session zum
-      Neumachen, ein `Bug-Defer:`-Commit mit ehrlicher Begründung.
+      Only sign off on Bug-Resolves if you are convinced after this
+      review. Otherwise: file a new Bug-Report `## Bug-Report`
+      explaining WHY the fix is insufficient (with concrete
+      edge-case or failing test). Alternative: if the fix is
+      fundamentally wrong AND too large to redo this session, file
+      a `Bug-Defer:` commit with honest rationale.
 
       Reply {"pass": true, "notes": "round 2: F new / R confirmed / U unconvinced / D deferred"}.
 
@@ -242,15 +246,15 @@ goals:
     consensus_needed: 2
     review_interval: 2
     prompt: |
-      Round 3 FINAL: lies SPEC.md absatzweise nochmal. Für JEDEN Satz
-      der ein Verhalten zusichert: such die entsprechende Test-Datei
-      und prüfe ob das Verhalten getestet ist. Wenn der Test fehlt:
-      file einen Bug-Report `missing-test:<feature>` mit severity med,
-      schreibe direkt im selben Commit einen happy + edge + sad Test
-      und resolve ihn.
+      Round 3 FINAL: re-read SPEC.md paragraph by paragraph. For
+      EVERY sentence that asserts a behaviour: look up the matching
+      test file and verify the behaviour is tested. If the test is
+      missing: file a Bug-Report `missing-test:<feature>` at
+      severity med, write happy + edge + sad tests directly in the
+      same commit, and resolve it.
 
-      KEINE Abkürzungen. Wenn du "das ist offensichtlich, braucht keinen
-      Test" denkst — schreib trotzdem den Test.
+      NO shortcuts. If you think "this is obvious, doesn't need a
+      test" — write the test anyway.
 
       Reply {"pass": true, "notes": "round 3 done: N missing-tests added"}.
 
@@ -260,18 +264,19 @@ goals:
     consensus_needed: 2
     review_interval: 2
     prompt: |
-      Lies JEDEN neuen oder geänderten Test im aktuellen Audit. Für
-      jeden Test verifiziere:
+      Read EVERY new or changed test in the current audit. For each
+      test verify:
         - happy: nominal input, expected output
         - edge: boundary (empty, max, off-by-one, unicode, very long)
         - sad: invalid input, malformed data, exceptions, timeouts,
                disk-full, network-fail, partial-state-rollback
 
       Reject `assert True`. Reject "the function returns something".
-      Reject Tests die nur die happy path covern und edge/sad weglassen.
+      Reject tests that only cover the happy path and drop edge/sad.
 
-      Bei jedem rejected Test: file Bug-Report `weak-test:<file>:<name>`
-      mit konkretem Vorschlag was die fehlende Klasse von Tests ist.
+      For every rejected test: file Bug-Report
+      `weak-test:<file>:<name>` with a concrete suggestion of which
+      test class is missing.
 
       Reply {"pass": bool, "notes": "...", "weak": [list of test names]}.
 
@@ -281,18 +286,19 @@ goals:
     consensus_needed: 2
     review_interval: 3
     prompt: |
-      Kritische Bewertung der bisher gelandeten Fixes. Für jeden Commit
-      mit `Bug-Resolves:`-trailer prüfe:
-        1. War die ursprüngliche Findings-Severity korrekt? Wurde ein
-           crit-Bug als med gedowngraded oder umgekehrt?
-        2. Wurde der Bug an der ROOT CAUSE gefixt, oder bei einem
-           Symptom (z.B. catch-all Exception statt Bug-Fix in der
-           aufrufenden Funktion)?
-        3. Ehrliche Tests dabei?
-        4. Hätte der Fix den Bug VOR Phase-3i-Fixes überhaupt gefunden?
+      Critical review of fixes landed so far. For every commit with
+      a `Bug-Resolves:` trailer:
+        1. Was the original finding's severity correct? Was a crit
+           bug downgraded to med or vice versa?
+        2. Was the bug fixed at its ROOT CAUSE, or at a symptom
+           (e.g. catch-all exception instead of fixing the caller)?
+        3. Honest tests included?
+        4. Would the fix have caught the bug under the original
+           audit's stricter rules?
 
-      Wenn ein Fix unkritisch durchgewinkt aussieht, file dazu einen
-      `weak-resolution:BUG-NNN`-Bug-Report. Sei explizit anti-cargo-cult.
+      If a fix looks like it was waved through, file a
+      `weak-resolution:BUG-NNN` Bug-Report. Be explicit
+      anti-cargo-cult.
 
       Reply {"pass": bool, "notes": "N resolves audited, M flagged"}.
 
@@ -302,25 +308,25 @@ goals:
     consensus_needed: 2
     review_interval: 5
     prompt: |
-      Selbst-Audit, ehrlich. Beantworte JEDE Frage:
-        - Hast du in dieser Audit-Runde mindestens einen Bug NICHT
-          gefiled weil du dachtest "ach das ist zu klein"? Wenn ja:
-          file ihn JETZT mit severity info.
-        - Hast du einen Test "vereinfacht" weil edge-cases unbequem
-          waren? Wenn ja: ergänze die fehlenden Cases JETZT.
-        - Hast du einen Fix per `git revert` weggemacht weil ein
-          Test fehlschlug, statt den Test zu fixen?
-        - Gibt es Code den du _vermutet_ hast statt verifiziert?
-          Wenn ja: nenne ihn beim Namen + füg eine Spec-conformance-
-          Verifikation in den nächsten Tick ein.
-        - Hast du eine neue dependency hinzugefügt (pip/npm/cargo)?
-          Wenn ja: gibt es einen `Dependency-Justification:`-Trailer
-          mit Begründung? Sonst JETZT nachreichen.
-        - Hast du irgendwo geraten welche externe API existiert? Hast
-          du sie konsultiert? Wenn unsicher: investigate-Bug filen.
+      Honest internal testing. Answer EVERY question:
+        - Did you NOT file at least one bug in this round because
+          you thought "ah, too small"? If yes: file it NOW with
+          severity info.
+        - Did you "simplify" a test because edge-cases were
+          inconvenient? If yes: add the missing cases NOW.
+        - Did you `git revert` a fix because a test failed,
+          instead of fixing the test?
+        - Is there code you _assumed_ rather than verified? If
+          yes: name it + add a spec-conformance verification in
+          the next tick.
+        - Did you add a new dependency (pip/npm/cargo)? If yes:
+          is there a `Dependency-Justification:` trailer with
+          rationale? If not, add it NOW.
+        - Did you guess at any external API's existence? Did you
+          actually consult it? If unsure: file an investigate Bug.
 
-      Reply {"pass": true, "notes": "honest list: ..."} — sei konkret.
-      Pauschal-"ja, alles ehrlich" wird vom anderen peer rejected.
+      Reply {"pass": true, "notes": "honest list: ..."} — be concrete.
+      Blanket "yes, all honest" is rejected by the other peer.
 
   - id: perf-no-regression
     type: soft
@@ -328,17 +334,16 @@ goals:
     consensus_needed: 2
     review_interval: 5
     prompt: |
-      Performance-Pass. Schau in SPEC.md unter "Performance-Hotpaths"
-      und führe deren Benchmark JETZT aus (z.B. `python -m mything
-      --bench=1000`). Vergleiche mit dem letzten in `.peers/perf.log`
-      eingetragenen Wert (Format: ISO-ts | sha | hotpath | metric).
-      Wenn keine perf.log existiert: lege sie an und schreibe den
-      ersten Baseline-Eintrag.
+      Performance pass. Look in SPEC.md under "Performance hot-paths"
+      and run their benchmark NOW (e.g. `python -m mything
+      --bench=1000`). Compare against the last value in
+      `.peers/perf.log` (format: ISO-ts | sha | hotpath | metric).
+      If no perf.log exists: create one with this run as baseline.
 
-      Falls die aktuelle Messung > 20% schlechter ist als die
-      letzte: file Bug-Report `perf-regression:<hotpath>` mit
-      severity med (oder höher wenn der hotpath user-facing ist) und
-      konkretem before/after-Wert im `## Bug-Report` JSON-Block.
+      If the current measurement is > 20% worse than the previous:
+      file a Bug-Report `perf-regression:<hotpath>` at severity med
+      (or higher if the hotpath is user-facing) with concrete
+      before/after numbers in the `## Bug-Report` JSON block.
 
       Reply {"pass": bool, "notes": "perf: hotpath=<v> (baseline=<v>, delta=<%>)"}.
 
@@ -348,17 +353,18 @@ goals:
     consensus_needed: 2
     review_interval: 3
     prompt: |
-      Public-API-Stabilität. SPEC.md listet die öffentliche API
-      (Funktionen/Klassen/CLI-Flags). Generiere einen API-Snapshot
-      via `python3 .peers/checks/api_stable.py --dump > /tmp/api.now`
-      und diff gegen `.peers/api-baseline.txt`.
+      Public API stability. SPEC.md lists the public API
+      (functions/classes/CLI flags). Generate an API snapshot via
+      `python3 .peers/checks/api_stable.py --dump > /tmp/api.now`
+      and diff against `.peers/api-baseline.txt`.
 
-      Jede Änderung an dieser Liste ist verdächtig: peers neigen zu
-      drive-by Refactor. Für jede Änderung:
-        - Wenn intentional + spec-konform: Commit muss
-          `Breaking-API: <funcname>: <wie genau>` als Trailer haben
-          UND einen Migrations-Hinweis im `## Bug-Resolution`.
-        - Sonst: revert oder Bug-Report `unintended-api-break:<symbol>`.
+      Every change to this list is suspicious: peers tend toward
+      drive-by refactor. For each change:
+        - If intentional + spec-conformant: commit must carry
+          `Breaking-API: <funcname>: <exactly how>` as trailer
+          AND a migration note in `## Bug-Resolution`.
+        - Otherwise: revert or file Bug-Report
+          `unintended-api-break:<symbol>`.
 
       Reply {"pass": bool, "notes": "api: N added / M removed / K signature-changed"}.
 
@@ -368,19 +374,19 @@ goals:
     consensus_needed: 2
     review_interval: 5
     prompt: |
-      Sichtung aller `Bug-Defer:`-Commits. Für jeden defer prüfe:
-        - Gibt es eine `reason`/`note` im `## Bug-Defer` JSON-Block?
-          (Ohne Begründung war's keine ehrliche defer-Entscheidung.)
-        - Ist der defer-Grund plausibel ("zu groß"/"braucht neue
-          dependency"/"braucht produktions-daten zum reproduzieren")
-          oder offensichtlich ein "ich hab keine Lust"?
-        - Ist im defer-Commit ein Next-Step-Hinweis für die nächste
-          Session formuliert (welche Vorbereitung würde den Fix
-          möglich machen)?
+      Review of all `Bug-Defer:` commits. For each defer check:
+        - Is there a `reason`/`note` in the `## Bug-Defer` JSON
+          block? (Without rationale it was not an honest defer.)
+        - Is the defer reason plausible ("too large" / "needs new
+          dependency" / "needs production data to reproduce")
+          or obviously a "can't be bothered"?
+        - Is there a next-step hint in the defer commit for the
+          next session (what preparation would make the fix
+          possible)?
 
-      Wenn ein defer fragwürdig ist: file Bug-Report `weak-defer:BUG-NNN`
-      mit konkretem Vorschlag wie der Bug doch noch dieser Session
-      angefasst werden könnte.
+      If a defer is questionable, file Bug-Report
+      `weak-defer:BUG-NNN` with a concrete suggestion of how the
+      bug could still be tackled this session.
 
       Reply {"pass": bool, "notes": "defers reviewed: N total, M flagged"}.
 
@@ -390,21 +396,20 @@ goals:
     consensus_needed: 2
     review_interval: 4
     prompt: |
-      Doc-Drift-Check. Für jeden Bug-Resolves-Commit prüfe:
-        - Wurde das Verhalten in einer User-facing Datei beschrieben
-          (README.md, docs/, docstring auf der public Funktion)?
-        - Wenn ja: ist die Beschreibung noch korrekt nach dem Fix?
-          Falls falsch: in DIESEM Audit nachziehen (eigener Commit
-          mit `Bug-Resolves:` ist ok wenn Dokumentation der Bug war,
-          sonst regulärer docs-update-Commit).
-        - Gibt es eine CHANGELOG.md? Wenn ja: ist der Fix dort
-          eingetragen?
+      Doc-drift check. For every Bug-Resolves commit:
+        - Was the behaviour described in a user-facing file
+          (README.md, docs/, docstring on the public function)?
+        - If yes: is the description still accurate after the fix?
+          If wrong: update it in THIS audit (a `Bug-Resolves:`
+          commit is OK if the doc was the bug; otherwise a regular
+          docs-update commit).
+        - Is there a CHANGELOG.md? If yes, is the fix entered there?
 
       Reply {"pass": bool, "notes": "docs: N updates needed, M done"}.
 ```
 
-Wenn du `.peers/goals.yaml` nach dem Editieren manuell übernimmst,
-aktualisiere den Bestätigungs-Hash:
+If you edit `.peers/goals.yaml` manually after scaffolding, refresh
+the integrity hash:
 
 ```sh
 python3 - <<'PY'
@@ -418,56 +423,55 @@ p = Path(".peers")
 PY
 ```
 
-Während eines laufenden `peers-ctl start` ist `goals.yaml` bewusst
-geschützt: Änderungen oder eine Löschung lösen einen Halt mit klarer
-Reason aus.
+During a running `peers-ctl start`, `goals.yaml` is intentionally
+protected: edits or deletion trigger a halt with a clear reason.
 
-### Warum diese Goals so geschrieben sind
+### Why these goals are written this way
 
-| Goal | Was es verhindert |
+| Goal | What it prevents |
 |------|------------------|
-| `tests-cover-happy-edge-sad` als HARD | "complete" mit nur happy-Tests pro src-Datei |
-| `bug-hunt-clean` als HARD | 0 offene crit/high/med ist nicht-verhandelbar |
-| `tdd-reproduces-bug` als HARD | Tests die nach dem Fix dazugebaut wurden (passen nur zum Fix, nicht zum Bug) |
-| `no-secrets-committed` als HARD | versehentliche commits von `.env`, credentials, tokens |
-| `deps-justified` als HARD | drive-by `pip install foo` ohne Begründung |
-| `api-stable` als HARD | unangekündigte breaking changes an der public API |
-| `no-prior-regression` als HARD | Fix für Bug X bricht Feature Y still |
-| `diff-size-per-resolve` als HARD | unreviewbare 800-Zeilen-bundled-Commits |
-| `round-2-cross-review` + "TDD-order erzwingen" | Test-mit-Fix statt Test-vor-Fix; gegenseitiges Durchwinken |
-| `critical-fix-review` separat | root-cause vs. symptom, severity-re-triage |
-| `perf-no-regression` | O(n²)-Fix der alle Tests besteht aber 10× langsamer ist |
-| `defer-discipline` | `Bug-Defer:` ohne Rationale wird gefangen |
-| `docs-sync` | README/docstring/CHANGELOG-drift gegenüber gefixtem Verhalten |
-| `honesty-self-check` | Selbst-Audit über Abkürzungen, Confabulation, ungerechtfertigte deps |
+| `tests-cover-happy-edge-sad` as HARD | "complete" with only happy tests per src file |
+| `bug-hunt-clean` as HARD | 0 open crit/high/med is non-negotiable |
+| `tdd-reproduces-bug` as HARD | Tests built up after the fix (they only pass for the fix, not for the bug) |
+| `no-secrets-committed` as HARD | Accidental commits of `.env`, credentials, tokens |
+| `deps-justified` as HARD | Drive-by `pip install foo` without rationale |
+| `api-stable` as HARD | Unannounced breaking changes to the public API |
+| `no-prior-regression` as HARD | A fix for bug X silently breaks feature Y |
+| `diff-size-per-resolve` as HARD | Unreviewable 800-line bundled commits |
+| `round-2-cross-review` + "enforce TDD order" | Test-with-fix instead of test-before-fix; mutual wave-throughs |
+| `critical-fix-review` (separate) | Root-cause vs. symptom; severity re-triage |
+| `perf-no-regression` | An O(n²) fix that passes all tests but is 10× slower |
+| `defer-discipline` | `Bug-Defer:` without rationale gets caught |
+| `docs-sync` | README/docstring/CHANGELOG drift relative to fixed behaviour |
+| `honesty-self-check` | Self-audit on shortcuts, confabulation, unjustified deps |
 
-### Bug-Hunt-Trailers — Schnellübersicht
+### Bug-hunt trailers — quick reference
 
-| Trailer | Bedeutung | Status für Gate |
+| Trailer | Meaning | Gate status |
 |---------|-----------|----------------|
-| `Bug-Report: BUG-NNN` | Finding gefiled | bug ist OFFEN |
-| `Bug-Resolves: BUG-NNN` + JSON `"status":"fixed"` | Fix gelandet | bug ist GESCHLOSSEN |
-| `Bug-Resolves: BUG-NNN` + `"status":"wontfix"` | Bewusst nicht gefixt | bug bleibt OFFEN (human muss explizit re-triagen) |
-| `Bug-Defer: BUG-NNN` + `## Bug-Defer {reason}` | Zu groß für diese Session, dokumentiert | bug ist GESCHLOSSEN (für gate) + sichtbar in summary |
-| `Bug-Reproduce: BUG-NNN` | Commit fügt failing test für den Bug hinzu | wird von `gate-tdd` ausgewertet |
-| `Dependency-Justification: <package>: <why>` | Neue dep mit Grund | von `deps-justified` Check geprüft |
-| `Breaking-API: <symbol>: <how>` | Intentionale API-Änderung | von `api-stable` als legitim akzeptiert |
+| `Bug-Report: BUG-NNN` | Finding filed | bug is OPEN |
+| `Bug-Resolves: BUG-NNN` + JSON `"status":"fixed"` | Fix landed | bug is CLOSED |
+| `Bug-Resolves: BUG-NNN` + `"status":"wontfix"` | Deliberately not fixed | bug stays OPEN (human must explicitly re-triage) |
+| `Bug-Defer: BUG-NNN` + `## Bug-Defer {reason}` | Too large for this session, documented | bug is CLOSED (for gate) + visible in summary |
+| `Bug-Reproduce: BUG-NNN` | Commit adds failing test for the bug | evaluated by `gate-tdd` |
+| `Dependency-Justification: <package>: <why>` | New dep with rationale | checked by `deps-justified` |
+| `Breaking-API: <symbol>: <how>` | Intentional API change | accepted by `api-stable` as legitimate |
 
-`gate-tdd` wertet die Git-History linear aus. Wenn du Merge-Commits
-oder Side-Branches nutzt, achte darauf, dass der `Bug-Reproduce`-Commit
-semantisch vor dem zugehörigen `Bug-Resolves` landet; sonst kann ein
-historisch später gemergter Reproduce wie ein fehlender TDD-Beleg wirken.
+`gate-tdd` evaluates git history linearly. If you use merge commits
+or side-branches, make sure the `Bug-Reproduce` commit semantically
+lands before its `Bug-Resolves`; otherwise a historically-later
+merged reproducer looks like a missing TDD proof.
 
 ---
 
-## 3) Check-Skripte (Referenz für `.peers/checks/`)
+## 3) Check scripts (reference for `.peers/checks/`)
 
-Mit `peers-ctl new --modes=audit` werden diese 6 Skripte automatisch
-nach `.peers/checks/` kopiert und `goals.yaml` wird direkt darauf
-verdrahtet. Die folgenden Bodies bleiben als Referenz und zum
-Customizing hier; fuer JavaScript/TypeScript kannst du stattdessen
-`--lang=js`, fuer Rust `--lang=rust`, fuer Go `--lang=go` verwenden.
-Unbekannte Sprachen fallen bewusst auf Python zurueck.
+`peers-ctl new --modes=audit` copies these 6 scripts automatically
+to `.peers/checks/` and wires `goals.yaml` directly at them. The
+bodies below stay here as a reference and for customisation; for
+JavaScript/TypeScript use `--lang=js`, for Rust `--lang=rust`,
+for Go `--lang=go`. Unknown languages deliberately fall back to
+Python.
 
 ### `coverage_3class.py`
 
@@ -517,11 +521,11 @@ if __name__ == "__main__":
 
 ### `scan_secrets.py`
 
-Das Template scannt Git-tracked Dateien plus untracked, nicht ignorierte
-Dateien (`git ls-files --cached --others --exclude-standard`). Absichtlich
-ignorierte Dateien wie `.env` bleiben Git-Policy; wenn du sie trotzdem
-auditieren willst, nimm einen echten Filesystem-Scanner wie trufflehog in
-deinen Projekt-Gates dazu.
+The template scans git-tracked files plus untracked, non-ignored
+files (`git ls-files --cached --others --exclude-standard`). Files
+deliberately ignored (such as `.env`) stay a git-policy concern; if
+you want to audit them too, add a real filesystem scanner like
+trufflehog to your project gates.
 
 ```python
 #!/usr/bin/env python3
@@ -646,8 +650,8 @@ if __name__ == "__main__":
 explicit Breaking-API: trailer in the corresponding commit.
 
 Usage:
-  api_stable.py --dump > .peers/api-baseline.txt   # einmal beim Audit-Start
-  api_stable.py                                    # gate-Modus
+  api_stable.py --dump > .peers/api-baseline.txt   # once at audit start
+  api_stable.py                                    # gate mode
 """
 import ast, subprocess, sys
 from pathlib import Path
@@ -767,11 +771,11 @@ if __name__ == "__main__":
 ```
 
 Note: uses pytest's `--junitxml` output rather than parsing stdout —
-robust gegen Format-Änderungen in pytest's terminal-reporter (z.B.
-zwischen `-q`/`-v`/colored). Das Python-Template ist pytest-spezifisch;
-die `--lang=js|rust|go` Scaffold-Varianten legen stack-spezifische
-`no_regression.sh` Einstiege an, die du bei Bedarf gegen Jest-, Cargo-
-oder Go-JSON-Reporter haerter machen kannst.
+robust against format changes in pytest's terminal reporter (e.g.
+between `-q`/`-v`/colored). The Python template is pytest-specific;
+the `--lang=js|rust|go` scaffold variants lay down stack-specific
+`no_regression.sh` entry-points that you can harden against Jest,
+Cargo, or Go JSON reporters as needed.
 
 ### `diff_size_per_resolve.py`
 
@@ -817,95 +821,97 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "."))
 ```
 
-### `verify_self_review.py` (für `self-review-on-handoff`)
+### `verify_self_review.py` (for `self-review-on-handoff`)
 
-Der Default nutzt den vertrauenswürdigen Package-Checker:
+The default uses the trusted package checker:
 
 ```sh
 python3 -m peers.templates.modes.audit.checks.verify_self_review
 ```
 
-`peers init` kopiert zusätzlich eine kompatible Datei nach
-`.peers/checks/verify_self_review.py`, damit bestehende Projekte und
-lokale Spezial-Checks weiter funktionieren. Für neue Goals ist der
-Package-Pfad robuster, weil er nicht von einem editierbaren Target-Repo
-abhängt.
+`peers init` additionally copies a compatible file to
+`.peers/checks/verify_self_review.py` so existing projects and
+local special-case checks keep working. For new goals the package
+path is more robust because it doesn't depend on an editable target
+repo.
 
 ---
 
-## 3.5) Modes stacken — wenn du mehr willst als nur Bug-Audit
+## 3.5) Stacking modes — when you want more than just bug-audit
 
-`--modes` ist eine komma-separierte Liste. Built-in:
-- `audit` — Bug-Audit (alles aus §3)
-- `thorough` — Anti-Convergence-Theater: HARD-gate auf N=3 aufeinanderfolgende saubere Ticks + Skeptic-Pass + Aggressive-Honesty
-- `describe` — peers schreiben SPEC/ARCH/DESIGN-Docs, nicht audit
-- `implement` — Feature-Implementierung aus PLAN.md (standalone, nicht stackable)
+`--modes` is a comma-separated list. Built-in:
+- `audit` — bug audit (everything from §3)
+- `thorough` — anti-convergence-theater: HARD gate on N=3
+  consecutive clean ticks + skeptic-pass + aggressive-honesty
+- `describe` — peers write SPEC/ARCH/DESIGN docs, don't audit
+- `implement` — feature implementation from PLAN.md (standalone,
+  not stackable)
 
 ```sh
 peers-ctl new myapp --modes=audit,thorough --spec ./myapp-spec.md
 ```
 
-Eigene scopes (z.B. `security-crypto`, `security-mobile`) gehen via
-user-mode unter `~/.config/peers/modes/<name>/`. Siehe `peers-ctl modes list`.
+Custom scopes (e.g. `security-crypto`, `security-mobile`) live under
+user modes at `~/.config/peers/modes/<name>/`. See `peers-ctl modes list`.
 
-### Externe Tools als User-Modes
+### External tools as user modes
 
 `~/.config/peers/modes/cloc-baseline/`:
 - `mode.yaml`: `{name: cloc-baseline, version: 1, description: ...}`
-- `goals.yaml`: ein `cmd:` der das externe Binary aufruft (z.B. `cloc`).
+- `goals.yaml`: a `cmd:` that calls the external binary (e.g. `cloc`).
 
-Dann:
+Then:
 ```sh
-peers-ctl new myapp --modes=audit,security,cloc-baseline
+peers-ctl new myapp --modes=audit,cloc-baseline
 ```
 
-`peers-ctl modes list` zeigt alle verfügbaren Modes (built-in + user).
+`peers-ctl modes list` shows all available modes (built-in + user).
 
-### Tiefes Audit: `--modes=audit,security,thorough`
+### Deep audit: `--modes=audit,thorough`
 
-Wenn du wirklich "läuft bis nichts mehr da" willst:
+When you really want "run until nothing's left":
 
 ```sh
-peers-ctl new myapp --modes=audit,security,thorough --spec ./spec.md
+peers-ctl new myapp --modes=audit,thorough --spec ./spec.md
 ```
 
-Was `thorough` zusätzlich bringt:
-- **HARD `convergence-reached`**: braucht N=3 (default, override via
-  `goals.convergence_n` in config.yaml) aufeinanderfolgende Ticks ohne
-  neue crit/high/med-Bug-Reports + ohne neue weak-fix/shallow-fix
-  Flag-Bugs aus dem security-mode. Info-Findings zählen nicht für
-  reset — sonst läuft die Loop ewig auf "info: missing docstring".
-- **SOFT `skeptic-pass`** alle Ticks: peers müssen pro Datei 5
-  Failure-Modes konkret begründen + ausschließen, sonst rejected.
-- **SOFT `aggressive-honesty`** alle 3 Ticks: pro Top-Level-Pfad
-  müssen peers 3 Failure-Modes + 2 Security-Kategorien + 1
-  coverage-loch konkret nennen.
+What `thorough` adds:
+- **HARD `convergence-reached`**: requires N=3 (default, override via
+  `goals.convergence_n` in config.yaml) consecutive ticks without
+  new crit/high/med Bug-Reports + without new weak-fix/shallow-fix
+  findings. Info findings don't count for reset — otherwise the loop
+  runs forever on "info: missing docstring".
+- **SOFT `skeptic-pass`** every tick: peers must concretely justify
+  and rule out 5 failure modes per file, otherwise rejected.
+- **SOFT `aggressive-honesty`** every 3 ticks: per top-level path
+  peers must name 3 failure modes + 2 security categories + 1
+  coverage gap concretely.
 
-Empfohlene config.yaml-Anpassungen wenn du thorough stackst:
+Recommended `config.yaml` tweaks when you stack thorough:
 
 ```yaml
 budget:
-  max_iterations: 500       # thorough braucht 20-50 mehr Ticks
-  max_runtime_s: 86400      # 24h Notbremse
+  max_iterations: 500       # thorough needs 20-50 more ticks
+  max_runtime_s: 86400      # 24h emergency brake
   max_consecutive_failures: 10
 goals:
-  convergence_n: 3          # 3 saubere ticks; auf 5 für noch strenger
+  convergence_n: 3          # 3 clean ticks; bump to 5 for stricter
 ```
 
 ---
 
-## 4) Einmal-Setup beim Audit-Start
+## 4) One-time setup at audit start
 
-`peers init` (via `peers-ctl new`) hat bereits den Tag `peers-baseline`
-auf HEAD gesetzt — der ist die Anker-Referenz für alle Check-Skripte
-die mit `peers-baseline..HEAD` arbeiten.
+`peers init` (via `peers-ctl new`) has already tagged HEAD with
+`peers-baseline` — that's the anchor reference for all check scripts
+that work against `peers-baseline..HEAD`.
 
-Zusätzlich vor dem ersten `peers-ctl start`:
+In addition, before the first `peers-ctl start`:
 
 ```sh
 cd ~/c0de/peers-c0de/myapp
 
-# Audit-env einfrieren (für Reproduzierbarkeit)
+# Freeze audit env (for reproducibility)
 {
   echo "audit-started: $(date -Is)"
   echo "peers: $(peers --version)"
@@ -916,31 +922,31 @@ cd ~/c0de/peers-c0de/myapp
   echo "git: $(git rev-parse HEAD)"
 } > .peers/audit-env.txt
 
-# Snapshots für no_regression + api_stable
+# Snapshots for no_regression + api_stable
 python3 .peers/checks/no_regression.py --snapshot
 python3 .peers/checks/api_stable.py --dump > .peers/api-baseline.txt
 
 git add .peers/audit-env.txt .peers/passing-baseline.txt .peers/api-baseline.txt
 git commit -m "audit: capture env + baseline snapshots"
-git tag -f peers-baseline HEAD     # bewege den anker auf DIESEN Commit
+git tag -f peers-baseline HEAD     # move the anchor to THIS commit
 ```
 
-Der letzte `git tag -f` verschiebt `peers-baseline` so dass die
-baseline-snapshots SELBST nicht als "Audit-Diff" gezählt werden.
+The final `git tag -f` moves `peers-baseline` so the baseline
+snapshots themselves are not counted as "audit diff".
 
 ---
 
-## 5) config.yaml — Audit-tauglich
+## 5) config.yaml — audit-grade
 
 ```yaml
 driver: orchestrator
-comm: hybrid                          # peers reden auch über files, nicht nur git
+comm: hybrid                          # peers also talk via files, not only git
 
 peers:
   - name: claude
     tool: claude
     argv: ["claude", "-p", "--dangerously-skip-permissions",
-           "--output-format", "json", "{PROMPT}"]   # json → USD-Tracking
+           "--output-format", "json", "{PROMPT}"]   # json → USD tracking
     prompt_mode: argv-substitute
   - name: codex
     tool: codex
@@ -951,229 +957,231 @@ peers:
     prompt_mode: argv-substitute
 
 budget:
-  max_iterations: 50                  # Audit braucht viele Ticks
-  max_runtime_s: 28800                # 8 h Notbremse
+  max_iterations: 50                  # audit needs many ticks
+  max_runtime_s: 28800                # 8 h emergency brake
   max_consecutive_failures: 5
-  max_usd_mode: auto                  # OAuth-Setup → warn (kein hard kill)
+  max_usd_mode: auto                  # OAuth setup → warn (no hard kill)
 
 health:
-  idle_timeout_s: 1800                # 30 min — peers denken lange auf großen Repos
+  idle_timeout_s: 1800                # 30 min — peers think long on big repos
   absolute_max_runtime_s: 7200
   error_patterns:
-    # Defaults aus template/config.yaml übernehmen (ERROR/FATAL-anchored)
+    # Use defaults from template/config.yaml (ERROR/FATAL anchored)
 
-# Bei pytest >120s hier hochsetzen
+# Bump this when pytest takes > 120s
 goals:
-  timeout_s: 600                      # 10 min — reicht für die meisten Suiten
+  timeout_s: 600                      # 10 min — covers most suites
 ```
 
 ---
 
-## 6) Starten + Mitlesen
+## 6) Starting + observing
 
 ```sh
 PEERS_CTL_PODMAN_NETWORK=host \
     peers-ctl start myapp --container --max-ticks 50 --max-usd 100
 
-# Drei Terminals zum Mitlesen (alternativ tmux):
-peers-ctl tail myapp                  # Container-Log live
+# Three terminals to watch live (or use tmux):
+peers-ctl tail myapp                  # container log live
 peers-ctl status myapp                # current goal status + peer health
 watch -n 30 'python3 -m peers.bug_hunt summary ~/c0de/peers-c0de/myapp'
 ```
 
-Was du in einer "echten" Audit-Session zu sehen kriegst:
-- Tick 1–3: peers lesen den ganzen src/-Tree, filen erste Welle Bugs
-- Tick 4–8: Round-2-cross-review läuft, eine Hälfte der Round-1-Findings
-  wird re-triaged oder als "weak resolution" markiert
-- Tick 9–15: Code-Fixes landen, Tests werden geschrieben
-- Tick 16+: round-3-spec-conformance findet missing-tests; honesty-self-check
-  triggert weitere kleine Findings
-- Convergence: bug-hunt-clean exit 0 + alle hard goals pass + soft consensus ≥2/2
+What a "real" audit session looks like:
+- Ticks 1–3: peers read the whole src/ tree, file first wave of bugs
+- Ticks 4–8: round-2 cross-review runs; half the round-1 findings get
+  re-triaged or marked as "weak resolution"
+- Ticks 9–15: code fixes land, tests are written
+- Tick 16+: round-3-spec-conformance finds missing-tests;
+  honesty-self-check triggers small further findings
+- Convergence: bug-hunt-clean exit 0 + all hard goals pass + soft
+  consensus ≥2/2
 
 ---
 
-## 7) Manuelles Stoppen wenn nötig
+## 7) Manual stop when needed
 
 ```sh
 peers-ctl stop myapp                  # SIGTERM → 10s grace → SIGKILL
 ```
 
-Substrate persistiert State sauber via SIGTERM-Handler. Du kannst später
-`peers-ctl start myapp --container --max-ticks 50` machen und es
-läuft weiter: `state.json` wird atomar geschrieben, und `goals.yaml`
-wird gegen den Start-Snapshot geschützt. Wenn du Goals ändern willst,
-stoppe den Lauf, passe `goals.yaml` an, aktualisiere `goals.sha256`
-und starte neu.
+The substrate persists state cleanly via the SIGTERM handler. You
+can later `peers-ctl start myapp --container --max-ticks 50` and
+it resumes: `state.json` is atomically written and `goals.yaml` is
+protected against the start snapshot. If you want to change goals,
+stop the run, edit `goals.yaml`, refresh `goals.sha256`, and start
+again.
 
 ---
 
-## 8) Abnahme — keine Abkürzungen
+## 8) Acceptance — no shortcuts
 
 ```sh
-# Volle Re-Validierung aller harden Gates
+# Full re-validation of all hard gates
 peers -C ~/c0de/peers-c0de/myapp verify
 cat ~/c0de/peers-c0de/myapp/.peers/VERIFY.md
 
-# Bug-Bilanz: was wurde gefiled, was resolved, was deferred
+# Bug ledger: what was filed, resolved, deferred
 python3 -m peers.bug_hunt summary ~/c0de/peers-c0de/myapp
 
-# TDD-Disziplin: jeder blocking fix hatte einen failing test ZUERST?
+# TDD discipline: did every blocking fix have a failing test FIRST?
 python3 -m peers.bug_hunt gate-tdd ~/c0de/peers-c0de/myapp
 
-# Lies REPORT.md — die Substrate-eigene Zusammenfassung
+# Read REPORT.md — the substrate's own summary
 cat ~/c0de/peers-c0de/myapp/.peers/REPORT.md
 
-# Lies runs.jsonl — Tick-für-Tick was passierte
+# Read runs.jsonl — tick-by-tick of what happened
 jq -s '.' ~/c0de/peers-c0de/myapp/.peers/log/runs.jsonl | less
 ```
 
-**Kritische Betrachtung der Findings — pflicht:**
+**Critical review of the findings — mandatory:**
 
-1. **Severity-Sanity-Check.** Geh durch `bug_hunt summary` und frag bei
-   jedem crit/high: "würde ein erfahrener Engineer das wirklich so
-   einstufen?". peers neigen zu Severity-Inflation am Anfang und
-   -Deflation am Ende. Bei Diskrepanz: manuell prüfen, ggf. einen
-   weiteren Tick mit re-triage-Prompt anwerfen.
+1. **Severity sanity check.** Walk through `bug_hunt summary` and
+   ask, for every crit/high: "would an experienced engineer really
+   classify it that way?". Peers tend toward severity inflation early
+   and deflation late. On discrepancy: check manually, optionally
+   kick off another tick with a re-triage prompt.
 
-2. **Fix-Quality-Stichproben.** Wähle 5 zufällige `Bug-Resolves:`-Commits.
-   Lies ihren Diff. Frag dich: hätte ICH den Bug so gefixt? Wenn nicht,
-   schau ob es einen guten Grund gibt oder ob das Cargo-Cult ist.
+2. **Fix-quality spot-check.** Pick 5 random `Bug-Resolves:` commits.
+   Read the diff. Ask yourself: would I have fixed the bug this way?
+   If not, check whether there's a good reason or whether it's
+   cargo-cult.
 
-3. **Test-Quality-Stichproben.** Wähle 5 zufällige neue Test-Funktionen.
-   Lies sie. Sind happy + edge + sad wirklich abgedeckt, oder hat
-   der peer drei Test-Funktionen mit demselben happy-case geschrieben
-   und die Klasse "edge" / "sad" nur über den Namen suggeriert?
+3. **Test-quality spot-check.** Pick 5 random new test functions.
+   Read them. Are happy + edge + sad really covered, or did the peer
+   write three test functions with the same happy case and only
+   suggest the "edge" / "sad" class through the name?
 
-4. **Spec-Conformance-Stichprobe.** Lies SPEC.md absatzweise. Pro
-   zugesichertem Verhalten: existiert ein Test? Wenn nein, ist
-   round-3 falsch durchgelaufen — neuer Tick.
+4. **Spec-conformance spot-check.** Read SPEC.md paragraph by
+   paragraph. For every asserted behaviour: does a test exist? If
+   not, round-3 didn't complete properly — schedule another tick.
 
-5. **Ehrlichkeitscheck.** Lies die Antworten der `honesty-self-check`
-   Reviews. "Alles gut, nichts gefunden" über mehrere Runs in Folge
-   ist verdächtig.
+5. **Honesty check.** Read the `honesty-self-check` review replies.
+   "All good, nothing found" across multiple runs in a row is
+   suspicious.
 
 ---
 
-## 9) Commiten + Pushen
+## 9) Commit + push
 
-Das Substrate committet schon während der Loop laufend, jeder Commit
-trägt `Peer: <name>` + Self-Review-Trailer. Du musst aber nochmal
-nachvollziehen + auf den eigenen Branch pushen:
+The substrate already commits during the loop; every commit carries
+`Peer: <name>` + a Self-Review trailer. But you must still
+double-check and push to your own branch:
 
 ```sh
 cd ~/c0de/peers-c0de/myapp
 
-# Was hat der Audit geändert?
+# What did the audit change?
 git log --oneline peers-baseline..HEAD | head -50
 git diff --stat peers-baseline..HEAD
 
-# Letzter Sanity-Check vor push — JEDE Zeile muss exit 0
-python3 -m pytest -q                                # tests grün?
+# Final sanity check before push — EVERY line must exit 0
+python3 -m pytest -q                                # tests green?
 ruff check .                                        # lint clean?
 python3 -m peers.bug_hunt gate .                    # 0 crit/high/med?
-python3 -m peers.bug_hunt gate-tdd .                # TDD-disziplin?
-python3 .peers/checks/scan_secrets.py .             # keine secrets?
-python3 .peers/checks/deps_justified.py .           # neue deps gerechtfertigt?
-python3 .peers/checks/api_stable.py .               # API-stabil?
-python3 .peers/checks/no_regression.py .            # keine vorher-grünen rot?
-python3 .peers/checks/diff_size_per_resolve.py .    # alle resolves ≤ 200 LOC?
-peers verify                                        # alle hard goals grün?
+python3 -m peers.bug_hunt gate-tdd .                # TDD discipline?
+python3 .peers/checks/scan_secrets.py .             # no secrets?
+python3 .peers/checks/deps_justified.py .           # new deps justified?
+python3 .peers/checks/api_stable.py .               # API stable?
+python3 .peers/checks/no_regression.py .            # no previously-green now red?
+python3 .peers/checks/diff_size_per_resolve.py .    # all resolves ≤ 200 LOC?
+peers verify                                        # all hard goals green?
 
-# Wenn ALLES grün:
-git remote -v                                       # auf welche origin pushst du?
-git push origin <dein-branch>
+# If EVERYTHING is green:
+git remote -v                                       # which origin do you push to?
+git push origin <your-branch>
 ```
 
-Wenn dein Workflow Pull-Requests vorsieht:
+If your workflow uses pull requests:
 
 ```sh
 gh pr create --title "Audit + fix run on myapp" --body "$(cat <<'EOF'
 ## Summary
-- Vollständiger peers-Audit + Fix (claude + codex, $N Ticks, $M USD)
-- $K Bug-Reports gefiled, $J resolved (severity-Verteilung im Body)
-- Tests: $B → $A passing (+$delta neue Tests)
+- Full peers audit + fix (claude + codex, $N ticks, $M USD)
+- $K bug reports filed, $J resolved (severity distribution in body)
+- Tests: $B → $A passing (+$delta new tests)
 - Lint/type: clean
 
-## Bug-Bilanz
+## Bug ledger
 $(python3 -m peers.bug_hunt summary . | head -40)
 
 ## Test plan
-- [ ] `pytest -q` lokal grün auf clean clone
+- [ ] `pytest -q` green locally on a clean clone
 - [ ] `peers verify` exit 0
-- [ ] Manual smoke-test: <project-specific>
-- [ ] Spec-conformance-Spot-Check auf 3 zufälligen SPEC-Sätzen
+- [ ] Manual smoke test: <project-specific>
+- [ ] Spec-conformance spot check on 3 random SPEC sentences
 
 🤖 Generated by peers-substrate via Claude Code
 EOF
 )"
 ```
 
-**Bevor du den PR mergst:** lies die Bug-Bilanz selbst, nicht nur die
-Zusammenfassung. Verifiziere stichprobenartig. Wenn was nicht passt:
-neuen Audit-Tick mit gezieltem prompt drauf, statt zu mergen und später
-zu fixen.
+**Before you merge the PR:** read the bug ledger yourself, not just
+the summary. Verify spot-wise. If something looks off: another audit
+tick with a targeted prompt is better than merging now and fixing
+later.
 
 ---
 
-## 10) Häufige Stolperfallen
+## 10) Common pitfalls
 
-- **`/tmp` ist tmpfs**: Audit-Projekte gehören NICHT nach `/tmp/`. Nutz
-  `$PEERS_PROJECTS_ROOT` (default `~/c0de/peers-c0de/`) — sonst gehen
-  Projekte nach einem Reboot verloren.
+- **`/tmp` is tmpfs**: audit projects do NOT belong under `/tmp/`.
+  Use `$PEERS_PROJECTS_ROOT` (default `~/c0de/peers-c0de/`) — otherwise
+  projects get lost after a reboot.
 
-- **PID-1-Annahmen in deinen Tests:** falls deine Test-Suite irgendwo
-  `os.kill(1, …)` oder `os.killpg(0, …)` macht in der Annahme PID 1 sei
-  init/systemd: im peers:dev-Container ist PID 1 das Substrat (uid 1000).
-  Mocken statt echt killen.
+- **PID-1 assumptions in your tests:** if your test suite does
+  `os.kill(1, …)` or `os.killpg(0, …)` assuming PID 1 is init/systemd:
+  in the peers:dev container PID 1 is the substrate (uid 1000). Mock
+  it instead of actually killing.
 
-- **idle_timeout_s zu klein**: häufigster Failure-Modus. claude `-p` ist
-  während der Arbeit komplett still (kein streaming). Faustregel:
-  600 s nur für kleine Fixes; 1800–3600 s für Multi-File; 3600+ s für
-  große Audits.
+- **`idle_timeout_s` too small**: the most common failure mode. claude
+  `-p` is completely silent during work (no streaming). Rule of
+  thumb: 600 s only for small fixes; 1800–3600 s for multi-file;
+  3600+ s for large audits.
 
-- **pasta-Network-Bug** auf manchen Hosts: `PEERS_CTL_PODMAN_NETWORK=host`
-  vor `peers-ctl start ...`.
+- **pasta network bug** on some hosts: `PEERS_CTL_PODMAN_NETWORK=host`
+  before `peers-ctl start ...`.
 
-- **Goal-Mutation-Halt**: ein peer hat `goals.yaml` editiert oder
-  gelöscht. Loop hält an — by design. Stop, manuell entscheiden ob du
-  das übernehmen willst, `goals.sha256` aktualisieren, neu starten.
-  Der Start-Snapshot schützt den laufenden Durchgang auch dann, wenn
-  jemand `goals.yaml` und `goals.sha256` zusammen verändert.
+- **Goal-mutation halt**: a peer edited or deleted `goals.yaml`. The
+  loop halts — by design. Stop, manually decide whether to accept
+  the edit, refresh `goals.sha256`, restart. The start-snapshot
+  protects the running pass even if `goals.yaml` and `goals.sha256`
+  are modified together.
 
-- **api-error in runs.jsonl**: loggt `matched_error_pattern` +
-  `stderr_tail`. Damit findest du heraus ob echt rate-limit oder
-  config-issue (z.B. fehlende `--dangerously-bypass-approvals-and-sandbox`
-  bei codex).
+- **api-error in runs.jsonl**: the substrate logs `matched_error_pattern`
+  + `stderr_tail`. Use them to tell real rate-limit from config issue
+  (e.g. missing `--dangerously-bypass-approvals-and-sandbox` on
+  codex).
 
-- **Convergence dauert lang**: Audit eines 5k-LOC-Projekts braucht
-  realistisch 20–40 Ticks à ~5–15 min = 2–10 h Wallclock + $30–100 USD
-  bei API-Billing (OAuth: gratis). Plane das ein, oder zieh den
-  `max_iterations` runter wenn du nur einen Quick-Pass willst.
+- **Convergence takes long**: auditing a 5k-LOC project realistically
+  takes 20–40 ticks at ~5–15 min = 2–10 h wallclock + $30–100 USD on
+  API billing (OAuth: free). Budget accordingly, or lower
+  `max_iterations` for a quick pass.
 
 ---
 
-## 11) Ehrlichkeit — Meta-Reminder
+## 11) Honesty — meta-reminder
 
-Diese Anleitung garantiert keinen perfekten Audit. Was sie garantiert:
+This guide does not guarantee a perfect audit. What it does guarantee:
 
-- **Zwei unabhängige peer-Augen** auf jeden Bug-Report (`reviewer: both`,
+- **Two independent peer eyes** on every bug report (`reviewer: both`,
   `consensus_needed: 2`)
-- **Strukturell verhindertes "complete"** ohne 0-crit/high/med
-- **Strukturell erzwungenes** happy/edge/sad-test-class-coverage
-- **Selbst-Audit** ("honesty-self-check") als wiederkehrender Prompt
-- **Mensch im Loop** für severity-sanity, fix-quality, spec-conformance
+- **Structurally prevented "complete"** without 0-crit/high/med
+- **Structurally enforced** happy/edge/sad test-class coverage
+- **Self-audit** ("honesty-self-check") as a recurring prompt
+- **Human in the loop** for severity sanity, fix quality, spec
+  conformance
 
-Was sie NICHT ersetzt:
+What it does NOT replace:
 
-- Deine eigene kritische Lektüre der Findings + Fixes
-- Dein Domänen-Wissen über die App
-- Penetration-Testing für sicherheitskritische Apps (peers finden
-  klassische OWASP-Patterns, aber kein State-of-the-Art-Exploit-Chaining)
-- Performance-Profiling (peers reviewen Code, nicht Latency-Profile)
+- Your own critical reading of findings + fixes
+- Your domain knowledge of the app
+- Penetration testing for security-critical apps (peers find
+  classical OWASP patterns, not state-of-the-art exploit chaining)
+- Performance profiling (peers review code, not latency profiles)
 
-Wenn der Audit "alles grün" sagt und dein Bauchgefühl sagt "das war zu
-schnell" — vertraue dem Bauchgefühl. Neuer Tick mit gezieltem
-Skeptiker-Prompt:
+If the audit says "all green" and your gut says "that was too
+quick" — trust the gut. Another tick with a targeted skeptic prompt:
 
 ```yaml
 - id: skeptic-pass
@@ -1182,22 +1190,21 @@ Skeptiker-Prompt:
   consensus_needed: 2
   review_interval: 1
   prompt: |
-    Der vorige Audit kam zu "alles grün". Das ist verdächtig.
-    Geh JEDES src-File nochmal durch und finde mindestens 1 Bug
-    den die vorigen Rounds übersehen haben. Wenn du nach
-    gewissenhafter Suche wirklich nichts findest, dokumentiere
-    KONKRET welche 5 Failure-Modes du geprüft + ausgeschlossen
-    hast. Pauschal-"sauber" wird vom anderen peer rejected.
+    The previous audit ended on "all green". That's suspicious.
+    Walk every src file again and find at least 1 bug the prior
+    rounds missed. If after a conscientious search you really find
+    nothing, document CONCRETELY which 5 failure modes you checked
+    and ruled out. Blanket "clean" gets rejected by the other peer.
 ```
 
 ---
 
-## TL;DR (für die Eile-Variante)
+## TL;DR (the rushed version)
 
 ```sh
 peers-ctl new myapp --container --modes=audit --spec ./spec.md
 cd ~/c0de/peers-c0de/myapp
-$EDITOR .peers/{goals,config}.yaml SPEC.md          # goals/config/SPEC trimmen
+$EDITOR .peers/{goals,config}.yaml SPEC.md          # trim goals/config/SPEC
 python3 .peers/checks/no_regression.py --snapshot
 python3 .peers/checks/api_stable.py --dump > .peers/api-baseline.txt
 git add .peers && git commit -m "audit: baseline" && git tag -f peers-baseline
@@ -1205,12 +1212,12 @@ cd -
 
 PEERS_CTL_PODMAN_NETWORK=host \
     peers-ctl start myapp --container --max-ticks 50 --max-usd 100
-peers-ctl tail myapp                  # zuschauen
-# warten bis "complete" oder manueller stop
+peers-ctl tail myapp                  # watch
+# wait for "complete" or stop manually
 
 peers -C ~/c0de/peers-c0de/myapp verify
 python3 -m peers.bug_hunt summary ~/c0de/peers-c0de/myapp
 python3 -m peers.bug_hunt gate-tdd ~/c0de/peers-c0de/myapp
-# kritisch lesen, stichproben, ggf. nochmal mit skeptic-pass laufen
+# read critically, spot-check, optionally re-run with skeptic-pass
 git push origin <branch>
 ```

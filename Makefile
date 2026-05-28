@@ -14,6 +14,7 @@
 
 IMAGE        ?= peers:dev
 PROXY_IMAGE  ?= peers-egress-proxy:dev
+AUTH_PROXY_IMAGE ?= peers-auth-proxy:dev
 TARGET       ?= $(CURDIR)
 HOST_HOME    ?= $(HOME)
 GIT_SHA      ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -26,7 +27,7 @@ BUILD_NETWORK ?= host
 # device"), set NETWORK=slirp4netns (older fallback) or NETWORK=host.
 NETWORK      ?=
 
-.PHONY: test build proxy-build run shell hooks-install clean help
+.PHONY: test build proxy-build auth-proxy-build run shell hooks-install clean help
 
 help:
 	@awk '/^## / {sub(/^## /,""); print}' $(MAKEFILE_LIST)
@@ -45,6 +46,11 @@ build:
 proxy-build:
 	podman build --network=$(BUILD_NETWORK) \
 		-f proxy/Containerfile.proxy -t $(PROXY_IMAGE) proxy/
+
+## auth-proxy-build — build the OAuth auth-proxy sidecar image
+auth-proxy-build:
+	podman build --network=$(BUILD_NETWORK) \
+		-f auth-proxy/Containerfile -t $(AUTH_PROXY_IMAGE) .
 
 ## run            — run peers on TARGET (defaults to cwd); pass ARGS=...
 run:
@@ -87,3 +93,4 @@ hooks-install:
 clean:
 	-podman rmi $(IMAGE)
 	-podman rmi $(PROXY_IMAGE)
+	-podman rmi $(AUTH_PROXY_IMAGE)

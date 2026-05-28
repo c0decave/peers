@@ -29,6 +29,11 @@ def test_peers_version_module_attr_matches_pyproject():
     assert peers.__version__ == _pyproject_version()
 
 
+def test_release_version_is_1_6_0():
+    import peers
+    assert peers.__version__ == "1.6.0"
+
+
 def test_peers_ctl_version_module_attr_matches_pyproject():
     import peers_ctl
     assert peers_ctl.__version__ == _pyproject_version()

@@ -221,7 +221,19 @@ def _scan_python_file(
 
 
 def _iter_src_files(src_root: Path) -> list[Path]:
-    return sorted(p for p in src_root.rglob("*.py") if p.is_file())
+    files: list[Path] = []
+    for path in src_root.rglob("*.py"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(src_root).as_posix()
+        if rel.startswith("peers/templates/modes/") and "/checks/" in rel:
+            # The peers repository vendors this gate and sibling gates as
+            # templates. Those policy implementations necessarily spell out
+            # the vocabulary they reject, so scanning them would be a
+            # self-hit rather than a production shortcut.
+            continue
+        files.append(path)
+    return sorted(files)
 
 
 def main(project_dir: str = ".") -> int:

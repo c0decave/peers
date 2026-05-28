@@ -68,6 +68,9 @@ class BugReport:
     description: str = ""
     fix_by: str | None = None
     location: str | None = None
+    cwe: str | None = None
+    file: str | None = None
+    function: str | None = None
     sha: str = ""               # commit that filed the bug
     found_by: str | None = None  # `Peer:` trailer of that commit
 
@@ -360,12 +363,18 @@ def summarize(repo: Path) -> BugSummary:
             desc = ""
             fix_by = None
             location = None
+            cwe = None
+            file_name = None
+            function = None
             if isinstance(json_block, dict) and json_block.get("id") == bid:
                 sev = str(json_block.get("severity", "info")).lower()
                 title = str(json_block.get("title", ""))
                 desc = str(json_block.get("description", ""))
                 fix_by = json_block.get("fix_by")
                 location = json_block.get("location")
+                cwe = json_block.get("cwe") or json_block.get("CWE")
+                file_name = json_block.get("file")
+                function = json_block.get("function")
             else:
                 # Heading-less fallback: pull title from the subject line.
                 subj = body.splitlines()[0] if body else ""
@@ -384,6 +393,11 @@ def summarize(repo: Path) -> BugSummary:
                 id=bid, severity=sev, title=title, description=desc,
                 fix_by=str(fix_by) if fix_by else None,
                 location=str(location) if location else None,
+                cwe=str(cwe) if cwe else None,
+                file=str(file_name) if file_name else (
+                    str(location).split(":", 1)[0] if location else None
+                ),
+                function=str(function) if function else None,
                 sha=sha, found_by=peer_trailer,
             )
 
@@ -498,6 +512,49 @@ def format_summary(s: BugSummary) -> str:
     return head + "\n" + "\n".join(lines)
 
 
+def summary_dict(repo: Path) -> dict:
+    """JSON-serializable bug-hunt summary for downstream tooling."""
+    s = summarize(repo)
+    by_severity = {sev: len(items) for sev, items in s.open_by_severity.items()}
+    by_cwe: dict[str, int] = {}
+    reports = []
+    for rep in sorted(s.reports.values(), key=lambda r: r.id):
+        if rep.cwe:
+            by_cwe[rep.cwe] = by_cwe.get(rep.cwe, 0) + 1
+        res = s.resolutions.get(rep.id)
+        reports.append({
+            "id": rep.id,
+            "severity": rep.severity,
+            "title": rep.title,
+            "description": rep.description,
+            "fix_by": rep.fix_by,
+            "location": rep.location,
+            "file": rep.file,
+            "function": rep.function,
+            "cwe": rep.cwe,
+            "sha": rep.sha,
+            "found_by": rep.found_by,
+            "status": res.status if res else "open",
+            "resolution_sha": res.sha if res else None,
+            "resolved_by": res.resolved_by if res else None,
+            "reproduced": rep.id in s.reproductions,
+        })
+    return {
+        "total": len(s.reports),
+        "open_blocking": s.open_blocking_count,
+        "deferred": s.deferred_count,
+        "reproduced": s.reproduced_count,
+        "by_severity": by_severity,
+        "by_cwe": by_cwe,
+        "reports": reports,
+        "warnings": list(s.warnings),
+    }
+
+
+def summary_json(repo: Path) -> str:
+    return json.dumps(summary_dict(repo), indent=2, sort_keys=True)
+
+
 def gate_pass(repo: Path) -> tuple[bool, str]:
     """Helper for the `bug-hunt-clean` hard gate. Returns
     (pass?, diagnostic). pass iff no blocking-severity bugs are open.
@@ -580,10 +637,16 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("summary", "gate", "gate-tdd"):
         s = sub.add_parser(name)
         s.add_argument("path", nargs="?", default=".")
+        if name == "summary":
+            s.add_argument("--format", choices=("text", "json"),
+                           default="text")
     args = p.parse_args(argv)
     repo = Path(args.path).resolve()
     if args.cmd == "summary":
-        print(format_summary(summarize(repo)))
+        if args.format == "json":
+            print(summary_json(repo))
+        else:
+            print(format_summary(summarize(repo)))
         return 0
     if args.cmd == "gate":
         ok, diag = gate_pass(repo)

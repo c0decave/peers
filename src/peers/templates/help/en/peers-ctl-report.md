@@ -6,7 +6,7 @@ one or all registered projects.
 
 ## SYNOPSIS
 ```
-peers-ctl report [<name>]
+peers-ctl report [<name>] [--format text|json]
 ```
 
 ## DESCRIPTION
@@ -24,6 +24,8 @@ unsafe).
 
 ## OPTIONS
 - `name` (positional, optional) — restrict to one project.
+- `--format` — `text` writes Markdown under the config dir (default);
+  `json` prints a structured export to stdout.
 
 ## EXAMPLES
 ```
@@ -32,6 +34,9 @@ peers-ctl report
 
 # Just one.
 peers-ctl report my-app
+
+# Structured export.
+peers-ctl report my-app --format json
 ```
 
 ## FILES

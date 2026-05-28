@@ -1,0 +1,47 @@
+goals:
+  - id: attack-surface-enumerated
+    type: hard
+    description: |
+      docs/ATTACK-SURFACE.md or an equivalent machine-readable recon
+      artifact enumerates at least three attack entry points before
+      deeper hunting iterations begin.
+    cmd: "test -s docs/ATTACK-SURFACE.md || test -s .chitin/attack-surface.json"
+    pass_when: "exit_code == 0"
+
+  - id: each-tick-produces-evidence
+    type: soft
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 1
+    description: |
+      Each tick should produce concrete evidence: a new BUG-NNN, a
+      validated CVE match, an attack-surface entry, a fuzz harness, a
+      sanitizer trace, or a runnable PoC. Pure prose is low value.
+    prompt: |
+      Did the peer produce concrete evidence this tick? Reply with a
+      JSON object: {"pass": bool, "notes": "what evidence was produced"}.
+
+  - id: novel-finding-rate
+    type: soft
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 3
+    description: |
+      The last three hunting ticks should include at least one novel
+      finding or clearly expand the explored surface.
+    prompt: |
+      Count novel BUGs and new explored surfaces in the last three
+      ticks. Reply {"pass": bool, "notes": "novel/evidence ratio"}.
+
+  - id: coverage-progresses
+    type: soft
+    reviewer: both
+    consensus_needed: 2
+    review_interval: 5
+    description: |
+      Fuzz, static-analysis, or manual-review coverage should expand
+      across each five-tick window. Re-reading the same surface without
+      new evidence should fail this soft review.
+    prompt: |
+      Did coverage expand versus the previous window? Reply
+      {"pass": bool, "notes": "new files/functions/harnesses/paths"}.

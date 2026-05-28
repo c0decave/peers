@@ -111,3 +111,17 @@ def test_skips_tests_directory(tmp_path, capsys):
     (tmp_path / "tests" / "test_a.py").write_text("# TODO: write tests\n")  # has TODO but in tests/
     rc = no_shortcut_markers.main(str(tmp_path))
     assert rc == 0  # tests/ TODO is fine
+
+
+def test_skips_peer_template_check_implementations(tmp_path, capsys):
+    """The peers repo's own policy templates name the markers they reject."""
+    path = (
+        tmp_path / "src" / "peers" / "templates" / "modes"
+        / "implement" / "checks" / "no_shortcut_markers.py"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_text('MARKERS = ("TODO", "FIXME", "XXX", "HACK")\n')
+
+    rc = no_shortcut_markers.main(str(tmp_path))
+
+    assert rc == 0

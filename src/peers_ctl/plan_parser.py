@@ -79,6 +79,9 @@ _STEP_SHA_RE = re.compile(r"^(?P<text>.+?)\s*\((?P<sha>[0-9a-f]{7,40})\)\s*$")
 class PlanValidationError(ValueError):
     """Raised when a PLAN.md fails schema or semantic validation."""
 
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(message or "plan validation failed")
+
 
 @dataclass
 class Step:

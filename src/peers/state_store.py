@@ -32,6 +32,7 @@ backup is written the first time a v1 state is migrated.
 from __future__ import annotations
 
 import copy
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -347,6 +348,35 @@ class StateStore:
 
 
 # --- helpers shared with TurnManager / driver -----------------------------
+
+def release_run_lock(peers_dir: Path) -> None:
+    """Remove a stale or just-released ``.peers/run.lock`` file.
+
+    The active lock is the kernel flock held by the running process; once
+    that process exits and unlocks, leaving the file behind only confuses
+    operators. Refuse to unlink symlinks so a peer cannot trick substrate
+    cleanup into deleting an arbitrary path.
+    """
+    lock = Path(peers_dir) / "run.lock"
+    try:
+        if lock.is_symlink():
+            return
+        with open_text_no_symlink(lock, "a") as f:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            try:
+                lock.unlink()
+            finally:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
 
 def current_peer_name(state: dict[str, Any]) -> str:
     return state["peer_order"][state["turn_index"]]

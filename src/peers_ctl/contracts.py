@@ -55,6 +55,9 @@ _VALID_KEYS = frozenset({_ACCEPTANCE, _E2E, _PLAN_ORIGINAL})
 class ContractsMismatch(RuntimeError):
     """Raised when frozen contracts have been tampered with or removed."""
 
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(message or "frozen contracts mismatch")
+
 
 def _script_body(command: str) -> str:
     return f"#!/bin/sh\nset -e\n{command}\n"

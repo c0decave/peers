@@ -14,6 +14,7 @@ fingerprint as long as the original process is alive.
 from __future__ import annotations
 
 import datetime as _dt
+import fcntl
 import hashlib
 import json
 import math
@@ -23,6 +24,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -77,6 +79,47 @@ EGRESS_PROXY_URL = f"http://127.0.0.1:{EGRESS_PROXY_PORT}"
 # explicitly. Default: empty string → podman default rootless
 # (slirp4netns/pasta), which sandboxes the proxy's namespace.
 EGRESS_PROXY_NETWORK = os.environ.get("PEERS_CTL_EGRESS_PROXY_NETWORK", "")
+
+# Phase 14: Claude OAuth lives in a local auth-proxy sidecar instead of
+# being bind-mounted into the workspace container as ~/.claude.json.
+# The workspace talks to http://127.0.0.1:8080 (same netns), while the
+# sidecar alone holds the rw token file. Escape hatch keeps legacy mode
+# available for local debugging.
+AUTH_PROXY_IMAGE = os.environ.get(
+    "PEERS_CTL_AUTH_PROXY_IMAGE", "peers-auth-proxy:dev"
+)
+AUTH_PROXY_DISABLED = _parse_truthy_env(
+    os.environ.get("PEERS_CTL_NO_AUTH_PROXY", "")
+)
+AUTH_PROXY_PORT = 8080
+AUTH_PROXY_URL = f"http://127.0.0.1:{AUTH_PROXY_PORT}"
+
+
+@contextmanager
+def _acquire_start_lock(lock_path: Path, timeout: float = 5.0):
+    """Serialize concurrent ``peers-ctl start`` calls for one project."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fp = lock_path.open("w")
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.time() >= deadline:
+                fp.close()
+                raise TimeoutError(
+                    f"could not acquire start lock {lock_path} "
+                    f"within {timeout:.1f}s"
+                )
+            time.sleep(0.05)
+    try:
+        yield fp
+    finally:
+        try:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+        finally:
+            fp.close()
 
 
 def _host_peers_version() -> str | None:
@@ -275,6 +318,21 @@ def _proxy_container_name(project: Project) -> str:
     return f"peers-egress-proxy_{suffix}"
 
 
+def _auth_proxy_container_name(project: Project) -> str:
+    main = _container_name(project)
+    suffix = main[len("peers-ctl_"):] if main.startswith("peers-ctl_") else main
+    return f"peers-auth-proxy_{suffix}"
+
+
+def _auth_proxy_enabled(home: Path | None = None) -> bool:
+    home = home or Path.home()
+    return (not AUTH_PROXY_DISABLED) and (home / ".claude.json").is_file()
+
+
+def _auth_proxy_was_used(project: Project) -> bool:
+    return "auth_proxy=1" in (project.notes or "") or _auth_proxy_enabled()
+
+
 def _build_proxy_argv(project: Project) -> list[str]:
     """Compose a `podman run -d` invocation for the egress-proxy
     sidecar. The proxy is a security component — it has no business
@@ -330,6 +388,42 @@ def _build_proxy_argv(project: Project) -> list[str]:
     return argv
 
 
+def _build_auth_proxy_argv(project: Project, home: Path | None = None) -> list[str]:
+    home = home or Path.home()
+    token_file = home / ".claude.json"
+    argv = [
+        PODMAN_CMD, "run", "-d", "--rm",
+        "--name", _auth_proxy_container_name(project),
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--read-only",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m,mode=1777",  # nosec B108
+        "--tmpfs", "/auth:rw,nosuid,nodev,size=4m,mode=700",  # nosec B108
+        "--pids-limit=128",
+        "-v", f"{token_file}:/auth/.claude.json",
+    ]
+    if EGRESS_PROXY_DISABLED:
+        if PODMAN_NETWORK:
+            argv.append(f"--network={PODMAN_NETWORK}")
+    else:
+        argv.append(f"--network=container:{_proxy_container_name(project)}")
+        argv += [
+            "-e", f"HTTPS_PROXY={EGRESS_PROXY_URL}",
+            "-e", f"HTTP_PROXY={EGRESS_PROXY_URL}",
+            "-e", "NO_PROXY=localhost,127.0.0.1,::1",
+        ]
+    token_url = os.environ.get("AUTH_PROXY_OAUTH_TOKEN_URL")
+    if token_url:
+        argv += ["-e", f"AUTH_PROXY_OAUTH_TOKEN_URL={token_url}"]
+    argv += [
+        AUTH_PROXY_IMAGE,
+        "--host", "127.0.0.1",
+        "--port", str(AUTH_PROXY_PORT),
+        "--token-file", "/auth/.claude.json",
+    ]
+    return argv
+
+
 def _ensure_egress_proxy_running(project: Project) -> None:
     """Phase-2 hardening B2: ensure the egress-proxy sidecar is up
     before launching the main peers container. The main container
@@ -382,6 +476,41 @@ def _ensure_egress_proxy_running(project: Project) -> None:
     )
 
 
+def _ensure_auth_proxy_running(project: Project) -> None:
+    if not _auth_proxy_enabled():
+        return
+    aname = _auth_proxy_container_name(project)
+    if _container_running(aname):
+        return
+    _cleanup_stale_container(aname)
+    run = subprocess.run(
+        _build_auth_proxy_argv(project),
+        stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, check=False,
+    )
+    if run.returncode == 0:
+        return
+    msg = (run.stderr or "").strip()[:300]
+    msg_lower = msg.lower()
+    name_collision = (
+        "in use" in msg_lower
+        or "already in use" in msg_lower
+        or "name is already" in msg_lower
+    )
+    if name_collision and _container_running(aname):
+        return
+    hint = (
+        " (build it with `make auth-proxy-build`, or set "
+        "PEERS_CTL_NO_AUTH_PROXY=1 to use the legacy workspace mount)"
+        if "image" in msg_lower or "manifest" in msg_lower
+        else ""
+    )
+    raise RuntimeError(
+        f"failed to start auth proxy ({aname}, rc={run.returncode}): "
+        f"{msg}{hint}"
+    )
+
+
 def _stop_egress_proxy_best_effort(project: Project) -> None:
     """Tear down the project's proxy sidecar if running. Best-effort:
     a leftover proxy is preferable to a stop-failure that breaks the
@@ -396,6 +525,21 @@ def _stop_egress_proxy_best_effort(project: Project) -> None:
     try:
         subprocess.run(
             [PODMAN_CMD, "stop", "-t", "2", pname],
+            capture_output=True, timeout=15, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
+def _stop_auth_proxy_best_effort(project: Project) -> None:
+    if not _auth_proxy_was_used(project):
+        return
+    aname = _auth_proxy_container_name(project)
+    if not _container_running(aname):
+        return
+    try:
+        subprocess.run(
+            [PODMAN_CMD, "stop", "-t", "2", aname],
             capture_output=True, timeout=15, check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -420,6 +564,7 @@ def _build_container_argv(project: Project,
     returned on podman's stdout; peers-ctl tracks the named container.
     """
     home = Path.home()
+    auth_proxy = _auth_proxy_enabled(home)
     argv = [
         PODMAN_CMD, "run", "-d", "--rm",
         "--name", _container_name(project),
@@ -454,10 +599,10 @@ def _build_container_argv(project: Project,
         "-v", f"{home / '.claude'}:/home/peer/.claude",
         "-v", f"{home / '.codex'}:/home/peer/.codex",
     ]
-    # claude (Anthropic CLI) reads its main config from ~/.claude.json
-    # which lives at $HOME root, not inside ~/.claude/. Mount it
-    # read-write so token refresh works.
-    if (home / ".claude.json").is_file():
+    # Legacy mode: claude reads its main config from ~/.claude.json.
+    # In the hardened default, only the auth-proxy sidecar gets that
+    # rw mount and the workspace receives ANTHROPIC_BASE_URL instead.
+    if (not auth_proxy) and (home / ".claude.json").is_file():
         argv += ["-v",
                  f"{home / '.claude.json'}:/home/peer/.claude.json"]
     # Per-user git identity so peer commits have a sensible author.
@@ -471,8 +616,9 @@ def _build_container_argv(project: Project,
     # behaved SDKs (Anthropic, OpenAI, requests, urllib, node-fetch)
     # route via the sidecar. NO_PROXY=localhost keeps loopback
     # direct so peer<->proxy itself doesn't loop.
-    if EGRESS_PROXY_DISABLED:
-        # Legacy mode: respect PODMAN_NETWORK env or default slirp.
+    if EGRESS_PROXY_DISABLED and auth_proxy:
+        argv += [f"--network=container:{_auth_proxy_container_name(project)}"]
+    elif EGRESS_PROXY_DISABLED:
         if PODMAN_NETWORK:
             argv += [f"--network={PODMAN_NETWORK}"]
     else:
@@ -482,6 +628,8 @@ def _build_container_argv(project: Project,
             "-e", f"HTTP_PROXY={EGRESS_PROXY_URL}",
             "-e", "NO_PROXY=localhost,127.0.0.1,::1",
         ]
+    if auth_proxy:
+        argv += ["-e", f"ANTHROPIC_BASE_URL={AUTH_PROXY_URL}"]
     argv += [CONTAINER_IMAGE, "run"]
     if max_ticks is not None:
         argv += ["--max-ticks", str(max_ticks)]
@@ -696,19 +844,28 @@ def _start_project_container(
     if drift_level == "warn":
         print(f"peers-ctl: warning: {drift_msg}", file=sys.stderr)
     _cleanup_stale_container(cname)
-    # Phase-2 hardening B2: bring the egress-proxy sidecar up FIRST,
-    # because the main container's `--network=container:<proxy>`
-    # would fail with "no such container" otherwise. _ensure_*
-    # raises with an actionable hint when the proxy image is
-    # missing.
-    _ensure_egress_proxy_running(project)
-    run = subprocess.run(
-        _build_container_argv(project, max_ticks, _run_extra_args(max_usd, extra_args)),
-        cwd=project.path,
-        stdin=subprocess.DEVNULL,
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        # Phase-2 hardening B2: bring the egress-proxy sidecar up FIRST,
+        # because the main container may share its network namespace.
+        _ensure_egress_proxy_running(project)
+        # Phase 14: auth proxy joins the same namespace and owns
+        # ~/.claude.json, keeping credentials out of the workspace.
+        _ensure_auth_proxy_running(project)
+        run = subprocess.run(
+            _build_container_argv(
+                project, max_ticks, _run_extra_args(max_usd, extra_args),
+            ),
+            cwd=project.path,
+            stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, check=False,
+        )
+    except Exception:
+        _stop_auth_proxy_best_effort(project)
+        _stop_egress_proxy_best_effort(project)
+        raise
     if run.returncode != 0:
+        _stop_auth_proxy_best_effort(project)
+        _stop_egress_proxy_best_effort(project)
         raise RuntimeError(
             f"podman run failed (rc={run.returncode}): "
             f"{(run.stderr or '').strip()[:400]}"
@@ -726,11 +883,14 @@ def _start_project_container(
             notes=(
                 f"max_ticks={max_ticks} max_usd={max_usd} "
                 f"started_by_pid={os.getpid()} starttime={starttime_token} "
-                f"container=1 container_name={cname} container_id={cid[:12]}"
+                f"container=1 container_name={cname} container_id={cid[:12]} "
+                f"auth_proxy={int(_auth_proxy_enabled())} "
+                f"auth_proxy_name={_auth_proxy_container_name(project)}"
             ),
         )
     except Exception:
         _stop_container_best_effort(cname)
+        _stop_auth_proxy_best_effort(project)
         _stop_egress_proxy_best_effort(project)
         _terminate_spawned_process(streamer)
         raise
@@ -830,20 +990,25 @@ def start_project(store: Store, project: Project,
     `budget:max_runtime` sentinel (useful for recording terminal
     state after a clean external stop).
     """
-    _start_project_preflight(
-        project, max_ticks, max_usd,
-        max_runtime_s=max_runtime_s,
-        reset_budget=reset_budget,
-        force=force,
-    )
-    log_path = _start_project_log_path(store, project)
-    if container:
-        return _start_project_container(
-            store, project, log_path, max_ticks, max_usd, extra_args
-        )
-    return _start_project_host(
-        store, project, log_path, max_ticks, max_usd, extra_args
-    )
+    lock_path = store.config_dir / "locks" / f"{project.name}.start.lock"
+    try:
+        with _acquire_start_lock(lock_path):
+            _start_project_preflight(
+                project, max_ticks, max_usd,
+                max_runtime_s=max_runtime_s,
+                reset_budget=reset_budget,
+                force=force,
+            )
+            log_path = _start_project_log_path(store, project)
+            if container:
+                return _start_project_container(
+                    store, project, log_path, max_ticks, max_usd, extra_args
+                )
+            return _start_project_host(
+                store, project, log_path, max_ticks, max_usd, extra_args
+            )
+    except TimeoutError as e:
+        raise ValueError(str(e)) from e
 
 
 def stop_project(store: Store, project: Project,
@@ -868,9 +1033,9 @@ def stop_project(store: Store, project: Project,
                 )
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
-        # Phase-2 hardening B2: tear the egress-proxy sidecar down
-        # after the main container exits. Stopping the proxy first
-        # would cut the LLM CLI's network mid-tick.
+        # Tear sidecars down after the main container exits. Stopping
+        # them first would cut the LLM CLI's network/auth mid-tick.
+        _stop_auth_proxy_best_effort(project)
         _stop_egress_proxy_best_effort(project)
         # Reap the log-streamer pid too if still alive.
         streamer_pid = project.pid

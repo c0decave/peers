@@ -1,6 +1,8 @@
 # peers — Security & Threat Model
 
-**Status:** living document. The threat model and per-layer mitigations described here reflect what the code does **today**; gaps and TODOs are called out explicitly so an operator can decide whether a given deployment is in-scope.
+**Languages:** EN / [DE](SECURITY_DE.md)
+
+**Status:** living document. The threat model and per-layer mitigations described here reflect what the code does **today**; gaps are called out explicitly so an operator can decide whether a given deployment is in-scope.
 
 ## TL;DR
 
@@ -36,6 +38,7 @@ For paid-customer or shared-host deployments: read the **Known Gaps** section be
 | Host operator | full | — |
 | `peers-ctl` on host | trusted (operator owns it) | `_PROJECT_NAME_RE` validation, `safe_io` (O_NOFOLLOW + nlink), `0o700` on config dirs, `fcntl.flock` on registry, atomic-rename + dir-fsync |
 | Egress proxy sidecar | trusted (operator-controlled image) | `cap-drop=ALL`, `no-new-privileges`, `--read-only` rootfs, `--tmpfs` per writable path, hardcoded allow-list, `pids-limit=128`, no host bind-mounts |
+| Auth proxy sidecar | trusted (operator-controlled image) | `cap-drop=ALL`, `no-new-privileges`, `--read-only` rootfs, `/tmp` + `/auth` tmpfs, `pids-limit=128`, isolated Claude OAuth injection + refresh |
 | peers container | semi-trusted (operator image, untrusted runtime) | `cap-drop=ALL`, `no-new-privileges`, `userns=keep-id`, `pids-limit=8192`, `--read-only` rootfs, `--tmpfs` for `/tmp` + `~/.cache` + `~/.npm`, **network restricted to proxy namespace**, HealthGuard idle/abs timeouts, in-container zombie reaper |
 | claude / codex CLIs | **NOT trusted** | `--dangerously-bypass-approvals-and-sandbox` (we own the outer sandbox; the CLI's internal one breaks `.git` writes) |
 | /work bind-mount | untrusted content | mounted read-write so peers can commit; tampering-detection + goals-hash sentinel (`goals.sha256`) + anti-cheating revert pass each tick |
@@ -69,6 +72,14 @@ For paid-customer or shared-host deployments: read the **Known Gaps** section be
 - **No host mounts** — sidecar cannot read host files even if compromised.
 - **No `--network=container:<peers>`** — proxy itself gets host networking (slirp4netns / pasta / configurable). Reverse-dependency: proxy controls the egress path; peers container shares its namespace.
 
+### Auth proxy sidecar
+
+- **Claude OAuth isolation** — when `~/.claude.json` exists, `peers-ctl start --container` mounts it into `peers-auth-proxy_<project>` only, not into the workspace container.
+- **Workspace route** — the workspace gets `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`; Claude API calls go through the sidecar, which injects `Authorization: Bearer ...`.
+- **Refresh on 401** — the sidecar refreshes the OAuth token from the mounted token file and retries once. The refresh endpoint is read from `AUTH_PROXY_OAUTH_TOKEN_URL` or `tokenUrl` in the token file.
+- **Read-only rootfs with explicit writable paths** — only `/tmp` and `/auth` are tmpfs-writable. Token refresh normally uses atomic replace; file-bind-mount targets fall back to an fsync'd in-place rewrite.
+- **Network placement** — with egress proxy enabled, auth-proxy and workspace both share the egress-proxy namespace. With egress disabled, workspace shares the auth-proxy namespace.
+
 ### peers main container
 
 - **`cap-drop=ALL + no-new-privileges`** — no privileged ops, no suid escalation.
@@ -76,6 +87,7 @@ For paid-customer or shared-host deployments: read the **Known Gaps** section be
 - **`--read-only` rootfs** — prompt-injection cannot persist binaries in `/usr`, `/etc`, `/var`.
 - **Explicit `--tmpfs`** for `/tmp`, `/home/peer/.cache`, `/home/peer/.npm`, all `nosuid,nodev`. Writable scratch only.
 - **Network via egress proxy** — `--network=container:peers-egress-proxy_<project>` + `HTTPS_PROXY` env. Direct internet egress impossible.
+- **No `~/.claude.json` workspace mount when auth-proxy is active** — Claude credentials are held by the sidecar. `~/.claude/` stays mounted for session jsonl/log state.
 - **`pids-limit=8192`** — prevents zombie-accumulation from setsid'd node helpers.
 
 ### LLM CLI layer
@@ -138,8 +150,8 @@ A wildcard like `.*\.sentry\.io$` matches *any* `<orgname>.ingest.sentry.io`. Si
 
 These gaps are documented but **not fixed today**.
 
-1. **OAuth token persistence** — `~/.claude.json`, `~/.claude/`, `~/.codex` are mounted **read-write** so token refresh works. A compromised LLM CLI can overwrite tokens. Mitigation today: rely on egress proxy to prevent exfil; trust that no other tenant has access to that host.
-   - **GA blocker:** OAuth-proxy on host or per-project COW credentials.
+1. **Non-Claude credential persistence** — `~/.codex` and `~/.claude/` are still mounted **read-write** so CLIs can persist local state. Claude's root `~/.claude.json` is isolated into the auth-proxy sidecar, but Codex OAuth/API-key material still depends on the egress proxy and single-operator trust boundary.
+   - **GA blocker:** equivalent auth-proxy/COW handling for every credential-bearing CLI.
 2. **argv-substitute discloses prompts** — peer prompts (including INBOX with commit messages from the other peer) are visible via `/proc/<pid>/cmdline`. Fix design: switch `prompt_mode: argv-substitute` → `stdin`.
 3. **No seccomp profile** — `cap-drop=ALL + no-new-privs` blocks privileged ops but not kernel-attack-surface narrowing. Future: ship a tinyproxy + main-container seccomp profile.
 4. **No multi-tenant isolation** — `~/.config/peers-ctl/projects.yaml` is single-user. Concurrent users on one host share that registry.
@@ -158,9 +170,10 @@ These gaps are documented but **not fixed today**.
 ```sh
 make build         # main peers:dev image
 make proxy-build   # peers-egress-proxy:dev sidecar
+make auth-proxy-build  # peers-auth-proxy:dev sidecar
 peers-ctl new <name> --container --modes=...
 peers-ctl start <name> --container
-# the egress proxy starts first; main container shares its netns
+# egress proxy starts first, auth proxy joins it, main container shares it
 ```
 
 ### How to verify hardening is active
@@ -168,9 +181,14 @@ peers-ctl start <name> --container
 ```sh
 # Proxy is running for the project:
 podman ps --filter name=peers-egress-proxy_<name>
+podman ps --filter name=peers-auth-proxy_<name>
 
 # Main container is on the proxy's network namespace:
 podman inspect <name> | grep NetworkMode    # expect: container:peers-egress-proxy_<name>
+
+# Workspace has no ~/.claude.json mount when auth-proxy is active:
+podman inspect peers-ctl_<name> | grep claude.json
+# expect: no workspace mount; peers-auth-proxy_<name> owns /auth/.claude.json
 
 # Egress is filtered: this should 403 from inside the container
 podman exec peers-ctl_<name> sh -c \
@@ -200,9 +218,12 @@ Without any of these, when `spent_runtime_s >= max_runtime_s`, `peers-ctl start`
 | Var | Effect | When to use |
 |---|---|---|
 | `PEERS_CTL_NO_EGRESS_PROXY=1` | Disable proxy sidecar, revert to legacy `--network=$PODMAN_NETWORK` (default `slirp4netns`, possibly `host`). Accepted falsy values: `0`/`false`/`no`/`off`/`""` (case-insensitive). | Debugging proxy issues. **Not safe for production.** |
+| `PEERS_CTL_NO_AUTH_PROXY=1` | Disable Claude auth-proxy sidecar and use the legacy `~/.claude.json` workspace mount when the file exists. | Debugging auth-proxy issues. **Not safe for multi-tenant use.** |
 | `PEERS_CTL_PODMAN_NETWORK=<mode>` | Override the **main peers container's** network mode (NOT the proxy's). Common: `host` when `/dev/net/tun` is absent | Rootless networking failure |
 | `PEERS_CTL_EGRESS_PROXY_NETWORK=<mode>` | The **proxy's** own network mode. Deliberately distinct from `PODMAN_NETWORK`: if the operator was forced into `host` for the main container, we MUST NOT also expose the proxy on the host loopback (any user with shell access to the host could reach 127.0.0.1:3128 and ride our OAuth quota). Default empty → podman rootless default | When you've validated a private alternative |
 | `PEERS_CTL_EGRESS_PROXY_IMAGE=<tag>` | Use alternative proxy image | Pinning a specific build for reproducibility |
+| `PEERS_CTL_AUTH_PROXY_IMAGE=<tag>` | Use alternative auth-proxy image | Pinning a specific build for reproducibility |
+| `AUTH_PROXY_OAUTH_TOKEN_URL=<url>` | Override OAuth refresh endpoint used by auth-proxy | Test environments or token files without `tokenUrl` |
 
 ### How to extend the allow-list
 
@@ -220,4 +241,3 @@ Without any of these, when `spent_runtime_s >= max_runtime_s`, `peers-ctl start`
 2. **Inspect the proxy log** (`podman logs peers-egress-proxy_<name>`) for unexpected destinations — if anything outside the allow-list 200-OK'd, the filter has a hole.
 3. **Stop all containers** with `peers-ctl stop` for every running project.
 4. **Audit the goals.yaml** of recent projects for unauthorized command additions (`goal-mutation` exit should have caught it; verify).
-
