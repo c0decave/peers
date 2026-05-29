@@ -197,11 +197,14 @@ def amend_acceptance(plan_dir: Path, new_command: str, reason: str) -> None:
     everything from the iso timestamp onward (including the trailing
     newline). The first entry uses the literal seed ``"genesis"``.
     """
+    # Load + validate the pin file BEFORE mutating any frozen file so a
+    # corrupt contracts.sha cannot wedge the layout.
+    pins = _load_pins(plan_dir)
+
     # 1. Re-pin acceptance.sh (preserve 0444 afterward).
     acc_body = _script_body(new_command)
     _write_read_only(_resolve_contract_path(plan_dir, _ACCEPTANCE), acc_body)
 
-    pins = _load_pins(plan_dir)
     pins[_ACCEPTANCE] = _sha256_hex(acc_body.encode("utf-8"))
     _save_pins(plan_dir, pins)
 

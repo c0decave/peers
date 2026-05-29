@@ -99,6 +99,11 @@ def _token_url(config: OAuthConfig) -> str:
             "OAuth refresh endpoint is not configured; set "
             "AUTH_PROXY_OAUTH_TOKEN_URL or tokenUrl in the token file"
         )
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        raise OAuthRefreshError(
+            "OAuth refresh endpoint must be an https:// URL"
+        )
     return url
 
 

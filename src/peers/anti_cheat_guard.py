@@ -18,6 +18,8 @@ _TEST_PATH_RE = re.compile(
     r"[a-zA-Z]+$)"
 )
 
+MAX_RECENT_DIFF_STATS = 50
+
 
 def is_test_only_commit(repo: Path, ref: str) -> bool:
     """True iff ``ref`` changes at least one file and all are tests."""
@@ -245,9 +247,26 @@ class AntiCheatGuard:
                 f"(+{test_lines} lines, 0 src). Verify the tests still "
                 "match the spec rather than being weakened."
             )
-        state.setdefault("recent_diff_stats", {})[
-            self.head_sha()
-        ] = {"test_lines": test_lines, "src_lines": src_lines}
+        self._record_recent_diff_stats(state, test_lines, src_lines)
+
+    def _record_recent_diff_stats(
+        self, state: dict[str, Any], test_lines: int, src_lines: int,
+    ) -> None:
+        """Record bounded per-handoff diff stats for dashboard hints."""
+        stats_by_head = state.get("recent_diff_stats")
+        if not isinstance(stats_by_head, dict):
+            stats_by_head = {}
+            state["recent_diff_stats"] = stats_by_head
+
+        head = self.head_sha()
+        stats_by_head.pop(head, None)
+        stats_by_head[head] = {"test_lines": test_lines, "src_lines": src_lines}
+
+        overflow = len(stats_by_head) - MAX_RECENT_DIFF_STATS
+        if overflow <= 0:
+            return
+        for old_head in list(stats_by_head)[:overflow]:
+            stats_by_head.pop(old_head, None)
 
     @staticmethod
     def _stderr_text(exc: subprocess.CalledProcessError) -> str:

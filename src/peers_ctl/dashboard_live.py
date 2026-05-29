@@ -85,7 +85,10 @@ def _dashboard_soft_goal_passed(goal, status: dict, n_peers: int) -> bool:
     if mode == "quorum":
         if not goal.quorum_num or not goal.quorum_den:
             return False
-        recent = status.get("history", [])[-goal.quorum_den:]
+        history = status.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        recent = history[-goal.quorum_den:]
         if len(recent) < goal.quorum_den:
             return False
         return sum(1 for entry in recent if entry.get("pass")) >= goal.quorum_num

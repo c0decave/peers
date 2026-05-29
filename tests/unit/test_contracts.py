@@ -257,3 +257,37 @@ def test_amend_does_not_touch_plan_original(tmp_path):
     assert sha_after["PLAN.original.md"] == plan_sha_before
     # And the file content + mode are still pristine
     assert verify_contracts(plan_dir) is None
+
+
+def test_amend_acceptance_atomic_on_corrupt_sha_BUG_201(tmp_path: Path):
+    """BUG-201 reproducer: amend_acceptance must NOT wedge the contracts
+    layout when contracts.sha is unreadable. Previously the function rewrote
+    acceptance.sh BEFORE calling _load_pins(), so a corrupt contracts.sha
+    raised ContractsMismatch with acceptance.sh already replaced and 0444;
+    the pin still referenced the OLD sha so every subsequent
+    verify_contracts() raised 'frozen file tampered: acceptance.sh' until a
+    human manually rolled the script back. Expected behavior: on any failure
+    to load pins, leave acceptance.sh untouched so the operator can recover
+    by restoring contracts.sha alone.
+    """
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+    acc_path = plan_dir / "contracts" / "acceptance.sh"
+    original_body = acc_path.read_bytes()
+
+    # Corrupt contracts.sha so _load_pins() raises ContractsMismatch.
+    _chmod_writable(plan_dir / "contracts.sha")
+    (plan_dir / "contracts.sha").write_text(
+        "{not valid json", encoding="utf-8",
+    )
+
+    with pytest.raises(ContractsMismatch):
+        amend_acceptance(plan_dir, "pytest -x", reason="fail-fast")
+
+    # Acceptance must be untouched so an operator who restores contracts.sha
+    # from backup recovers without a manual rollback of acceptance.sh.
+    assert acc_path.read_bytes() == original_body, (
+        "BUG-201: amend_acceptance overwrote acceptance.sh before "
+        "_load_pins() detected the corrupt contracts.sha, wedging the "
+        "contract layout permanently"
+    )

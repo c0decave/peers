@@ -222,3 +222,86 @@ def test_refresh_claude_config_rewrites_file_bind_mount_when_replace_busy(
     assert data["oauthAccount"]["accessToken"] == "new"
     assert data["oauthAccount"]["refreshToken"] == "refresh-2"
     assert not (tmp_path / ".claude.json.tmp").exists()
+
+
+def test_refresh_claude_config_rejects_http_token_url_BUG_203(
+    tmp_path: Path,
+) -> None:
+    """BUG-203 reproducer: refresh_claude_config must NOT POST the
+    refresh_token to a plain http:// endpoint. A misconfigured tokenUrl (or
+    a compromised token file) would otherwise exfiltrate the long-lived
+    refresh credential in cleartext. Expected: any non-https scheme is
+    rejected with OAuthRefreshError BEFORE the request fires."""
+    import pytest
+
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh-secret",
+            "tokenUrl": "http://attacker.example/token",
+            "clientId": "client-1",
+        }
+    }), encoding="utf-8")
+
+    captured_body: dict = {}
+
+    def opener(request, *, timeout):  # pragma: no cover - must not fire
+        captured_body["url"] = request.full_url
+        captured_body["body"] = request.data.decode("utf-8")
+        return FakeResponse(
+            200, json.dumps({"access_token": "new"}).encode("utf-8"),
+        )
+
+    with pytest.raises(oauth_refresh.OAuthRefreshError, match="https://"):
+        refresh_claude_config(token_file, opener=opener)
+
+    assert "refresh_token=refresh-secret" not in captured_body.get("body", ""), (
+        "BUG-203: refresh_token was POSTed over cleartext http:// to "
+        f"{captured_body.get('url')!r}"
+    )
+
+
+def test_refresh_claude_config_rejects_http_env_token_url_BUG_203(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import pytest
+
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh-secret",
+            "tokenUrl": "https://auth.example/token",
+        }
+    }), encoding="utf-8")
+    monkeypatch.setenv(
+        "AUTH_PROXY_OAUTH_TOKEN_URL", "http://attacker.example/token",
+    )
+
+    def opener(request, *, timeout):  # pragma: no cover - must not fire
+        raise AssertionError("refresh request must be rejected before network IO")
+
+    with pytest.raises(oauth_refresh.OAuthRefreshError, match="https://"):
+        refresh_claude_config(token_file, opener=opener)
+
+
+def test_refresh_claude_config_rejects_https_url_without_host_BUG_203(
+    tmp_path: Path,
+) -> None:
+    import pytest
+
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh-secret",
+            "tokenUrl": "https:///token",
+        }
+    }), encoding="utf-8")
+
+    def opener(request, *, timeout):  # pragma: no cover - must not fire
+        raise AssertionError("malformed refresh endpoint must not be requested")
+
+    with pytest.raises(oauth_refresh.OAuthRefreshError, match="https://"):
+        refresh_claude_config(token_file, opener=opener)

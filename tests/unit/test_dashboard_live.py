@@ -428,3 +428,59 @@ def test_cmd_dashboard_snapshot_tip_hidden_when_piped(monkeypatch,
     assert rc == 0
     out = capsys.readouterr().out
     assert dashboard_live.LIVE_HINT not in out
+
+
+def test_dashboard_soft_goal_passed_tolerates_non_list_history_BUG_205():
+    """BUG-205 reproducer: _dashboard_soft_goal_passed did
+    ``status.get('history', [])[-quorum_den:]`` with no isinstance check. A
+    soft_status[gid] value whose ``history`` is a non-list (serialization
+    corruption or a peer-written dict-shaped stub) made the slice raise
+    TypeError, which propagated out of _dashboard_goal_counts() and killed
+    the dashboard for ALL registered projects. Expected: guard with
+    isinstance(history, list) and fall back to insufficient quorum."""
+    from peers.goals import Goal
+
+    goal = Goal(
+        gid="soft-quorum",
+        type="soft",
+        reviewer="quorum",
+        quorum_num=2,
+        quorum_den=3,
+    )
+    # history is a dict, not a list — must not raise.
+    status = {"history": {"r1": {"pass": True}, "r2": {"pass": True}}}
+
+    assert dashboard_live._dashboard_soft_goal_passed(goal, status, 2) is False
+
+
+def test_dashboard_goal_counts_survives_corrupt_soft_history_BUG_205(tmp_path):
+    """End-to-end: a corrupt non-list history in state.json must not crash
+    the whole-registry dashboard render (load_dashboard_rows)."""
+    config_dir = tmp_path / "ctl"
+    project_path = _register_project(config_dir, tmp_path, "gamma")
+    peers_dir = project_path / ".peers"
+    (peers_dir / "goals.yaml").write_text(
+        "goals:\n"
+        "  - id: soft-quorum\n"
+        "    description: quorum soft goal\n"
+        "    type: soft\n"
+        "    reviewer: quorum\n"
+        "    quorum: 2/3\n"
+        "    pass_when: \"true\"\n",
+        encoding="utf-8",
+    )
+    (peers_dir / "state.json").write_text(
+        json.dumps({
+            "soft_status": {
+                "soft-quorum": {"history": {"bad": "shape"}},
+            },
+            "peer_order": ["claude", "codex"],
+        }),
+        encoding="utf-8",
+    )
+
+    rows = load_dashboard_rows(config_dir, reconcile_first=False)
+
+    assert any(row.name == "gamma" for row in rows), (
+        "BUG-205: corrupt soft-goal history aborted the whole-registry render"
+    )

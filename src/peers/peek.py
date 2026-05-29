@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -24,9 +25,14 @@ def _trunc(value: object, limit: int = MAX_RENDERED_VALUE) -> str:
     return text[: max(0, limit - 3)] + "..."
 
 
+def _event_type(ev: dict) -> str:
+    t = ev.get("type")
+    return t if isinstance(t, str) and t else "?"
+
+
 def decode_event(ev: dict) -> Iterator[str]:
     """Yield one-line summaries for the operator-relevant event parts."""
-    t = ev.get("type")
+    t = _event_type(ev)
     if t in NOISE_TYPES:
         return
     msg = ev.get("message")
@@ -66,16 +72,20 @@ def newest_session_jsonl(jsonl_dir: Path) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def _read_existing_lines(path: Path, last: int | None) -> tuple[list[str], int]:
+def _read_existing_lines(
+    path: Path,
+    last: int | None,
+) -> tuple[list[str], int, tuple[int, int] | None]:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
+            stat = os.fstat(f.fileno())
             if last is None:
                 lines = list(f)
             else:
                 lines = list(deque(f, maxlen=last))
-            return lines, f.tell()
+            return lines, f.tell(), (stat.st_dev, stat.st_ino)
     except FileNotFoundError:
-        return [], 0
+        return [], 0, None
 
 
 def tail_session(
@@ -85,7 +95,7 @@ def tail_session(
     last: int | None = None,
 ) -> Iterator[str]:
     """Yield decoded lines from a session jsonl, optionally following it."""
-    lines, pos = _read_existing_lines(jsonl_path, last)
+    lines, pos, identity = _read_existing_lines(jsonl_path, last)
     for line in lines:
         try:
             ev = json.loads(line)
@@ -98,6 +108,13 @@ def tail_session(
     while True:
         try:
             with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+                stat = os.fstat(f.fileno())
+                current_identity = (stat.st_dev, stat.st_ino)
+                if identity is not None and current_identity != identity:
+                    pos = 0
+                elif stat.st_size < pos:
+                    pos = 0
+                identity = current_identity
                 f.seek(pos)
                 while True:
                     line = f.readline()
@@ -111,5 +128,6 @@ def tail_session(
                     if isinstance(ev, dict):
                         yield from decode_event(ev)
         except FileNotFoundError:
-            pass
+            pos = 0
+            identity = None
         time.sleep(0.5)
