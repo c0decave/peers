@@ -44,6 +44,46 @@ def test_advance_on_failure_keeps_turn_until_max_retries():
     assert state["peer_order"][state["turn_index"]] == "codex"
 
 
+def test_default_max_retries_is_one_not_two():
+    """Bug B: default rotation was max_retries=2 (3 consec fails needed).
+    v12 wasted ~67min on claude struggling 3 ticks before rotation. New
+    default rotates after 2 consec fails (max_retries=1) so the OTHER
+    peer gets a chance to attack the same problem from a fresh angle."""
+    state = _fresh_state("claude")
+    tm = TurnManager(state)  # no explicit max_retries → uses new default
+    tm.advance(success=False)
+    assert state["peer_order"][state["turn_index"]] == "claude"
+    assert state["peers"]["claude"]["consecutive_fails"] == 1
+    tm.advance(success=False)  # second failure now exceeds max_retries=1
+    assert state["peer_order"][state["turn_index"]] == "codex"
+
+
+def test_max_retries_read_from_state_config():
+    """max_retries can be overridden per-project via state['config']['max_retries'].
+
+    Lets audit-mode operators bump retries up (peer needs more time to think)
+    or down (aggressive diversification) without changing the substrate default.
+    """
+    state = _fresh_state("claude")
+    state["config"] = {"max_retries": 3}
+    tm = TurnManager.from_state(state)  # factory honors config
+    for _ in range(3):
+        tm.advance(success=False)
+    # 3 fails not yet > max_retries=3 → still claude
+    assert state["peer_order"][state["turn_index"]] == "claude"
+    tm.advance(success=False)
+    assert state["peer_order"][state["turn_index"]] == "codex"
+
+
+def test_from_state_uses_default_when_config_missing():
+    state = _fresh_state("claude")
+    tm = TurnManager.from_state(state)  # no state['config'] at all
+    tm.advance(success=False)
+    assert state["peer_order"][state["turn_index"]] == "claude"
+    tm.advance(success=False)  # new default 1 → rotate
+    assert state["peer_order"][state["turn_index"]] == "codex"
+
+
 def test_current_skips_degraded_peer_if_healthy_exists(monkeypatch):
     """degraded peer at turn_index → current() hops forward
     to the next healthy peer and pins turn_index there."""

@@ -44,7 +44,14 @@ _STOP_POLL_INTERVAL_S = 0.25
 # cgroup limit. The sweep itself is cheap (one os.listdir + stat read
 # per /proc/[pid]) and only fires when peers is PID 1.
 _ZOMBIE_SWEEP_INTERVAL_S = 2.0
-_CLAUDE_JSONL_LIVENESS_WINDOW_S = 60
+# Bug A revisit: 60s was too tight — claude can legitimately think
+# for 60-120s between tool calls (long extended-thinking, tool result
+# processing). With Bug D now fixed (stream-json is the runtime default
+# again), normal liveness comes from stdout. The jsonl-fallback is the
+# emergency parachute for the rare case where stream-json fails but
+# jsonl still writes. 300s (5min) gives meaningful buffer without
+# letting a genuinely-stuck peer drag on forever.
+_CLAUDE_JSONL_LIVENESS_WINDOW_S = 300
 
 
 def claude_session_jsonl_path(cwd: str | Path) -> Path | None:

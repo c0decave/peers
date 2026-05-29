@@ -27,11 +27,34 @@ class DriverPeerHealthMixin:
         theoretical thrash to keep recovery responsive — a stuck-flag
         bias check happens at the loop level via stuck_counter.)"""
         t = state["peers"][peer]
-        history = t.setdefault("recent_runs", [])  # list of bool
-        history.append(success)
+        history = t.setdefault("recent_runs", [])  # list of bool OR float
+        # Bug C: productive-commit-no-handoff counts as 0.5 fail (not 1.0).
+        # Peers committing real work but missing the handoff trailer should
+        # be hinted toward fixing the format, not penalized into DEGRADED.
+        # Real-fails (idle-timeout, no-commit, history-rewrite) still 1.0.
+        productive_no_handoff = bool(
+            t.get("last_tick_productive_no_handoff", False)
+        )
+        if success:
+            entry: bool | float = True
+        elif productive_no_handoff:
+            entry = 0.5
+        else:
+            entry = False
+        history.append(entry)
         if len(history) > 5:
             del history[:-5]
-        recent_fails = sum(1 for ok in history if not ok)
+        # Treat True as 0.0 fail, False as 1.0 fail, float entry as
+        # (1 - value). Stored as float so DEGRADED threshold sees the
+        # exact fractional total without rounding-up surprises.
+        recent_fails = 0.0
+        for x in history:
+            if x is True:
+                pass
+            elif x is False:
+                recent_fails += 1.0
+            else:
+                recent_fails += (1.0 - float(x))
         t["recent_fails"] = recent_fails
         prev_state = t.get("state")
         if success and prev_state == "degraded":
@@ -45,7 +68,11 @@ class DriverPeerHealthMixin:
             t["state"] = "degraded"
             if prev_state != "degraded":
                 self._record_degraded_annotations(
-                    state, peer, "recent-fails:{0}/5".format(recent_fails),
+                    state, peer,
+                    "recent-fails:{0}/5".format(
+                        int(recent_fails) if recent_fails == int(recent_fails)
+                        else round(recent_fails, 1)
+                    ),
                 )
         elif t.get("failed_cheating", 0) >= 2:
             t["state"] = "degraded"

@@ -7,8 +7,15 @@ and last-tick timestamp.
 
 ## SYNOPSIS
 ```
-peers-ctl dashboard [--live] [--refresh-s SECONDS] [--project NAME]
+peers-ctl dashboard [--live] [--refresh-s SECONDS] [--frames N]
+                    [--project NAME]
 ```
+
+For most multi-project operators the **streaming view** (`--live`) is
+the more useful mode: it redraws the table every `--refresh-s` seconds
+and surfaces `ALERT` + `EVENT` columns that the one-shot snapshot
+omits. The default no-flag invocation is a single rendered snapshot,
+useful for scripting and quick checks.
 
 ## DESCRIPTION
 Reconciles the registry, then walks every project to produce a row:
@@ -39,18 +46,30 @@ project row, recent `runs.jsonl` entries, and bug-report details. It
 can also be combined with `--live` for continuous redraw.
 
 ## OPTIONS
-- `--live` — redraw the dashboard continuously until Ctrl-C.
+- `--live` — redraw the dashboard continuously until Ctrl-C. Adds
+  the `ALERT` and `EVENT` columns. This is the streaming view most
+  operators want for day-to-day observability.
 - `--refresh-s SECONDS` — refresh interval for `--live` (default:
   `2.0`). Must be greater than zero.
+- `--frames N` — only valid with `--live`. Render `N` frames and
+  exit (default: run until Ctrl-C). Useful for headless smoke tests
+  and CI: `peers-ctl dashboard --live --frames 1` renders exactly
+  one frame and exits 0.
 - `--project NAME` — show a single-project drilldown with recent runs
   and bug reports.
 
 ## EXAMPLES
 ```
+# Streaming view of all projects — the discoverable default for
+# day-to-day observability (Ctrl-C to exit).
+peers-ctl dashboard --live
+peers-ctl dashboard --live --refresh-s 1
+
+# One-shot snapshot — good for piping into other tools.
 peers-ctl dashboard
 
-# Built-in live view.
-peers-ctl dashboard --live --refresh-s 1
+# Non-interactive smoke test: render one frame and exit.
+peers-ctl dashboard --live --frames 1
 
 # Single-project drilldown.
 peers-ctl dashboard --project my-app

@@ -31,6 +31,9 @@ from typing import Any
 
 VALID_PROMPT_MODES = ("stdin", "argv-substitute")
 
+# Item 13: peer-role topology. See PeerSpec.role docstring for semantics.
+VALID_PEER_ROLES = ("default", "recovery", "witness", "debater")
+
 # `tool` selects which token/USD parser to use in the driver and which
 # default invocation conventions apply. Two are recognised today;
 # anything else falls through to a no-op token parser.
@@ -68,6 +71,16 @@ class PeerSpec:
     tool: str
     argv: tuple[str, ...]
     prompt_mode: str = "stdin"
+    # Item 13: n>2 peer topologies. `role` selects substrate behavior:
+    #   "default"  — regular peer in rotation (legacy)
+    #   "recovery" — only activated when all default peers are degraded
+    #   "witness"  — commits annotations only, never claims handoff
+    #                (prompt-template variation; substrate is role-agnostic
+    #                aside from skip-from-rotation rule below)
+    #   "debater"  — takes the opposing position (prompt-template variation)
+    # The substrate distinguishes only "default" vs "recovery" today;
+    # witness/debater are pure prompt patterns living in the mode template.
+    role: str = "default"
 
 
 def load_peer_specs(cfg: dict[str, Any]) -> list[PeerSpec]:
@@ -134,9 +147,16 @@ def load_peer_specs(cfg: dict[str, Any]) -> list[PeerSpec]:
                     f"peers[{i}].prompt_mode must be one of "
                     f"{VALID_PROMPT_MODES}, got {prompt_mode!r}"
                 )
+            role = entry.get("role", "default")
+            if role not in VALID_PEER_ROLES:
+                raise ValueError(
+                    f"peers[{i}].role must be one of "
+                    f"{VALID_PEER_ROLES}, got {role!r}"
+                )
             specs.append(PeerSpec(
                 name=name, tool=tool,
                 argv=tuple(argv), prompt_mode=prompt_mode,
+                role=role,
             ))
         return specs
 

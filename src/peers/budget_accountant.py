@@ -273,14 +273,29 @@ def account_tokens_usd(
 
 def record_tick_accounting(
     state: dict[str, Any], success: bool, tick_dt: int,
+    peer: str | None = None,
 ) -> None:
-    """Record iteration/runtime counters for one completed tick."""
+    """Record iteration/runtime counters for one completed tick.
+
+    On fail, also append a per-tick attribution entry to
+    `budget['wasted_runtime_per_tick']` so operators can see WHICH ticks
+    burned which budget, not just the running sum. Capped at last 20
+    entries (older fail-ticks drop off).
+    """
     state["iteration"] += 1
     budget = state["budget"]
     budget["spent_iterations"] += 1
     budget["spent_runtime_s"] += tick_dt
     if not success:
         budget["wasted_runtime_s"] = budget.get("wasted_runtime_s", 0) + tick_dt
+        per_tick = budget.setdefault("wasted_runtime_per_tick", [])
+        per_tick.append({
+            "iteration": int(state["iteration"]),
+            "peer": str(peer) if peer is not None else None,
+            "duration_s": int(tick_dt),
+        })
+        if len(per_tick) > 20:
+            del per_tick[:-20]
     budget["consecutive_failures"] = (
         0 if success else budget["consecutive_failures"] + 1
     )

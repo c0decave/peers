@@ -8,6 +8,7 @@ import datetime as _dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -156,6 +157,287 @@ def _container_run_in(target: Path, *peers_args: str) -> int:
         return 127
 
 
+_KNOWN_TEMPLATES = ("internal testing",)
+
+_PLACEHOLDER_SELF_AUDIT_SPEC = """\
+# peers — Specification (Self-Audit Snapshot, placeholder)
+
+This SPEC.md is the **root-level** anchor required by the
+`threat-model-present` hard gate. It was generated as a placeholder
+by `peers-ctl new --template internal testing` because no previous
+`peers-internal testing-v*` sibling directory was found to copy from.
+
+Replace this body with the real spec before the first audit tick — the
+substrate internal testing needs an honest threat model to do useful work.
+The expected sections are:
+
+- Purpose, functional scope, non-goals
+- Threat model (actors + capabilities, trust boundaries, mitigations)
+- A link to `docs/ATTACK-SURFACE.md` for the per-surface analysis
+- A link to `docs/SECURITY.md` for the runtime defense playbook
+"""
+
+_PLACEHOLDER_SELF_AUDIT_ATTACK_SURFACE = """\
+# peers — Attack Surface (placeholder)
+
+This file is the anchor for the `attack-surface-enumerated` hard gate.
+It was generated as a placeholder by `peers-ctl new --template
+internal testing` because no previous `peers-internal testing-v*` sibling
+directory was found to copy from.
+
+Each `##` section below should describe one entry-point:
+- Where attacker-controlled input enters the system
+- Which trust boundary it crosses
+- What defense is in place today
+- Known gaps with links to tracking items
+
+Suggested initial sections (replace the bodies with the real analysis
+before the first audit tick):
+
+## peers-ctl CLI (host)
+TODO: untrusted input, trust boundary, defenses, known gaps.
+
+## peers in-container orchestrator
+TODO: untrusted input, trust boundary, defenses, known gaps.
+
+## podman container + egress proxy
+TODO: untrusted input, trust boundary, defenses, known gaps.
+"""
+
+
+def _find_latest_self_audit_anchor(target: Path) -> Path | None:
+    """Find the highest-versioned `peers-internal testing-vN` sibling of
+    ``target`` that has a SPEC.md (and is therefore usable as anchor
+    source). Returns ``None`` if nothing eligible is found.
+
+    The version compare is integer-on-N rather than string-on-name so
+    `v10` sorts above `v9`.
+    """
+    parent = target.parent
+    if not parent.is_dir():
+        return None
+    rx = re.compile(r"^peers-internal testing-v(\d+)$")
+    candidates: list[tuple[int, Path]] = []
+    try:
+        for entry in parent.iterdir():
+            if not entry.is_dir():
+                continue
+            m = rx.match(entry.name)
+            if not m:
+                continue
+            # Skip if we're looking AT the target itself.
+            if entry.resolve() == target.resolve():
+                continue
+            # Only consider as anchor source if it actually has SPEC.md.
+            if not (entry / "SPEC.md").is_file():
+                continue
+            candidates.append((int(m.group(1)), entry))
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[0][1]
+
+
+def _substrate_default_source() -> Path:
+    """Return the operator's substrate-repo path for the internal testing
+    template's default `--from`. The convention is whatever directory
+    contains the running peers_ctl package — i.e. the same checkout
+    the operator installed peers-ctl from."""
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _apply_self_audit_template(
+    target: Path,
+    *,
+    template_from: Path | None,
+    anchors_from: Path | None,
+    force: bool,
+) -> tuple[int, list[str] | None]:
+    """Bootstrap the substrate internal testing project layout into ``target``.
+
+    Performed BEFORE the existing `cmd_new` scaffold flow runs (so the
+    cloned ``.git`` + branch + anchors are in place when `peers init`
+    fires inside the directory).
+
+    Returns ``(rc, implied_modes)``:
+      - ``rc=0`` on success; ``implied_modes`` is the default mode
+        list (``["audit", "thorough"]``) the caller should use unless
+        the operator passed an explicit ``--modes``.
+      - non-zero ``rc`` on failure; ``implied_modes`` is ``None`` and
+        the error is already printed to stderr.
+    """
+    src = (template_from or _substrate_default_source()).expanduser().resolve()
+    if not (src / ".git").is_dir():
+        print(
+            f"peers-ctl: --template internal testing: source {src} is not a "
+            "git repo (use --from to point at the substrate checkout)",
+            file=sys.stderr,
+        )
+        return 1, None
+
+    if target.exists():
+        try:
+            existing = list(target.iterdir())
+        except OSError as e:
+            print(f"peers-ctl: cannot read {target}: {e}", file=sys.stderr)
+            return 1, None
+        if existing and not force:
+            print(
+                f"peers-ctl: --template internal testing: target {target} is "
+                "non-empty (use --force to override)",
+                file=sys.stderr,
+            )
+            return 2, None
+        if existing and force:
+            # The git-clone below refuses to write into a non-empty
+            # destination — clear it first. We only delete entries we
+            # owned; symlinks are explicitly refused (no surprise
+            # follow-outside) and an error short-circuits the clone.
+            for entry in existing:
+                if entry.is_symlink():
+                    print(
+                        f"peers-ctl: refusing to remove symlink under "
+                        f"target before clone: {entry}",
+                        file=sys.stderr,
+                    )
+                    return 1, None
+                try:
+                    if entry.is_dir():
+                        shutil.rmtree(entry)
+                    else:
+                        entry.unlink()
+                except OSError as e:
+                    print(
+                        f"peers-ctl: cannot clear {entry}: {e}",
+                        file=sys.stderr,
+                    )
+                    return 1, None
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Clone substrate into target.
+    clone = subprocess.run(
+        ["git", "clone", "--quiet", str(src), str(target)],
+        capture_output=True, text=True,
+    )
+    if clone.returncode != 0:
+        print(
+            f"peers-ctl: --template internal testing: git clone failed: "
+            f"{clone.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return 1, None
+
+    # 2. Checkout a branch named after the target dir basename.
+    branch_name = target.name
+    if branch_name.startswith("peers-internal testing-"):
+        branch_name = "internal testing-" + branch_name[len("peers-internal testing-"):]
+    co = subprocess.run(
+        ["git", "checkout", "-q", "-b", branch_name],
+        cwd=target, capture_output=True, text=True,
+    )
+    if co.returncode != 0:
+        print(
+            f"peers-ctl: --template internal testing: git checkout -b "
+            f"{branch_name} failed: {co.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return 1, None
+
+    # 3. Resolve anchor source and copy SPEC.md + docs/ATTACK-SURFACE.md.
+    anchor_dir: Path | None = None
+    if anchors_from is not None:
+        anchor_dir = anchors_from.expanduser().resolve()
+        if not anchor_dir.is_dir():
+            print(
+                f"peers-ctl: --anchors-from {anchor_dir} is not a directory",
+                file=sys.stderr,
+            )
+            return 1, None
+    else:
+        anchor_dir = _find_latest_self_audit_anchor(target)
+
+    spec_path = target / "SPEC.md"
+    attack_path = target / "docs" / "ATTACK-SURFACE.md"
+    attack_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if anchor_dir is not None and (anchor_dir / "SPEC.md").is_file():
+        # safe_io's read_text_no_symlink + write_text_no_symlink keep
+        # the symlink-TOCTOU defenses consistent with the rest of
+        # cmd_new's scaffold path.
+        try:
+            spec_text = read_text_no_symlink(anchor_dir / "SPEC.md")
+        except OSError as e:
+            print(
+                f"peers-ctl: cannot read anchor SPEC.md: {e}",
+                file=sys.stderr,
+            )
+            return 1, None
+        attack_src = anchor_dir / "docs" / "ATTACK-SURFACE.md"
+        attack_text: str
+        if attack_src.is_file():
+            try:
+                attack_text = read_text_no_symlink(attack_src)
+            except OSError as e:
+                print(
+                    f"peers-ctl: cannot read anchor ATTACK-SURFACE.md: {e}",
+                    file=sys.stderr,
+                )
+                return 1, None
+        else:
+            attack_text = _PLACEHOLDER_SELF_AUDIT_ATTACK_SURFACE
+    else:
+        spec_text = _PLACEHOLDER_SELF_AUDIT_SPEC
+        attack_text = _PLACEHOLDER_SELF_AUDIT_ATTACK_SURFACE
+
+    try:
+        write_text_no_symlink(spec_path, spec_text)
+        write_text_no_symlink(attack_path, attack_text)
+    except OSError as e:
+        print(
+            f"peers-ctl: cannot write internal testing anchors safely: {e}",
+            file=sys.stderr,
+        )
+        return 1, None
+
+    # 4. Stage + commit the anchors on the new branch.
+    subprocess.run(
+        ["git", "add", "SPEC.md", "docs/ATTACK-SURFACE.md"],
+        cwd=target, capture_output=True, check=False,
+    )
+    # Ensure local commit identity if the operator's gitconfig is absent.
+    for k, v in (("user.email", "you@local"), ("user.name", "you")):
+        cur = subprocess.run(
+            ["git", "config", "--get", k],
+            cwd=target, capture_output=True, text=True,
+        )
+        if cur.returncode != 0:
+            subprocess.run(
+                ["git", "config", k, v],
+                cwd=target, capture_output=True, check=False,
+            )
+    commit = subprocess.run(
+        ["git", "commit", "-q", "-m",
+         f"chore({branch_name}): seed internal testing anchors"],
+        cwd=target, capture_output=True, text=True,
+    )
+    if commit.returncode != 0:
+        # If there's literally nothing to commit (e.g. anchors copied
+        # bit-identical to what was already on disk from clone), the
+        # commit step is a soft no-op — don't fail the template.
+        if "nothing to commit" not in commit.stdout + commit.stderr:
+            print(
+                f"peers-ctl: --template internal testing: anchor commit failed: "
+                f"{commit.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return 1, None
+
+    return 0, ["audit", "thorough"]
+
+
 def cmd_new(path: Path, name: str | None = None,
             spec: str | None = None, force: bool = False,
             driver: str = "orchestrator",
@@ -164,6 +446,9 @@ def cmd_new(path: Path, name: str | None = None,
             audit_templates: bool = False,   # legacy alias
             lang: str = "python",
             plan: str | None = None,
+            template: str | None = None,
+            template_from: Path | None = None,
+            anchors_from: Path | None = None,
             config_dir: Path | None = None) -> int:
     """One-shot project scaffold: create the target directory, git
     init it with an empty initial commit, run `peers init` against
@@ -191,6 +476,32 @@ def cmd_new(path: Path, name: str | None = None,
     except ValueError as e:
         print(f"peers-ctl: {e}", file=sys.stderr)
         return 2
+    if template is not None and template not in _KNOWN_TEMPLATES:
+        print(
+            f"peers-ctl: unknown --template {template!r}; "
+            f"known: {', '.join(_KNOWN_TEMPLATES)}",
+            file=sys.stderr,
+        )
+        return 2
+    # --template internal testing: bootstrap the substrate internal testing layout
+    # (clone + branch + anchors + commit) BEFORE the rest of the
+    # scaffold runs. After the helper returns, the rest of cmd_new sees
+    # a non-empty git repo at `target` and must proceed with --force.
+    if template == "internal testing":
+        rc, implied_modes = _apply_self_audit_template(
+            target,
+            template_from=template_from,
+            anchors_from=anchors_from,
+            force=force,
+        )
+        if rc != 0:
+            return rc
+        if implied_modes and not modes:
+            modes = implied_modes
+        # `peers init` runs after this; treat the cloned dir as
+        # "force-re-scaffold" so the non-empty-dir check downstream
+        # doesn't refuse.
+        force = True
     # Legacy alias: --audit-templates ⇒ --modes=audit. If both are passed,
     # explicit `modes` wins (user opt-in).
     if audit_templates and not modes:
@@ -375,6 +686,17 @@ def cmd_new(path: Path, name: str | None = None,
             if not init_modes:
                 init_modes = None
     if container:
+        # Refuse minor/patch drift for audit-integrity modes BEFORE init —
+        # `peers init` inside an outdated image silently writes stale config
+        # (Bug D — v12 hit this: image 1.5.0, host 1.6.0, stream-json default lost).
+        try:
+            from peers_ctl.runner import enforce_container_drift_for_modes
+            level, drift_msg = enforce_container_drift_for_modes(init_modes)
+            if level == "warn" and drift_msg:
+                print(f"peers-ctl: warning: {drift_msg}", file=sys.stderr)
+        except RuntimeError as e:
+            print(f"peers-ctl new: {e}", file=sys.stderr)
+            return 1
         # ENTRYPOINT is `peers`, target mounted at /work.
         ic_args = ["-C", "/work", "init"]
         if force:
@@ -957,6 +1279,7 @@ def cmd_dashboard(
     live: bool = False,
     refresh_s: float = 2.0,
     project: str | None = None,
+    frames: int | None = None,
 ) -> int:
     if project is not None:
         try:
@@ -964,9 +1287,24 @@ def cmd_dashboard(
         except ValueError as e:
             print(f"peers-ctl: {e}", file=sys.stderr)
             return 2
+    if frames is not None and frames < 1:
+        print(
+            "peers-ctl dashboard: --frames must be >= 1",
+            file=sys.stderr,
+        )
+        return 2
     if live:
         from peers_ctl.dashboard_live import run
-        return run(config_dir, refresh_s=refresh_s, project_name=project)
+        return run(
+            config_dir, refresh_s=refresh_s, project_name=project,
+            iterations=frames,
+        )
+    if frames is not None:
+        print(
+            "peers-ctl dashboard: --frames requires --live",
+            file=sys.stderr,
+        )
+        return 2
     from peers_ctl.dashboard_live import (
         DashboardProjectNotFound,
         load_dashboard_rows,
@@ -980,7 +1318,13 @@ def cmd_dashboard(
             print(e, file=sys.stderr)
             return e.exit_code
         return 0
-    print(render_snapshot(load_dashboard_rows(config_dir, reconciler=reconcile)))
+    # Show the --live hint only on a TTY so piped/captured snapshots
+    # (e.g. `peers-ctl dashboard | grep ...`) stay parseable.
+    show_hint = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    print(render_snapshot(
+        load_dashboard_rows(config_dir, reconciler=reconcile),
+        include_live_hint=show_hint,
+    ))
     return 0
 
 
@@ -1512,145 +1856,19 @@ def cmd_modes_show(name: str) -> int:
 
 
 def cmd_doctor(config_dir: Path | None = None) -> int:
-    """Pre-flight check: verify the host has everything `peers-ctl
-    start` needs, and that each registered project's config can be
-    loaded. Exits 0 on a clean bill of health, 1 otherwise.
+    """Pre-flight check (Item 9): verify the host has everything
+    ``peers-ctl start`` needs.
+
+    Delegates to :func:`peers_ctl.doctor.run_doctor`, which prints a
+    tabular ``[OK]``/``[WARN]``/``[MISS]`` report and returns 0 iff
+    every REQUIRED probe passed. The ``config_dir`` argument is
+    accepted for symmetry with the other dispatchers but is not
+    currently used — doctor's scope is the host environment, not
+    per-project state (see ``peers-ctl status`` / ``peers-ctl report``
+    for the latter).
     """
-    import shutil as _shutil
-    problems: list[str] = []
-    warnings: list[str] = []
-
-    # Toolchain — the substrate itself
-    if _shutil.which("peers") is None:
-        problems.append(
-            "`peers` is not on PATH — `peers-ctl start` will fail. "
-            "Install the substrate (`pip install -e .` from the repo)."
-        )
-    if _shutil.which("git") is None:
-        problems.append("`git` is not on PATH — the peers loop needs it.")
-
-    # Peer CLIs — we can only WARN here because they're configured
-    # per-project. Surface the most common ones.
-    for name in ("claude", "codex"):
-        if _shutil.which(name) is None:
-            # codex often ships with the VSCode ChatGPT extension and
-            # isn't on PATH; look there as a fallback so the warning
-            # can suggest a concrete fix.
-            hint = ""
-            if name == "codex":
-                from pathlib import Path as _P
-                for ext in (_P.home() / ".vscode-oss" / "extensions",
-                            _P.home() / ".vscode" / "extensions"):
-                    if not ext.is_dir():
-                        continue
-                    try:
-                        matches = sorted(ext.glob(
-                            "openai.chatgpt-*/bin/linux-x86_64/codex"
-                        )) + sorted(ext.glob(
-                            "openai.chatgpt-*/bin/darwin-arm64/codex"
-                        ))
-                    except OSError:
-                        matches = []
-                    if matches:
-                        hint = (
-                            f" Found {matches[-1]} — point "
-                            "config.yaml's codex argv at it."
-                        )
-                        break
-            warnings.append(
-                f"`{name}` is not on PATH. If any project uses it, "
-                f"either add it to PATH or set the full path in "
-                f"that project's .peers/config.yaml — or use "
-                f"`peers-ctl start --container` to run the loop "
-                f"inside the peers:dev image." + hint
-            )
-
-    # Container path — not a problem if you're not using --container,
-    # but flag the state so users know.
-    podman = _shutil.which("podman")
-    if podman is None:
-        warnings.append(
-            "`podman` is not on PATH; `peers-ctl start --container` "
-            "won't work. Install podman or stick to the host path."
-        )
-    else:
-        # Check if the image is present (best-effort).
-        from peers_ctl.runner import CONTAINER_IMAGE
-        try:
-            r = subprocess.run(
-                [podman, "image", "exists", CONTAINER_IMAGE],
-                capture_output=True, timeout=10,
-            )
-            if r.returncode != 0:
-                warnings.append(
-                    f"`podman` is available but image "
-                    f"{CONTAINER_IMAGE!r} is not built yet. "
-                    f"Run `make build` (or `podman build -t "
-                    f"{CONTAINER_IMAGE} .`) before "
-                    f"`peers-ctl start --container`."
-                )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-    # Per-project config + goals can be loaded
-    store = _store(config_dir)
-    reconcile(store)
-    projects = store.list_projects()
-    print(f"peers-ctl doctor — {len(projects)} project(s) registered, "
-          f"config dir {store.config_dir}")
-    root = projects_root()
-    root_default = root == _DEFAULT_PROJECTS_ROOT.resolve()
-    print(
-        f"  projects root: {root}"
-        + ("" if root_default
-           else " (via PEERS_PROJECTS_ROOT)")
-    )
-    print()
-    for p in projects:
-        ok = True
-        msgs: list[str] = []
-        cfg_path = Path(p.path) / ".peers" / "config.yaml"
-        goals_path = Path(p.path) / ".peers" / "goals.yaml"
-        if not cfg_path.exists():
-            ok = False
-            msgs.append(f"missing {cfg_path}")
-        if not goals_path.exists():
-            ok = False
-            msgs.append(f"missing {goals_path}")
-        if ok:
-            try:
-                from peers.cli import _load_config_yaml, _validate_config
-                from peers.peer_spec import load_peer_specs
-                from peers.goals import load_goals
-                cfg = _load_config_yaml(cfg_path)
-                err = _validate_config(cfg, cfg_path)
-                if err is not None:
-                    raise ValueError(err)
-                specs = load_peer_specs(cfg)
-                goals = load_goals(goals_path)
-                msgs.append(
-                    f"{len(specs)} peer(s), {len(goals)} goal(s)"
-                )
-            except Exception as e:
-                ok = False
-                msgs.append(f"config/goals load error: {e}")
-        sym = "ok" if ok else "FAIL"
-        print(f"  [{sym}] {p.name:<20} {p.path}")
-        for m in msgs:
-            print(f"           {m}")
-
-    if warnings:
-        print()
-        print("Warnings:")
-        for w in warnings:
-            print(f"  - {w}")
-    if problems:
-        print()
-        print("Problems:")
-        for p_ in problems:
-            print(f"  - {p_}")
-        return 1
-    return 0
+    from peers_ctl.doctor import run_doctor
+    return run_doctor()
 
 
 _HELP_MAN_HINT = "\n(use --help-man for detailed docs + examples)"
@@ -1742,6 +1960,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             "<project>/.peers/PLAN.original.md with SHA-pinned acceptance.sh."
         ),
     )
+    p_new.add_argument(
+        "--template", default=None, metavar="TEMPLATE",
+        choices=("internal testing",),
+        help=(
+            "preset bootstrap. `internal testing` clones the substrate repo "
+            "into <path>, checks out a branch named after the target "
+            "basename, copies SPEC.md + docs/ATTACK-SURFACE.md from "
+            "the latest peers-internal testing-v* sibling (or --anchors-from), "
+            "commits them, then continues with the normal "
+            "`peers init --modes=audit,thorough` flow."
+        ),
+    )
+    p_new.add_argument(
+        "--from", dest="template_from", default=None, type=Path,
+        metavar="PATH",
+        help=(
+            "with --template internal testing: source git repo to clone "
+            "(default: the substrate checkout this peers-ctl was "
+            "installed from)."
+        ),
+    )
+    p_new.add_argument(
+        "--anchors-from", dest="anchors_from", default=None, type=Path,
+        metavar="PATH",
+        help=(
+            "with --template internal testing: explicit directory to copy "
+            "SPEC.md + docs/ATTACK-SURFACE.md from (default: latest "
+            "peers-internal testing-v* in the target's parent)."
+        ),
+    )
 
     p_ack = _add_help_man_subparser(
         sub, "ack-block",
@@ -1796,11 +2044,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help_text="rollup view across all registered projects")
     p_dashboard.add_argument(
         "--live", action="store_true",
-        help="redraw the dashboard continuously until Ctrl-C",
+        help="redraw the dashboard continuously until Ctrl-C "
+             "(streaming view of all projects)",
     )
     p_dashboard.add_argument(
         "--refresh-s", type=float, default=2.0,
         help="seconds between --live refreshes (default: 2.0)",
+    )
+    p_dashboard.add_argument(
+        "--frames", type=int, default=None,
+        help="with --live: render N frames then exit "
+             "(non-interactive smoke test; default: run until Ctrl-C)",
     )
     p_dashboard.add_argument(
         "--project", default=None,
@@ -1956,6 +2210,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
 
+    p_compare = _add_help_man_subparser(
+        sub, "compare",
+        help_text=(
+            "side-by-side metrics for 2+ projects (iterations, runtime, "
+            "wasted budget, bugs by severity, tick classes, "
+            "ticks-to-convergence, stop reason)."
+        ),
+    )
+    p_compare.add_argument(
+        "names", nargs="+",
+        help="project names to compare (need at least 2)",
+    )
+
+    from peers_ctl.replay import register_subparser as _register_replay
+    _register_replay(sub)
+
     p_modes = _add_help_man_subparser(
         sub, "modes", help_text="inspect available audit modes")
     modes_sub = p_modes.add_subparsers(dest="modes_cmd", required=False)
@@ -1995,6 +2265,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                        audit_templates=args.audit_templates,
                        lang=args.lang,
                        plan=args.plan,
+                       template=args.template,
+                       template_from=args.template_from,
+                       anchors_from=args.anchors_from,
                        config_dir=cd)
     if args.cmd == "ack-block":
         return cmd_ack_block(args.project_name, args.step_id, args.reason)
@@ -2007,7 +2280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cmd == "dashboard":
         return cmd_dashboard(
             cd, live=args.live, refresh_s=args.refresh_s,
-            project=args.project,
+            project=args.project, frames=args.frames,
         )
     if args.cmd == "report":
         return cmd_report(args.name, cd, output_format=args.format)
@@ -2052,6 +2325,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_prune(args.older_than_days, cd)
     if args.cmd == "doctor":
         return cmd_doctor(cd)
+    if args.cmd == "compare":
+        return cmd_compare(list(args.names), cd)
+    if args.cmd == "replay":
+        from peers_ctl.replay import cmd_replay
+        return cmd_replay(
+            args.name,
+            show_prompts=getattr(args, "show_prompts", False),
+            show_diffs=getattr(args, "show_diffs", False),
+            from_tick=getattr(args, "from_tick", None),
+            to_tick=getattr(args, "to_tick", None),
+            config_dir=cd,
+        )
     if args.cmd == "modes":
         if not getattr(args, "modes_cmd", None):
             parser.error("modes: choose one of: list, show "

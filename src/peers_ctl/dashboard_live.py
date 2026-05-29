@@ -258,10 +258,24 @@ def _render_table(rows: list[DashboardRow], *, include_live: bool) -> str:
     )
 
 
-def render_snapshot(rows: list[DashboardRow]) -> str:
+#: Hint appended to the snapshot dashboard so operators discover --live.
+LIVE_HINT = (
+    "Tip: use --live for a streaming view of all projects "
+    "(redraws every --refresh-s seconds; --frames N to render N "
+    "frames and exit)."
+)
+
+
+def render_snapshot(
+    rows: list[DashboardRow], *, include_live_hint: bool = False,
+) -> str:
     if not rows:
-        return "(no projects registered)"
-    return _render_table(rows, include_live=False)
+        body = "(no projects registered)"
+    else:
+        body = _render_table(rows, include_live=False)
+    if include_live_hint:
+        return f"{body}\n\n{LIVE_HINT}"
+    return body
 
 
 def render_live(rows: list[DashboardRow]) -> str:

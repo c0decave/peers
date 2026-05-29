@@ -52,9 +52,36 @@ def sweep_legacy_handoff_msg(project_root: Path) -> None:
 
 
 class TurnManager:
-    def __init__(self, state: dict[str, Any], max_retries: int = 2) -> None:
+    # Bug B: default rotation threshold lowered from 2 → 1 in 1.6.x.
+    # Old default needed 3 consecutive fails to rotate (consec > 2). v12
+    # showed that wastes ~67min when one peer is stuck — the OTHER peer
+    # should get a chance after one wasted retry. Operators who want the
+    # legacy behavior (let peer finish what it started) can override via
+    # state['config']['max_retries'] = 2 or the constructor argument.
+    DEFAULT_MAX_RETRIES = 1
+
+    def __init__(self, state: dict[str, Any],
+                 max_retries: int = DEFAULT_MAX_RETRIES) -> None:
         self.state = state
         self.max_retries = max_retries
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "TurnManager":
+        """Construct honoring state['config']['max_retries'] override.
+
+        Falls back to DEFAULT_MAX_RETRIES when the config key is missing
+        or not a non-negative int. Use this factory in the orchestrator
+        so operator-supplied config.yaml settings reach the rotation logic.
+        """
+        cfg = state.get("config") or {}
+        raw = cfg.get("max_retries", cls.DEFAULT_MAX_RETRIES)
+        try:
+            mr = int(raw)
+        except (TypeError, ValueError):
+            mr = cls.DEFAULT_MAX_RETRIES
+        if mr < 0:
+            mr = cls.DEFAULT_MAX_RETRIES
+        return cls(state, max_retries=mr)
 
     def current(self) -> str:
         """Active peer name.
@@ -65,6 +92,12 @@ class TurnManager:
         loop from burning ticks retrying a known-degraded peer while a
         healthy one waits next in rotation.
 
+        Item 13: also hop OVER `recovery`-role peers as long as at least
+        one non-recovery, non-degraded peer exists. Recovery peers are
+        spares; they only enter rotation when every default peer is
+        degraded. peer_roles lives at state['peer_roles'][peer_name]
+        and is populated by the driver from PeerSpec.role at startup.
+
         If ALL peers are degraded, fall back to the original rotation
         target — the HALT-all-degraded check in the driver will pick it
         up at the next loop iteration.
@@ -72,16 +105,26 @@ class TurnManager:
         order = self.state["peer_order"]
         idx = self.state["turn_index"]
         peers = self.state.get("peers") or {}
-        # Any healthy peer at all? If not, no point skipping.
-        if not any(
-            peers.get(p, {}).get("state") not in ("degraded", "halted")
-            for p in order
-        ):
+        roles = self.state.get("peer_roles") or {}
+
+        def _eligible(name: str, *, allow_recovery: bool) -> bool:
+            if peers.get(name, {}).get("state") in ("degraded", "halted"):
+                return False
+            if roles.get(name) == "recovery" and not allow_recovery:
+                return False
+            return True
+
+        # Any non-recovery healthy peer? If so, skip recovery peers.
+        has_default_healthy = any(
+            _eligible(p, allow_recovery=False) for p in order
+        )
+        # Any healthy peer at all (including recovery)? If not, no skip.
+        if not any(_eligible(p, allow_recovery=True) for p in order):
             return order[idx]
         n = len(order)
         for _ in range(n):
             name = order[idx]
-            if peers.get(name, {}).get("state") not in ("degraded", "halted"):
+            if _eligible(name, allow_recovery=not has_default_healthy):
                 self.state["turn_index"] = idx
                 return name
             idx = (idx + 1) % n

@@ -689,6 +689,17 @@ def cmd_status(target: Path) -> int:
             f"{b.get('max_runtime_s', '?')}s ({pct_r:.0f}%)"
             + (f", wasted {wasted}s" if wasted else "")
         )
+        # Item 6: per-tick wasted attribution — show last 3 fail-ticks so
+        # the operator sees WHICH ticks burned budget, not just the sum.
+        per_tick = b.get("wasted_runtime_per_tick") or []
+        if per_tick:
+            recent = per_tick[-3:]
+            bits = [
+                f"iter {e.get('iteration', '?')}={e.get('duration_s', 0)}s"
+                + (f" {e.get('peer')}" if e.get("peer") else "")
+                for e in recent
+            ]
+            print(f"  Last wasted ticks: {', '.join(bits)}")
         tokens = b.get("spent_tokens", 0)
         usd = b.get("spent_usd", 0.0)
         if tokens or usd:

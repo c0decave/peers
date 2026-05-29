@@ -33,6 +33,49 @@ from peers.skeptic_engine import PHASE_B_SKEPTIC_GATES, SkepticEngine
 from peers.turn_manager import TurnManager
 
 
+# Item 7: convergence-wall hard halt. v9-v12 all burned full budget
+# struggling on tests-pass + no-prior-regression. After N consecutive
+# red ticks on a watched gate, exit cleanly with stop-reason `stuck:<gate>`
+# instead of letting the loop spin until max_runtime.
+_DEFAULT_STUCK_HALT_AFTER = 5
+_DEFAULT_STUCK_HALT_GATES = ("tests-pass", "no-prior-regression")
+
+
+def compute_stuck_gate_halt_reason(state: dict[str, Any]) -> str | None:
+    """Return `stuck:<gate>` if any watched gate stuck >= threshold ticks.
+
+    Threshold default 5, override via state['config']['goals']['stuck_halt_after'].
+    Watched-gate set defaults to (tests-pass, no-prior-regression), override
+    via state['config']['goals']['stuck_halt_gates'] (list of goal ids).
+    A threshold of 0 disables the halt entirely (legacy behavior).
+    """
+    cfg_goals = ((state.get("config") or {}).get("goals") or {})
+    raw_n = cfg_goals.get("stuck_halt_after", _DEFAULT_STUCK_HALT_AFTER)
+    try:
+        threshold = int(raw_n)
+    except (TypeError, ValueError):
+        threshold = _DEFAULT_STUCK_HALT_AFTER
+    if threshold <= 0:
+        return None
+    raw_gates = cfg_goals.get("stuck_halt_gates")
+    if raw_gates:
+        watched = tuple(str(g) for g in raw_gates)
+    else:
+        watched = _DEFAULT_STUCK_HALT_GATES
+    stuck = state.get("stuck_counter") or {}
+    # Pick the worst (highest count) watched gate that crossed threshold.
+    worst_gate: str | None = None
+    worst_count = -1
+    for gate in watched:
+        count = int(stuck.get(gate, 0))
+        if count >= threshold and count > worst_count:
+            worst_gate = gate
+            worst_count = count
+    if worst_gate is None:
+        return None
+    return f"stuck:{worst_gate}"
+
+
 class DriverTickHooksMixin:
     def _record_phase(self, state: dict[str, Any]) -> None:
         """Stamp the upcoming tick's phase into state.json.
@@ -157,6 +200,14 @@ class DriverTickHooksMixin:
         if budget_reason is not None:
             reason = f"budget:{budget_reason}"
             return self._exit_with_fresh_results(state, reason, ticks), {}
+        # Item 7: tests-pass + no-prior-regression as convergence wall.
+        # v9-v12 burned full budgets struggling on these gates. After
+        # stuck_halt_after (default 5) consecutive red ticks on a critical
+        # gate, give up cleanly with stop-reason `stuck:<gate>` instead
+        # of letting the loop spin until max_runtime fires.
+        stuck_reason = compute_stuck_gate_halt_reason(state)
+        if stuck_reason is not None:
+            return self._exit_with_fresh_results(state, stuck_reason, ticks), {}
         mutation_reason = self._goal_mutation_reason()
         if mutation_reason is not None:
             reason = f"goal-mutation:{mutation_reason}"
@@ -381,8 +432,9 @@ class DriverTickHooksMixin:
 
     def _record_tick_accounting(
         self, state: dict[str, Any], success: bool, tick_dt: int,
+        peer: str | None = None,
     ) -> None:
-        record_tick_accounting(state, success, tick_dt)
+        record_tick_accounting(state, success, tick_dt, peer=peer)
 
     def _record_results(self, state: dict[str, Any],
                         results: dict[str, GoalResult]) -> None:
@@ -476,6 +528,9 @@ class DriverTickHooksMixin:
             "duration_ms": run.duration_ms,
         }
         state["peers"][peer]["last_run"] = info
+        # Bug C: reset the half-fail flag each tick. Set true only when
+        # we explicitly detect productive-commit-no-handoff below.
+        state["peers"][peer]["last_tick_productive_no_handoff"] = False
 
         # Dogfood-R2 finding: claude in -p (print) mode is silent
         # while it works. With a too-low idle_timeout_s, the
@@ -563,9 +618,24 @@ class DriverTickHooksMixin:
                 )
             return True
 
+        # Bug C: peer DID commit productive work this turn (new_commits
+        # non-empty per the check at line 502) but no commit carries the
+        # handoff trailers. Old behavior counted this as a full fail —
+        # v12 tick 9+10 saw claude produce real review + test commits
+        # without trailers, both classified as full no-handoff fails
+        # toward DEGRADED. That's punishing busy peers for formatting.
+        #
+        # New semantics (half-fail): productive-commit-no-handoff returns
+        # False (so the operator-readable label stays "no-handoff" and
+        # the next prompt can carry the warning), but a sentinel flag is
+        # set on the peer state. recent_fails / DEGRADED logic reads this
+        # flag and treats the tick as 0.5 instead of 1.0.
+        peer_state = state["peers"].setdefault(peer, {})
+        peer_state["last_tick_productive_no_handoff"] = True
+        info["productive_no_handoff"] = True
         info["soft_fail_reason"] = (
-            "no commit in this turn carries Peer-Status: handoff + "
-            "Self-Review: pass trailers"
+            "productive commit(s) this turn but no Peer-Status: handoff "
+            "+ Self-Review: pass trailers (half-fail credit toward DEGRADED)"
         )
         return False
 

@@ -185,6 +185,63 @@ def check_container_version_drift() -> tuple[str, str]:
     return ("warn", f"{msg}; consider rebuilding with `make build`.")
 
 
+# Modes whose audit-validity / integrity contracts require host and container
+# substrate to be on the SAME minor version. Minor/patch drift escalates from
+# warn to error for these modes. Operator can override via PEERS_CTL_ALLOW_DRIFT=1.
+_DRIFT_REFUSE_MODES = frozenset({"audit", "thorough"})
+
+
+def _read_project_modes_applied(project) -> list[str]:
+    """Read mode names from `<project>/.peers/modes-applied.txt`.
+
+    Returns empty list on missing file or parse failure. Each line is
+    `<timestamp>  <mode>  v<n>  sha256=...` — the mode name is the
+    second whitespace-separated token.
+    """
+    try:
+        trail = Path(project.path) / ".peers" / "modes-applied.txt"
+        text = trail.read_text(encoding="utf-8", errors="replace")
+    except (OSError, AttributeError):
+        return []
+    names: list[str] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            names.append(parts[1])
+    return names
+
+
+def enforce_container_drift_for_modes(modes: list[str] | None) -> tuple[str, str]:
+    """Run drift check; escalate warn → error for audit-integrity modes.
+
+    Background: `peers-ctl new --container` runs `peers init` inside the
+    container image. If the image is older than the host, init writes
+    `.peers/config.yaml` from the OLD template, silently propagating stale
+    defaults (claude argv, prompt_mode, mode templates) into the new
+    project. v12 hit exactly this — image was 1.5.0, host 1.6.0, so
+    Phase-2 stream-json default never reached the project.
+
+    Returns (level, msg). Raises RuntimeError when refusing.
+    Bypass: set PEERS_CTL_ALLOW_DRIFT=1 to keep the legacy warn behavior.
+    """
+    level, msg = check_container_version_drift()
+    if level == "error":
+        raise RuntimeError(msg)
+    if level != "warn":
+        return (level, msg)
+    if os.environ.get("PEERS_CTL_ALLOW_DRIFT", "").strip() == "1":
+        return (level, msg)
+    mode_set = {m.strip() for m in (modes or []) if m and m.strip()}
+    if mode_set & _DRIFT_REFUSE_MODES:
+        raise RuntimeError(
+            f"{msg}; refuse: audit-integrity modes "
+            f"({sorted(mode_set & _DRIFT_REFUSE_MODES)!r}) require "
+            "aligned host and container versions. Rebuild with `make build` "
+            "or override with PEERS_CTL_ALLOW_DRIFT=1."
+        )
+    return (level, msg)
+
+
 def _terminate_spawned_process(proc: subprocess.Popen, grace_s: float = 1.0) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
@@ -838,10 +895,11 @@ def _start_project_container(
         raise ValueError(
             f"project {project.name!r} already has a running container ({cname})"
         )
-    drift_level, drift_msg = check_container_version_drift()
-    if drift_level == "error":
-        raise RuntimeError(drift_msg)
-    if drift_level == "warn":
+    # Escalate warn to error for audit-integrity modes (Bug D): the project
+    # already has a stale config if init ran against the old image.
+    project_modes = _read_project_modes_applied(project)
+    drift_level, drift_msg = enforce_container_drift_for_modes(project_modes)
+    if drift_level == "warn" and drift_msg:
         print(f"peers-ctl: warning: {drift_msg}", file=sys.stderr)
     _cleanup_stale_container(cname)
     try:

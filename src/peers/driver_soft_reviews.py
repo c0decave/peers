@@ -6,6 +6,28 @@ from peers.driver_helpers import _extract_first_json_object
 from peers.goals import Goal
 
 
+_SOFT_CONSENSUS_FALSY = frozenset({"false", "0", "no", "off", ""})
+
+
+def soft_consensus_required_for_convergence(state: dict[str, Any]) -> bool:
+    """Item 8: operators can disable the soft-consensus convergence gate
+    via .peers/config.yaml -> goals.soft_consensus_required: false.
+
+    Background: v9 + v10 both exited budget:max_runtime (not 'complete')
+    because _all_green_including_soft required every soft goal to have
+    peer-review consensus, even after all hard gates had been green for
+    many ticks. Operators who want hard-gate-driven convergence can opt
+    out. Default True preserves legacy strict semantics.
+    """
+    cfg_goals = ((state.get("config") or {}).get("goals") or {})
+    raw = cfg_goals.get("soft_consensus_required", True)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() not in _SOFT_CONSENSUS_FALSY
+    return bool(raw)
+
+
 class DriverSoftReviewsMixin:
     def _soft_reviews_pending(self, state: dict[str, Any],
                               current_peer: str) -> list[Goal]:
@@ -91,9 +113,18 @@ class DriverSoftReviewsMixin:
         return sg.get("consensus_count", 0) >= g.consensus_needed
 
     def _all_green_including_soft(self, state: dict[str, Any]) -> bool:
-        """All hard gates pass AND all soft goals have consensus."""
+        """All hard gates pass AND (optionally) all soft goals have consensus.
+
+        Item 8 escape valve: when state.config.goals.soft_consensus_required
+        is false, only hard gates need to be green. v9 + v10 ended
+        budget:max_runtime because soft consensus was never reached even
+        though hard gates were stable green for many ticks. Operators who
+        want to ship as soon as hard gates settle can opt out.
+        """
         if not self.engine.all_green():
             return False
+        if not soft_consensus_required_for_convergence(state):
+            return True
         n = len(state["peer_order"])
         for g in self.goals:
             if g.type != "soft":

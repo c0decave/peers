@@ -151,6 +151,7 @@ class _Driver:
 
     def _record_tick_accounting(
         self, state: dict[str, Any], success: bool, tick_dt: int,
+        peer: str | None = None,
     ) -> None:
         self.events.append("accounting")
         state["iteration"] += 1

@@ -353,7 +353,7 @@ class TickLoop:
         success = driver._apply_dry_run_reset(state, success)
 
         turn_manager.advance(success=success)
-        driver._record_tick_accounting(state, success, invocation.tick_dt)
+        driver._record_tick_accounting(state, success, invocation.tick_dt, peer=peer)
 
         tokens_this_tick, usd_this_tick = driver._account_tokens_usd(
             state, invocation.spec.tool, run,

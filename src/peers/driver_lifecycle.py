@@ -173,7 +173,15 @@ class DriverLifecycleMixin:
     def _sync_peer_order(self, state: dict[str, Any]) -> None:
         """If the loaded state's peer_order differs from the configured
         one (e.g. user reordered or renamed peers in config.yaml), trust
-        the config and rebuild missing entries."""
+        the config and rebuild missing entries.
+
+        Item 13: also (re)populate state['peer_roles'] from PeerSpec.role
+        on every load so TurnManager.current() can skip recovery-role
+        peers when default-role peers are healthy.
+        """
+        # Always refresh peer_roles — config can change PeerSpec.role
+        # without otherwise touching peer_order.
+        state["peer_roles"] = {p.name: p.role for p in self.peer_specs}
         if state.get("peer_order") != self.peer_names:
             old_order = state.get("peer_order", [])
             state["peer_order"] = list(self.peer_names)

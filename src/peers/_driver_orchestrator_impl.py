@@ -228,7 +228,7 @@ class OrchestratorDriver(
                 state, self.cfg_budget,
                 peer_tools=[s.tool for s in self.peer_specs],
             )
-            tm = TurnManager(state)
+            tm = TurnManager.from_state(state)
             ticks = 0
 
             if self.recon_enabled:
