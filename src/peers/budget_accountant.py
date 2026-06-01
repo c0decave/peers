@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 
@@ -10,6 +11,15 @@ _CONFIGURABLE_BUDGET_LIMITS = (
     "max_iterations", "max_runtime_s", "max_consecutive_failures",
     "max_tokens", "max_usd", "max_usd_mode",
 )
+
+# Operator budget caps (`peers-ctl start --max-runtime ...`) are persisted
+# here, in `.peers/`, so they survive `_apply_config_budget` — which
+# re-overlays config.yaml's caps onto state.budget on EVERY loop start and
+# would otherwise clobber the override. peers-ctl writes this sidecar;
+# the orchestrator re-applies it right after the config overlay. Kept out
+# of state.json on purpose so it also works before state.json exists (the
+# first start of a freshly-init'd project).
+OPERATOR_BUDGET_OVERRIDE_FILE = "budget-overrides.json"
 
 
 def _parse_codex_tokens(text: str) -> tuple[int, float]:
@@ -209,6 +219,48 @@ def _apply_config_budget(
     mode, reason = resolve_max_usd_mode(declared, peer_tools or [])
     state["budget"]["max_usd_mode"] = mode
     state["budget"]["max_usd_mode_reason"] = reason
+
+
+def read_operator_budget_overrides(repo: Path | str) -> dict[str, Any]:
+    """Read operator cap overrides from `.peers/budget-overrides.json`.
+
+    These are the explicit caps an operator passed to `peers-ctl start`
+    (e.g. `--max-runtime 12h` -> ``{"max_runtime_s": 43200}``) and which
+    MUST win over config.yaml. Returns ``{}`` when the file is absent,
+    unreadable, or malformed. Only recognised numeric budget caps survive;
+    unknown keys and bool values (an int subclass — a silent footgun) are
+    dropped, and ``max_usd_mode`` (a string knob, not an operator cap) is
+    excluded.
+    """
+    path = Path(repo) / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, value in data.items():
+        if (key in _CONFIGURABLE_BUDGET_LIMITS and key != "max_usd_mode"
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)):
+            out[key] = value
+    return out
+
+
+def apply_operator_budget_overrides(
+    state: dict[str, Any], repo: Path | str,
+) -> dict[str, Any]:
+    """Re-apply operator cap overrides ON TOP of the config overlay so the
+    operator's explicit `--max-runtime` (etc.) wins over config.yaml.
+
+    Call this immediately after :func:`_apply_config_budget`. Returns the
+    overrides that were applied (for logging / tests)."""
+    overrides = read_operator_budget_overrides(repo)
+    budget = state.setdefault("budget", {})
+    for key, value in overrides.items():
+        budget[key] = value
+    return overrides
 
 
 class BudgetCheck:

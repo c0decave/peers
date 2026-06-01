@@ -76,16 +76,16 @@ For paid-customer or shared-host deployments: read the **Known Gaps** section be
 
 - **Claude OAuth isolation** — when `~/.claude.json` exists, `peers-ctl start --container` mounts it into `peers-auth-proxy_<project>` only, not into the workspace container.
 - **Workspace route** — the workspace gets `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`; Claude API calls go through the sidecar, which injects `Authorization: Bearer ...`.
-- **Refresh on 401** — the sidecar refreshes the OAuth token from the mounted token file and retries once. The refresh endpoint is read from `AUTH_PROXY_OAUTH_TOKEN_URL` or `tokenUrl` in the token file.
+- **Refresh on 401** — the sidecar refreshes the OAuth token from the mounted token file and retries once. The refresh endpoint is read from `AUTH_PROXY_OAUTH_TOKEN_URL` or `tokenUrl` in the token file. The endpoint must be an `https://` URL so the `refresh_token` is never sent in cleartext to an off-box host; `http://` is accepted only for the loopback hosts `127.0.0.1`, `::1`, and `localhost` (RFC 8252 §7.3), which never leave the machine and let local dev / integration tests exercise the flow without TLS. A malformed URL is rejected the same way (structured error, not a crash).
 - **Read-only rootfs with explicit writable paths** — only `/tmp` and `/auth` are tmpfs-writable. Token refresh normally uses atomic replace; file-bind-mount targets fall back to an fsync'd in-place rewrite.
 - **Network placement** — with egress proxy enabled, auth-proxy and workspace both share the egress-proxy namespace. With egress disabled, workspace shares the auth-proxy namespace.
 
 ### peers main container
 
 - **`cap-drop=ALL + no-new-privileges`** — no privileged ops, no suid escalation.
-- **`userns=keep-id`** — rootless mapping, UID 1000 inside → 1000 outside.
+- **`userns` shared with the netns owner** — the rootless UID-1000-inside→1000-outside (`keep-id`) mapping is created by the **egress-proxy** sidecar (the network-namespace owner). The auth-proxy and the main container join it with `--userns=container:<egress-proxy>` so all three share one user namespace. This is mandatory, not cosmetic: the kernel only lets a process mount a fresh `sysfs` at `/sys` if its user namespace *owns* the joined network namespace, so a main container that minted its own `keep-id` userns failed `runc create` with `mounting sysfs to /sys: operation not permitted` (rc=126). In the bypass/host-net modes the container owns its own netns and keeps a self-minted `keep-id`.
 - **`--read-only` rootfs** — prompt-injection cannot persist binaries in `/usr`, `/etc`, `/var`.
-- **Explicit `--tmpfs`** for `/tmp`, `/home/peer/.cache`, `/home/peer/.npm`, all `nosuid,nodev`. Writable scratch only.
+- **Explicit `--tmpfs`** for `/tmp`, `~/.cache`, `~/.npm`, all `nosuid,nodev`. Writable scratch only.
 - **Network via egress proxy** — `--network=container:peers-egress-proxy_<project>` + `HTTPS_PROXY` env. Direct internet egress impossible.
 - **No `~/.claude.json` workspace mount when auth-proxy is active** — Claude credentials are held by the sidecar. `~/.claude/` stays mounted for session jsonl/log state.
 - **`pids-limit=8192`** — prevents zombie-accumulation from setsid'd node helpers.
@@ -105,7 +105,10 @@ real LLM-CLI traffic plus documented SDK behaviour; new hosts surfacing
 in `tinyproxy.log` as `refused on filtered domain` should be evaluated
 and either added here or left blocked.
 
-The canonical source is [`proxy/filter-allow.txt`](../proxy/filter-allow.txt) — this table is the human-readable index.
+The canonical base allow-list is
+[`proxy/filter-allow.txt`](../proxy/filter-allow.txt). Project-scoped
+runtime additions, currently OpenRouter, are injected via
+`PEERS_EGRESS_EXTRA_HOSTS` and are not mounted from the host.
 
 ### Required (peers will fail without these)
 
@@ -114,6 +117,12 @@ The canonical source is [`proxy/filter-allow.txt`](../proxy/filter-allow.txt) �
 | `api.anthropic.com` | claude CLI | Anthropic Messages API (the actual LLM call) | No — Anthropic-controlled |
 | `chatgpt.com` + `*.chatgpt.com` | codex CLI (subscription mode) | WebSocket backend `wss://chatgpt.com/backend-api/codex/responses` and OAuth-subscription flow. Without this codex tickets all `process-fail`. | Multi-tenant by user account, **not** by attacker-registrable org → wildcard is safe |
 | `api.openai.com` | codex CLI (API-key mode) | Legacy/API-key path for codex. Kept for operators who don't use the subscription. | No — OpenAI-controlled |
+
+### Runtime additions (only when a project opts in)
+
+| Host | Trigger | Purpose | Multi-tenant? |
+|---|---|---|---|
+| `openrouter.ai` | any peer with `provider: openrouter` | OpenRouter gateway for Claude/Codex-compatible models | No user-controlled subdomain wildcard; exact host only |
 
 ### Speculative / unverified (NOT in current allow-list)
 
@@ -207,8 +216,8 @@ podman exec peers-ctl_<name> sh -c \
 
 | Flag | Effect |
 |---|---|
-| `--max-runtime DURATION` | Overrides `budget.max_runtime_s` in `.peers/state.json` *before* the loop starts. Accepts bare integer (seconds) or unit suffix: `300s`, `90m`, `6h`, `2d`, `1w`. Persists in state.json until changed again. Use when an existing project needs more wall-clock time. |
-| `--reset-budget` | Zeroes `spent_runtime_s`, `spent_iterations`, `spent_tokens`, `spent_usd`, `wasted_runtime_s`, `consecutive_failures` in state.json. **`state.iteration` is preserved** — tick numbering in the operator's log stays continuous (`tick 26` → `tick 27`), only budget counters restart at 0. Semantically a "fresh session" on top of existing project state. |
+| `--max-runtime DURATION` | Sets `budget.max_runtime_s` to an explicit operator cap that **wins over `config.yaml`**. Accepts bare integer (seconds) or unit suffix: `300s`, `90m`, `6h`, `2d`, `1w`. Persisted to the `.peers/budget-overrides.json` sidecar (and mirrored into `state.json` when it exists), so it survives the loop's per-start config overlay — which re-applies `config.yaml`'s caps every start and would otherwise clobber it — and it takes effect even on the very **first** start, before `state.json` exists. The override sticks until changed by another `--max-runtime` or cleared by `--reset-budget`. |
+| `--reset-budget` | Zeroes `spent_runtime_s`, `spent_iterations`, `spent_tokens`, `spent_usd`, `wasted_runtime_s`, `consecutive_failures` in state.json, and clears the `.peers/budget-overrides.json` sidecar so caps return to their `config.yaml` defaults. **`state.iteration` is preserved** — tick numbering in the operator's log stays continuous (`tick 26` → `tick 27`), only budget counters restart at 0. Semantically a "fresh session" on top of existing project state. |
 | `--force` | Skip the pre-flight `budget already exhausted` abort. The loop will exit after 0 ticks with the `budget:max_runtime` sentinel — operator explicitly accepts this (e.g. to record terminal state cleanly). |
 
 Without any of these, when `spent_runtime_s >= max_runtime_s`, `peers-ctl start` now **refuses to start** with an actionable error message pointing at each option.

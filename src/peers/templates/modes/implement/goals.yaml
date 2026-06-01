@@ -206,6 +206,21 @@ goals:
     cmd: "python3 -m peers.cli run-check no_unresolved_blocks"
     pass_when: "exit_code == 0"
 
+  - id: no-open-bug-reports
+    type: hard
+    description: |
+      Convergence anchor for the bug-hunt protocol. Peers file findings as
+      `Bug-Report: BUG-NNN` commits (JSON severity) and close them with
+      `Bug-Resolves: BUG-NNN`. `peers.bug_hunt` reconstructs the ledger from
+      git history; this gate fails while any bug at severity >= med is still
+      open. Without it, a bug the post-convergence skeptic files in its own
+      final re-audit can slip straight through to a "complete" exit (observed:
+      the calc greenfield run shipped an unresolved med-severity OverflowError
+      leak, BUG-006). Resolve each open bug, or downgrade below `med` if it is
+      genuinely not blocking, before the loop may declare success.
+    cmd: "python3 -m peers.cli run-check no_open_bug_reports"
+    pass_when: "exit_code == 0"
+
   - id: honesty-audit
     type: hard
     description: |
@@ -528,8 +543,13 @@ goals:
     type: hard
     description: |
       No commit since the peers baseline introduces a regression in the
-      test suite. Reused verbatim from audit-mode.
-    cmd: "python3 .peers/checks/no_regression.py ."
+      test suite. Reused from audit-mode. Invoked via `run-check` (not a
+      direct `.peers/checks/...` path): `no_regression.py` lives in the
+      audit template, so an implement-only scaffold does not copy it into
+      `.peers/checks/` — a direct path then errors (file not found) and
+      sticks the run on this gate. `run-check` resolves the script from the
+      audit mode template, so the gate works whether or not it was copied.
+    cmd: "python3 -m peers.cli run-check no_regression"
     pass_when: "exit_code == 0"
 
   - id: lint-clean

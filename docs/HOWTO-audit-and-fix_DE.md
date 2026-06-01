@@ -65,6 +65,21 @@ Unterstuetzt sind aktuell `python` (Default) und `js`. Andere Werte
 warnen und fallen auf Python-Templates zurueck, damit Scaffolding nie an
 einem Tippfehler scheitert.
 
+Um einen Peer beim Scaffolden auf ein bestimmtes Modell oder einen
+Provider zu pinnen, nutze wiederholbare `--peer-*`-Flags. Beispiel fuer
+Codex ueber OpenRouter:
+
+```sh
+export OPENROUTER_API_KEY=sk-or-...
+peers-ctl new myapp --container --modes=audit --spec ./myapp-spec.md \
+  --peer-provider codex=openrouter \
+  --peer-model codex=~openai/gpt-latest \
+  --peer-reasoning codex=xhigh
+```
+
+`OPENROUTER_API_KEY` wird vor `peers run`, `peers tick`,
+`peers tmux up` und Container-Start geprueft.
+
 Was angelegt wird:
 ```
 ~/c0de/peers-c0de/myapp/

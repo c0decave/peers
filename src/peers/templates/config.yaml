@@ -9,6 +9,10 @@ comm: git                     # git | hybrid (git for code + files for messages)
 peers:
   - name: claude
     tool: claude
+    # Optional semantic controls. Explicit argv flags still win.
+    # model: opus
+    # reasoning: high              # low|medium|high|xhigh|max
+    # provider: anthropic          # anthropic|openrouter
     # `{PROMPT}` is substituted with the current peer prompt at runtime.
     #
     # Default: stream-json + verbose. Each tool call / text /
@@ -26,6 +30,10 @@ peers:
 
   - name: codex
     tool: codex
+    # Optional semantic controls. Explicit argv flags still win.
+    # model: gpt-5.1-codex-max
+    # reasoning: xhigh             # minimal|low|medium|high|xhigh
+    # provider: openai             # openai|openrouter
     # `--dangerously-bypass-approvals-and-sandbox` disables codex's
     # internal bubblewrap `workspace-write` sandbox. We rely on the
     # outer peers container (cap-drop=ALL, no-new-privileges,
@@ -116,6 +124,16 @@ health:
     - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\b(invalid|missing|expired)[ _-]?api[ _-]?key\\b"
     - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bquota[ _-]?exhausted\\b"
     - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\busage[ _-]?limit[ _-]?(reached|exceeded|exhausted)\\b"
+    # ChatGPT/codex emit "ERROR: You've hit your usage limit. Visit
+    # https://chatgpt.com/codex/settings/usage ..." — the phrase is
+    # "hit your usage limit" with NO reached/exceeded/exhausted
+    # qualifier, so the line above misses it. Without this, a quota-dead
+    # codex is misclassified as a retryable process-fail and its empty
+    # ticks count toward max_consecutive_failures, killing a run the
+    # other peer could have finished solo (v14 internal testing finding).
+    # ERROR/FATAL-anchored + line-bounded so it can't self-match the
+    # substrate's own goal text.
+    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bhit your usage limit\\b"
 
 # Hard-goal commands (pytest, ruff, custom checks) run with a
 # per-command wall-clock timeout. Default 120 s suffices for small
@@ -124,3 +142,16 @@ health:
 # depending on cache state).
 goals:
   timeout_s: 120
+  # Convergence-wall halt: after `stuck_halt_after` consecutive red
+  # ticks on a watched gate, the run exits cleanly with `stuck:<gate>`
+  # instead of burning budget until max_runtime. 0 disables it.
+  # stuck_halt_after: 5
+  # stuck_halt_gates: ["tests-pass", "no-prior-regression"]
+  #
+  # Progress-aware reset: gates listed here have their red streak
+  # forgiven whenever a PLAN step is completed on a tick — so a run only
+  # halts on genuine NO-progress, not on a terminal gate that is red by
+  # design while a multi-step build is still in flight. Implement-mode
+  # defaults to ["tests-pass"]; other modes default to [] (there a red
+  # tests-pass IS a real stuck signal). Set [] to disable, or add gates.
+  # stuck_progress_reset_gates: ["tests-pass"]

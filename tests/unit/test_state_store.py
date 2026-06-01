@@ -64,6 +64,49 @@ def test_save_refuses_symlinked_temp_file(tmp_path: Path):
     assert bait.read_text() == "keep me"
 
 
+def test_save_does_not_fsync_through_symlinked_parent(tmp_path: Path, monkeypatch):
+    """BUG-114: the durability dir-fsync after os.replace must not follow a
+    symlinked parent directory. If `.peers/` is swapped for a symlink to an
+    attacker-controlled dir, the post-write fsync must refuse it (O_NOFOLLOW)
+    instead of fsync'ing the attacker's directory. The data write already
+    guards its leaf; this closes the dir-fsync gap (defense in depth)."""
+    import stat as _stat
+
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    link = tmp_path / "work"
+    link.symlink_to(evil, target_is_directory=True)
+    evil_id = (evil.stat().st_dev, evil.stat().st_ino)
+
+    fsynced_dirs: list[tuple[int, int]] = []
+    real_fsync = os.fsync
+
+    def spy_fsync(fd):
+        try:
+            st = os.fstat(fd)
+            if _stat.S_ISDIR(st.st_mode):
+                fsynced_dirs.append((st.st_dev, st.st_ino))
+        except OSError:
+            pass
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+
+    store = StateStore(link / "state.json")
+    store.save({
+        "iteration": 1,
+        "peer_order": ["claude", "codex"],
+        "turn_index": 0,
+        "peers": {"claude": {"state": "healthy"},
+                  "codex": {"state": "healthy"}},
+    })
+
+    assert evil_id not in fsynced_dirs, (
+        "durability dir-fsync followed the symlinked parent into the "
+        "attacker directory"
+    )
+
+
 def test_default_state_has_required_keys():
     for key in ("schema_version", "iteration", "peer_order", "turn_index",
                 "budget", "goals_status", "stuck_counter", "peers"):

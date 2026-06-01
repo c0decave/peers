@@ -19,6 +19,7 @@ from peers.budget_accountant import (
     _CONFIGURABLE_BUDGET_LIMITS as _CONFIGURABLE_BUDGET_LIMITS,
     _TOKEN_PARSERS as _TOKEN_PARSERS,
     _apply_config_budget as _apply_config_budget,
+    apply_operator_budget_overrides as apply_operator_budget_overrides,
     _parse_claude_json_envelope as _parse_claude_json_envelope,
     _parse_claude_tokens as _parse_claude_tokens,
     _parse_codex_tokens as _parse_codex_tokens,
@@ -54,6 +55,7 @@ from peers.health_guard import HealthGuard, RunResult as RunResult
 from peers.peer_spec import PeerSpec
 from peers.prompt_builder import build_prompt as build_prompt
 from peers.recon import run_recon as _run_recon  # noqa: F401
+from peers.regression_baseline import ensure_baseline_snapshot
 from peers.safe_io import (
     _ensure_private_dir,
     _open_private_nested_dir_fd_no_symlink
@@ -228,8 +230,23 @@ class OrchestratorDriver(
                 state, self.cfg_budget,
                 peer_tools=[s.tool for s in self.peer_specs],
             )
+            # The config overlay above re-clobbers caps from config.yaml on
+            # every start. Re-apply any explicit operator override (e.g.
+            # `peers-ctl start --max-runtime 12h`) ON TOP so it actually
+            # takes effect instead of being silently reset to the config
+            # default.
+            apply_operator_budget_overrides(state, self.repo)
             tm = TurnManager.from_state(state)
             ticks = 0
+
+            # Seed the no-prior-regression baseline ONCE, before any peer
+            # modifies code. Without this the gate fails forever (missing
+            # baseline → exit 1) and sticks the run at the convergence wall.
+            baseline_msg = ensure_baseline_snapshot(
+                self.repo, self.peer_dir, [g.id for g in self.goals],
+            )
+            if baseline_msg is not None:
+                print(f"peers: {baseline_msg}", file=sys.stderr, flush=True)
 
             if self.recon_enabled:
                 self._run_recon_step()

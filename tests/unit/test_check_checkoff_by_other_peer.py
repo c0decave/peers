@@ -79,6 +79,46 @@ def test_checkoff_by_same_peer_fails(tmp_path, capsys):
     assert "claude@p.local" in out
 
 
+# --- shared git identity: peers distinguished by the `Peer:` trailer -------
+# In real runs both peers commit under one container git identity (e.g.
+# `dash <user@localhost>`); the email comparison cannot tell them apart.
+# The orchestrator writes a `Peer: <name>` trailer that the gate must honour.
+_SHARED = "dash@localhost.local"
+
+
+def test_shared_identity_distinct_peer_trailers_passes(tmp_path, capsys):
+    _init_git(tmp_path)
+    src = tmp_path / "src" / "auth.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def auth(): pass")
+    _write_plan(tmp_path, "- [ ] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    _commit_as(tmp_path, _SHARED, "dash", ["src/auth.py", "PLAN.md"],
+               "step-1 impl\n\nPeer: claude")
+    _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    _commit_as(tmp_path, _SHARED, "dash", ["PLAN.md"],
+               "step-1 reviewed\n\nPeer: codex")
+    # Same author email throughout; only the trailer differs -> must PASS.
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 0
+
+
+def test_shared_identity_same_peer_trailer_fails(tmp_path, capsys):
+    _init_git(tmp_path)
+    src = tmp_path / "src" / "auth.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def auth(): pass")
+    _write_plan(tmp_path, "- [ ] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    _commit_as(tmp_path, _SHARED, "dash", ["src/auth.py", "PLAN.md"],
+               "step-1 impl\n\nPeer: claude")
+    _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    _commit_as(tmp_path, _SHARED, "dash", ["PLAN.md"],
+               "step-1 self-checkoff\n\nPeer: claude")
+    # Same peer implements AND checks off, despite it being one git identity.
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 1
+    assert "peer:claude" in capsys.readouterr().out
+
+
 def test_checkoff_without_touches_skipped(tmp_path, capsys):
     """A `trivial_step: true` step is exempt from the touches:
     requirement at parse time (Issue I4); the post-hoc gate has no

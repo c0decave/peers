@@ -136,6 +136,25 @@ def test_reap_orphans_if_pid1_returns_zero_on_no_children(monkeypatch):
     assert HealthGuard._reap_orphans_if_pid1() == 0
 
 
+def test_invoke_merges_extra_env(tmp_path: Path):
+    import sys as _sys
+
+    script = tmp_path / "print_env.py"
+    script.write_text(
+        "import os\n"
+        "print(os.environ.get('PEERS_TEST_EXTRA_ENV', ''))\n"
+    )
+
+    result = HealthGuard(tmp_path).invoke(
+        [_sys.executable, str(script)],
+        prompt="",
+        extra_env={"PEERS_TEST_EXTRA_ENV": "from-extra"},
+    )
+
+    assert result.classification == "success"
+    assert result.stdout.strip() == "from-extra"
+
+
 def test_sweep_zombies_via_proc_skips_tracked_pid(monkeypatch, tmp_path):
     """follow-up (BUG-zombie-leak, 2026-05-24): the existing
     `_reap_orphans_if_pid1` uses waitpid(-1) which races with

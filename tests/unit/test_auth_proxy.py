@@ -305,3 +305,146 @@ def test_refresh_claude_config_rejects_https_url_without_host_BUG_203(
 
     with pytest.raises(oauth_refresh.OAuthRefreshError, match="https://"):
         refresh_claude_config(token_file, opener=opener)
+
+
+def test_refresh_claude_config_accepts_loopback_http_token_url(
+    tmp_path: Path,
+) -> None:
+    """RFC 8252 §7.3 — http:// to a loopback host stays on the local
+    machine, so it does not exfiltrate the refresh_token. The exception is
+    required for local dev / integration tests; the BUG-203 protection
+    remains for any non-loopback http URL."""
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh-secret",
+            "tokenUrl": "http://127.0.0.1:65535/oauth/token",
+        }
+    }), encoding="utf-8")
+
+    seen_url: dict = {}
+
+    def opener(request, *, timeout):
+        seen_url["url"] = request.full_url
+        return FakeResponse(
+            200, json.dumps({"access_token": "new"}).encode("utf-8"),
+        )
+
+    token = refresh_claude_config(token_file, opener=opener)
+    assert token == "new"
+    assert seen_url["url"] == "http://127.0.0.1:65535/oauth/token"
+
+
+def test_refresh_claude_config_accepts_loopback_localhost_http_token_url(
+    tmp_path: Path,
+) -> None:
+    """The localhost hostname (case-insensitive) is also a loopback alias."""
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh-secret",
+            "tokenUrl": "http://LocalHost:9000/oauth/token",
+        }
+    }), encoding="utf-8")
+
+    def opener(request, *, timeout):
+        return FakeResponse(
+            200, json.dumps({"access_token": "new"}).encode("utf-8"),
+        )
+
+    token = refresh_claude_config(token_file, opener=opener)
+    assert token == "new"
+
+
+def test_refresh_claude_config_handles_malformed_ipv6_token_url_BUG_302(
+    tmp_path: Path,
+) -> None:
+    """BUG-302 reproducer: urllib.parse.urlsplit() raises ValueError on a
+    malformed IPv6 bracket sequence (e.g. ``http://[invalid/token``). The
+    BUG-203 hardening at _token_url calls urlsplit without a try/except, so
+    the ValueError propagates instead of becoming the controlled
+    OAuthRefreshError every other bad-URL path produces. The ClaudeTokenStore
+    in auth_proxy.server catches OAuthRefreshError but NOT ValueError, so
+    the auth-proxy would return an opaque HTTP 500 instead of the structured
+    502 + diagnostic. Expected: ValueError is caught and re-raised as
+    OAuthRefreshError with the same 'must be an https:// URL' wording, so
+    the failure shape is consistent across all malformed-URL inputs."""
+    import pytest
+
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh-secret",
+            "tokenUrl": "http://[invalid/token",
+        }
+    }), encoding="utf-8")
+
+    def opener(request, *, timeout):  # pragma: no cover - must not fire
+        raise AssertionError("malformed IPv6 endpoint must not be requested")
+
+    with pytest.raises(oauth_refresh.OAuthRefreshError, match="https://"):
+        refresh_claude_config(token_file, opener=opener)
+
+
+def test_refresh_claude_config_rejects_http_to_loopback_lookalike(
+    tmp_path: Path,
+) -> None:
+    """Defense-in-depth: only the exact loopback aliases bypass the https
+    requirement. A hostname that merely *contains* ``localhost`` or sits
+    inside the ``127.0.0.0/8`` net but routes off-box must still be
+    rejected — the loopback exception is a string-equality check, not a
+    substring or CIDR match."""
+    import pytest
+
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh-secret",
+            "tokenUrl": "http://localhost.attacker.example/token",
+        }
+    }), encoding="utf-8")
+
+    def opener(request, *, timeout):  # pragma: no cover - must not fire
+        raise AssertionError("non-loopback http endpoint must not be requested")
+
+    with pytest.raises(oauth_refresh.OAuthRefreshError, match="https://"):
+        refresh_claude_config(token_file, opener=opener)
+
+
+def test_refresh_claude_config_rejects_http_loopback_userinfo_bypass(
+    tmp_path: Path,
+) -> None:
+    """Regression lock for the userinfo-spoofing vector: in
+    ``http://127.0.0.1@evil.tld/token`` the authority's *host* is
+    ``evil.tld`` (the part before ``@`` is userinfo), so urlopen would
+    connect off-box. The loopback check uses ``parsed.hostname`` — the
+    same field urlopen dials — so the spoof is rejected. This test exists
+    precisely because the code is already correct: it fails closed and
+    pins the behavior so a future refactor to substring-match on
+    ``netloc`` cannot silently open the bypass."""
+    import pytest
+
+    for spoof in (
+        "http://127.0.0.1@evil.tld/token",
+        "http://localhost@evil.tld/token",
+    ):
+        token_file = tmp_path / ".claude.json"
+        token_file.write_text(json.dumps({
+            "oauthAccount": {
+                "accessToken": "old",
+                "refreshToken": "refresh-secret",
+                "tokenUrl": spoof,
+            }
+        }), encoding="utf-8")
+
+        def opener(request, *, timeout):  # pragma: no cover - must not fire
+            raise AssertionError(
+                f"userinfo-spoofed endpoint must not be requested: {spoof}"
+            )
+
+        with pytest.raises(oauth_refresh.OAuthRefreshError, match="https://"):
+            refresh_claude_config(token_file, opener=opener)

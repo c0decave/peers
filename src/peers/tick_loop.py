@@ -11,6 +11,8 @@ import sys
 import time
 from typing import Any, Protocol, Sequence
 
+from peers.model_provider import build_peer_argv
+
 
 class _Comm(Protocol):
     def head_sha(self) -> str:
@@ -29,6 +31,7 @@ class _HealthInvoker(Protocol):
         error_patterns: Sequence[str],
         halt_patterns: Sequence[str],
         buf_cap_bytes: int,
+        extra_env: dict[str, str] | None = None,
     ) -> Any:
         ...
 
@@ -292,16 +295,25 @@ class TickLoop:
 
         tick_t0 = time.monotonic()
         driver._head_before_invoke = driver.comm.head_sha()
-        run = driver.health.invoke(
-            spec.argv,
-            prompt=prompt,
-            idle_timeout_s=driver.idle_timeout_s,
-            absolute_max_runtime_s=driver.absolute_max_runtime_s,
-            prompt_mode=spec.prompt_mode,
-            error_patterns=driver.error_patterns,
-            halt_patterns=driver.halt_patterns,
-            buf_cap_bytes=driver.buf_cap_bytes,
-        )
+        peer_argv, extra_env = build_peer_argv(spec)
+        # Expose the current peer name to the peer's subprocess (and thus to
+        # any git hooks it triggers) so peer attribution does not depend on
+        # the git author identity — which is frequently a single shared
+        # container user that cannot distinguish the two peers. The
+        # reviewer-only-checkoff hook reads PEERS_PEER_NAME.
+        extra_env = {**(extra_env or {}), "PEERS_PEER_NAME": str(peer)}
+        invoke_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "idle_timeout_s": driver.idle_timeout_s,
+            "absolute_max_runtime_s": driver.absolute_max_runtime_s,
+            "prompt_mode": spec.prompt_mode,
+            "error_patterns": driver.error_patterns,
+            "halt_patterns": driver.halt_patterns,
+            "buf_cap_bytes": driver.buf_cap_bytes,
+        }
+        if extra_env:
+            invoke_kwargs["extra_env"] = extra_env
+        run = driver.health.invoke(peer_argv, **invoke_kwargs)
         driver._verify_peer_dir_identity()
         self._validate_run_result(run)
         tick_dt = int(time.monotonic() - tick_t0)

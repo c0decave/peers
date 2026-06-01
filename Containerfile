@@ -8,6 +8,13 @@ RUN apt-get update && apt-get install -y \
 RUN npm install -g @anthropic-ai/claude-code
 RUN npm install -g @openai/codex || true
 
+# Ship a test runner in the image. Without it, implement-mode peers
+# improvise — vendoring pytest into a working-tree `.local/` and dropping
+# a stray top-level `pytest.py` shim, which pollutes the repo and slips
+# past every cleanliness gate (they scan `src/`). Provide the common
+# Python test stack so the acceptance command just works.
+RUN pip3 install --break-system-packages pytest pytest-timeout hypothesis
+
 COPY . /opt/peers
 RUN pip3 install --break-system-packages /opt/peers
 

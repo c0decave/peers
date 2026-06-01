@@ -36,6 +36,11 @@ protocol surfaces. We exempt:
   ``abc.ABC`` / ``ABCMeta`` / ``abc.ABCMeta`` (or use
   ``metaclass=ABCMeta`` via the keyword form).
 
+* Empty-bodied **exception classes** -- ``class FooError(Exception):
+  pass`` is the idiomatic way to declare a custom error, not a shortcut.
+  Recognised textually by a base whose name ends in
+  ``Error`` / ``Exception`` / ``Warning``.
+
 The base-class match is purely textual on the unparsed AST node, so
 ``Foo(Protocol)`` and ``Foo(typing.Protocol)`` both work. Aliases
 (``from typing import Protocol as P``; ``class X(P):``) are not
@@ -73,6 +78,24 @@ _ABSTRACTMETHOD_DECORATORS = (
     "abstractproperty",
     "abc.abstractproperty",
 )
+
+
+# An empty-bodied class that subclasses an exception is the idiomatic way
+# to declare a custom error (`class FooError(Exception): pass`). Flagging it
+# as a "shortcut" is a false positive. We recognise an exception base purely
+# textually (matching the heuristic style used for Protocol/ABC above): a
+# base whose name ends in Error / Exception / Warning, e.g. `Exception`,
+# `ValueError`, `calc.errors.CalcError`, `DeprecationWarning`.
+_EXCEPTION_BASE_SUFFIXES = ("Error", "Exception", "Warning")
+
+
+def _is_exception_class(node: ast.ClassDef) -> bool:
+    """True if ``node`` textually derives from an exception base."""
+    for base in node.bases:
+        name = ast.unparse(base).rsplit(".", 1)[-1]
+        if name.endswith(_EXCEPTION_BASE_SUFFIXES):
+            return True
+    return False
 
 
 def _is_abstract_base(node: ast.ClassDef) -> bool:
@@ -190,6 +213,10 @@ def _scan_tree(
 
         kind = _body_is_empty(node.body)
         if kind is None:
+            continue
+
+        # An empty-bodied exception subclass is idiomatic, not a shortcut.
+        if isinstance(node, ast.ClassDef) and _is_exception_class(node):
             continue
 
         sym_kind = (

@@ -104,6 +104,45 @@ def test_init_modes_empty_string_errors(tmp_path):
     assert "empty list" in (r.stderr + r.stdout).lower()
 
 
+def test_init_peer_model_provider_flags_land_in_config(tmp_path):
+    import yaml
+
+    repo = _new_repo(tmp_path)
+    r = _run_init(
+        repo,
+        "--peer-model", "claude=opus",
+        "--peer-reasoning", "codex=xhigh",
+        "--peer-provider", "codex=openrouter",
+    )
+
+    assert r.returncode == 0, r.stderr
+    cfg = yaml.safe_load((repo / ".peers" / "config.yaml").read_text())
+    peers = {peer["name"]: peer for peer in cfg["peers"]}
+    assert peers["claude"]["model"] == "opus"
+    assert peers["codex"]["reasoning"] == "xhigh"
+    assert peers["codex"]["provider"] == "openrouter"
+
+
+def test_init_peer_flags_bare_value_applies_to_all_peers(tmp_path):
+    import yaml
+
+    repo = _new_repo(tmp_path)
+    r = _run_init(repo, "--peer-reasoning", "high")
+
+    assert r.returncode == 0, r.stderr
+    cfg = yaml.safe_load((repo / ".peers" / "config.yaml").read_text())
+    assert all(peer["reasoning"] == "high" for peer in cfg["peers"])
+
+
+def test_init_peer_flags_invalid_value_leaves_no_peers_dir(tmp_path):
+    repo = _new_repo(tmp_path)
+    r = _run_init(repo, "--peer-provider", "claude=openai")
+
+    assert r.returncode == 2
+    assert "peer override" in r.stderr
+    assert not (repo / ".peers").exists()
+
+
 def test_init_modes_unknown_does_not_leave_half_written_peers_dir(tmp_path):
     """When --modes contains an unknown mode, .peers/ must be untouched.
     Half-initialized state is worse than no state — the user can rerun

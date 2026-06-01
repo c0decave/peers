@@ -12,6 +12,8 @@ peers-ctl new <pfad> [--name NAME] [--spec TEXT_ODER_PFAD]
               [--driver {orchestrator,hooks,sessions}]
               [--force] [--container]
               [--modes <liste>] [--lang <lang>]
+              [--peer-model WERT] [--peer-reasoning WERT]
+              [--peer-provider WERT]
 ```
 
 ## BESCHREIBUNG
@@ -46,6 +48,12 @@ installiert ist: nur `podman` + das `peers:dev`-Image reichen.
   `thorough`, ...). Siehe `peers-ctl modes list`.
 - `--lang <lang>` — `python` (default), `js`, `rust`, `go`.
 - `--audit-templates` — DEPRECATED-Alias für `--modes=audit`.
+- `--peer-model WERT` — setzt `model` in der generierten Config.
+  Wiederholbar. `WERT` gilt für alle Peers; `NAME=WERT` oder
+  `TOOL=WERT` targetet gezielt.
+- `--peer-reasoning WERT` — setzt `reasoning` in der generierten Config.
+- `--peer-provider WERT` — setzt `provider` (`anthropic`, `openai`,
+  `openrouter`) in der generierten Config.
 
 ## BEISPIELE
 ```
@@ -58,6 +66,12 @@ peers-ctl new quick-test --modes=audit
 
 # Force-Re-Scaffold über bestehenden State.
 peers-ctl new meine-app --force --modes=audit,security
+
+# Codex über OpenRouter nutzen.
+peers-ctl new meine-app --modes=audit \
+  --peer-provider codex=openrouter \
+  --peer-model codex=~openai/gpt-latest \
+  --peer-reasoning codex=xhigh
 ```
 
 ## DATEIEN
@@ -73,6 +87,8 @@ Registry-Update:
 - `PEERS_PROJECTS_ROOT` — Basis für Kurznamen-Auflösung.
 - `PODMAN_CMD` — `podman`-Pfad-Override (bei `--container`).
 - `PEERS_CTL_PODMAN_NETWORK` — Podman-Netzwerkmodus.
+- `OPENROUTER_API_KEY` — zur Laufzeit nötig für Peers mit
+  `provider: openrouter`.
 
 ## SIEHE AUCH
 - `peers init --help-man` — was Schritt 5 im Detail tut.

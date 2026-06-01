@@ -971,6 +971,46 @@ def test_start_max_runtime_and_reset_budget_combine(
     runner_mod.stop_project(s, s.get("x"), grace_s=2)
 
 
+def test_apply_budget_overrides_writes_sidecar_without_state(
+    tmp_path: Path,
+) -> None:
+    """First-start fix: on a freshly-init'd project state.json does not
+    exist yet, so writing the cap only to state.json silently dropped
+    `--max-runtime`. The operator override must persist to the sidecar
+    (.peers/budget-overrides.json) regardless, so the orchestrator can
+    re-apply it after the config overlay on the first tick."""
+    import json
+    import peers_ctl.runner as runner_mod
+    from peers.budget_accountant import OPERATOR_BUDGET_OVERRIDE_FILE
+
+    target = _stub_target(tmp_path)  # has .peers/config.yaml, NO state.json
+    assert not (target / ".peers" / "state.json").exists()
+    proj = Project(name="x", path=str(target))
+
+    runner_mod._apply_budget_overrides(proj, 43200, False)
+
+    sidecar = target / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE
+    assert sidecar.exists(), "operator override must persist to the sidecar"
+    assert json.loads(sidecar.read_text())["max_runtime_s"] == 43200
+
+
+def test_apply_budget_overrides_reset_clears_sidecar(tmp_path: Path) -> None:
+    """`--reset-budget` returns a project to its config.yaml defaults, so
+    it must also clear any persisted operator cap override."""
+    import json
+    import peers_ctl.runner as runner_mod
+    from peers.budget_accountant import OPERATOR_BUDGET_OVERRIDE_FILE
+
+    target = _stub_target(tmp_path)
+    sidecar = target / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE
+    sidecar.write_text(json.dumps({"max_runtime_s": 43200}))
+    proj = Project(name="x", path=str(target))
+
+    runner_mod._apply_budget_overrides(proj, None, True)
+
+    assert not sidecar.exists(), "reset must clear the operator override"
+
+
 def test_start_rejects_non_positive_max_usd(tmp_path: Path):
     s = Store(tmp_path / "ctl")
     target = _stub_target(tmp_path)

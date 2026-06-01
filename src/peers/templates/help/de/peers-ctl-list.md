@@ -16,8 +16,8 @@ Vier-Spalten-Tabelle:
 
 ```
 NAME                 STATE    PID      PATH
-meine-app            running  12345    /home/x/c0de/peers-c0de/meine-app
-alteres-proj         idle              /home/x/c0de/peers-c0de/alteres-proj
+meine-app            running  12345    ~/c0de/peers-c0de/meine-app
+alteres-proj         idle              ~/c0de/peers-c0de/alteres-proj
 ```
 
 States:

@@ -38,9 +38,9 @@ services:
       # Mount the TARGET project at /work. Default: cwd.
       # Override:  TARGET=/path/to/target-project podman compose up
       - ${TARGET:-./}:/work
-      - ${HOME:?HOME must be set}/.claude:/home/peer/.claude
-      - ${HOME:?HOME must be set}/.codex:/home/peer/.codex
-      - peer-cache:/home/peer/.cache
+      - ${HOME:?HOME must be set}/.claude:~/.claude
+      - ${HOME:?HOME must be set}/.codex:~/.codex
+      - peer-cache:~/.cache
     cap_drop:
       - ALL
     security_opt:

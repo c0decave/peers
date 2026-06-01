@@ -61,8 +61,10 @@ peers run --dry-run --max-ticks 3 -v
 ## ENVIRONMENT
 - `PEERS_FORCE_DRIVER` — testing override; bypasses `config.yaml`'s
   driver selection.
-- Peer-specific env (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) is
-  passed through to the peer subprocess.
+- Peer-specific env (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+  `OPENROUTER_API_KEY`) is passed through to the peer subprocess.
+  `OPENROUTER_API_KEY` is required, and checked before launch, when a
+  peer has `provider: openrouter`.
 
 ## SEE ALSO
 - `peers tick --help-man` — one-tick variant for hook chains.

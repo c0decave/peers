@@ -65,6 +65,20 @@ Currently supported: `python` (default) and `js`. Other values warn
 and fall back to Python templates so scaffolding never fails on a
 typo.
 
+To pin a peer to a specific model/provider at scaffold time, add
+repeatable `--peer-*` flags. For OpenRouter-backed Codex:
+
+```sh
+export OPENROUTER_API_KEY=sk-or-...
+peers-ctl new myapp --container --modes=audit --spec ./myapp-spec.md \
+  --peer-provider codex=openrouter \
+  --peer-model codex=~openai/gpt-latest \
+  --peer-reasoning codex=xhigh
+```
+
+`OPENROUTER_API_KEY` is checked before `peers run`, `peers tick`,
+`peers tmux up`, and container start.
+
 What gets created:
 ```
 ~/c0de/peers-c0de/myapp/

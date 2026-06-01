@@ -55,8 +55,12 @@ peers-ctl start meine-app --max-usd 20
 ## UMGEBUNGSVARIABLEN
 - `PEERS_CTL_PODMAN_NETWORK` — Podman-Netzwerkmodus (`host`, `none`, ...).
 - `PODMAN_CMD` — `podman`-Pfad-Override.
-- Peer-spezifische Env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) wird
-  durchgereicht.
+- Peer-spezifische Env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+  `OPENROUTER_API_KEY`) wird durchgereicht. Im Container-Modus wird
+  `OPENROUTER_API_KEY` per Name durchgereicht, wenn ein Projekt
+  `provider: openrouter` nutzt, ausser Codex setzt ein eigenes
+  `model_providers.openrouter.env_key`; der Start bricht früh ab,
+  wenn der erforderliche Key fehlt.
 
 ## SIEHE AUCH
 - `peers-ctl stop --help-man` — sauberes Shutdown.

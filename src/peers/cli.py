@@ -22,7 +22,16 @@ from peers.help_man import (
     pick_lang,
     print_help_man,
 )
-from peers.peer_spec import is_valid_peer_name, load_peer_specs
+from peers.model_provider import (
+    OPENROUTER_API_KEY_ENV,
+    build_peer_argv,
+    validate_peer_runtime_env,
+)
+from peers.peer_spec import (
+    apply_peer_field_overrides,
+    is_valid_peer_name,
+    load_peer_specs,
+)
 from peers.safe_io import (
     open_text_in_dir_no_symlink,
     open_text_read_no_symlink,
@@ -338,7 +347,10 @@ def cmd_init(target: Path, force: bool, driver: str = "orchestrator",
              modes: list[str] | None = None,
              # legacy alias — kept for back-compat:
              audit_templates: bool = False,
-             lang: str = "python") -> int:
+             lang: str = "python",
+             peer_model: list[str] | None = None,
+             peer_reasoning: list[str] | None = None,
+             peer_provider: list[str] | None = None) -> int:
     # Normalize legacy --audit-templates → --modes=audit with a stderr note.
     if audit_templates and not modes:
         modes = ["audit"]
@@ -366,6 +378,22 @@ def cmd_init(target: Path, force: bool, driver: str = "orchestrator",
         except ValueError as e:
             print(f"peers: {e}", file=sys.stderr)
             return 1
+    try:
+        template_cfg = yaml.safe_load(
+            read_text_no_symlink(_templates_dir() / "config.yaml")
+        )
+        if not isinstance(template_cfg, dict):
+            raise ValueError("template config.yaml top-level must be a mapping")
+        apply_peer_field_overrides(
+            template_cfg,
+            peer_model=peer_model,
+            peer_reasoning=peer_reasoning,
+            peer_provider=peer_provider,
+        )
+    except (OSError, ValueError, yaml.YAMLError) as e:
+        print(f"peers: peer override validation failed: {e}",
+              file=sys.stderr)
+        return 2
     target = Path(target)
     if not target.is_dir():
         print(f"target is not an existing directory: {target}",
@@ -420,6 +448,20 @@ def cmd_init(target: Path, force: bool, driver: str = "orchestrator",
                 file=sys.stderr,
             )
             return 2
+        # The harness hardening below makes .peers/checks read-only (so a
+        # peer cannot delete a gate script). A plain rmtree cannot remove a
+        # non-writable directory, so pre-unlock the whole tree first.
+        import os as _os
+        for _root, _dirs, _files in _os.walk(peers):
+            try:
+                _os.chmod(_root, 0o755)
+            except OSError:
+                pass
+            for _f in _files:
+                try:
+                    _os.chmod(_os.path.join(_root, _f), 0o644)
+                except OSError:
+                    pass
         shutil.rmtree(peers)
     peers.mkdir(parents=True)
     (peers / "log").mkdir()
@@ -434,6 +476,24 @@ def cmd_init(target: Path, force: bool, driver: str = "orchestrator",
     src = _templates_dir()
     shutil.copy(src / "config.yaml", peers / "config.yaml")
     shutil.copy(src / "goals.yaml", peers / "goals.yaml")
+    if peer_model or peer_reasoning or peer_provider:
+        cfg_path = peers / "config.yaml"
+        try:
+            cfg = yaml.safe_load(read_text_no_symlink(cfg_path))
+            cfg = apply_peer_field_overrides(
+                cfg,
+                peer_model=peer_model,
+                peer_reasoning=peer_reasoning,
+                peer_provider=peer_provider,
+            )
+        except (OSError, ValueError, yaml.YAMLError) as e:
+            print(f"peers: peer override validation failed: {e}",
+                  file=sys.stderr)
+            return 2
+        write_text_no_symlink(
+            cfg_path,
+            yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True),
+        )
     shutil.copy(
         src / "modes" / "audit" / "checks" / "verify_self_review.py",
         peers / "checks" / "verify_self_review.py",
@@ -507,6 +567,31 @@ def cmd_init(target: Path, force: bool, driver: str = "orchestrator",
         write_text_no_symlink(
             peers / "modes-applied.txt", "\n".join(lines) + "\n"
         )
+
+    # Harden the harness: make installed check scripts read-only and the
+    # checks/ directory non-writable so a peer cannot accidentally (or
+    # otherwise) delete or rewrite a gate script. In the calc diagnostic a
+    # peer removed `.peers/checks/no_regression.py` mid-run (the dir was
+    # writable and gitignored, so the loss was invisible), which broke the
+    # `no-prior-regression` gate and stuck the run. Peers run as the same
+    # uid and could chmod the dir back, but this stops the casual `rm`/edit
+    # that actually happened. We also snapshot a sha256 manifest for the
+    # record. Best-effort: never fail scaffolding over a chmod.
+    checks_dir = peers / "checks"
+    if checks_dir.is_dir():
+        try:
+            import hashlib as _hashlib
+            manifest = []
+            for f in sorted(checks_dir.glob("*.py")):
+                digest = _hashlib.sha256(f.read_bytes()).hexdigest()
+                manifest.append(f"{digest}  {f.name}")
+                f.chmod(0o555)  # r-x: readable + executable, not writable
+            write_text_no_symlink(
+                peers / "checks.sha256", "\n".join(manifest) + "\n"
+            )
+            checks_dir.chmod(0o555)  # prevent add/delete/rename within
+        except OSError:
+            pass
 
     # G10: tag the target's current HEAD so a human can always roll
     # back to "before peers touched this". Surface the absence so the
@@ -1543,6 +1628,11 @@ def cmd_run(target: Path, max_ticks: int | None,
         print(f"goals error: {e}", file=sys.stderr)
         return 1
     peer_specs = load_peer_specs(cfg)
+    try:
+        validate_peer_runtime_env(peer_specs)
+    except ValueError as e:
+        print(f"runtime error: {e}", file=sys.stderr)
+        return 1
     health = cfg["health"]
     goals_cfg = cfg.get("goals", {}) or {}
     cfg_budget = dict(cfg.get("budget", {}) or {})
@@ -1571,7 +1661,9 @@ def cmd_run(target: Path, max_ticks: int | None,
     return 0 if result["reason"] in ("complete", "max_ticks") else 1
 
 
-def cmd_run_check(target: Path, name: str) -> int:
+def cmd_run_check(
+    target: Path, name: str, check_args: tuple[str, ...] = (),
+) -> int:
     """Resolve and invoke a check script by name.
 
     Used by `cmd:` strings in scaffolded goals.yaml so they don't have
@@ -1664,7 +1756,7 @@ def cmd_run_check(target: Path, name: str) -> int:
     # Forward stdout/stderr and exit code by inheriting them.
     try:
         r = subprocess.run(
-            [sys.executable, str(resolved)],
+            [sys.executable, str(resolved), *check_args],
             cwd=str(target),
         )
     except OSError as e:
@@ -1782,6 +1874,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             "audit-template language: python, js, rust, or go; "
             "unknown falls back"
         ),
+    )
+    p_init.add_argument(
+        "--peer-model", action="append", default=None,
+        help="set model in scaffolded config.yaml; VALUE applies to all "
+             "peers, NAME=VALUE/TOOL=VALUE targets matching peers",
+    )
+    p_init.add_argument(
+        "--peer-reasoning", action="append", default=None,
+        help="set reasoning effort in scaffolded config.yaml; VALUE applies "
+             "to all peers, NAME=VALUE/TOOL=VALUE targets matching peers",
+    )
+    p_init.add_argument(
+        "--peer-provider", action="append", default=None,
+        help="set provider in scaffolded config.yaml "
+             "(anthropic/openai/openrouter)",
     )
 
     _add_help_man_subparser(
@@ -1949,7 +2056,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         install_hooks=getattr(args, "install", False),
                         modes=modes,
                         audit_templates=args.audit_templates,
-                        lang=args.lang)
+                        lang=args.lang,
+                        peer_model=args.peer_model,
+                        peer_reasoning=args.peer_reasoning,
+                        peer_provider=args.peer_provider)
     if args.cmd == "status":
         return cmd_status(args.target)
     if args.cmd == "run":
@@ -2082,6 +2192,11 @@ def cmd_tmux(target: Path, subcmd: str) -> int:
         print(f"session {session} already exists; use "
               f"`peers tmux down` first or `peers tmux attach`")
         return 1
+    try:
+        validate_peer_runtime_env(peer_specs)
+    except ValueError as e:
+        print(f"runtime error: {e}", file=sys.stderr)
+        return 1
     # Shell-quote the target path before embedding into tmux command
     # strings (tmux passes them to a shell). This guards against
     # surprising target paths.
@@ -2129,12 +2244,37 @@ def _continue_cmd(spec) -> str:
     existing session' mode. Falls back to the configured argv if the
     tool isn't claude/codex."""
     if spec.tool == "claude":
-        return "claude --continue || claude"
+        return (
+            f"{_continue_shell_cmd(spec, ('claude', '--continue'))} || "
+            f"{_continue_shell_cmd(spec, ('claude',))}"
+        )
     if spec.tool == "codex":
-        return "codex resume || codex"
+        return (
+            f"{_continue_shell_cmd(spec, ('codex', 'resume'))} || "
+            f"{_continue_shell_cmd(spec, ('codex',))}"
+        )
     # Generic fallback — just spawn a login shell so the user can
     # invoke the tool by hand.
     return "bash -l"
+
+
+def _continue_shell_cmd(spec, base_argv: tuple[str, ...]) -> str:
+    import shlex
+
+    argv, extra_env = build_peer_argv(spec, base_argv)
+    cmd = " ".join(shlex.quote(arg) for arg in argv)
+    if not extra_env:
+        return cmd
+    env_parts: list[str] = []
+    for key, value in extra_env.items():
+        if key == "ANTHROPIC_AUTH_TOKEN" and spec.provider == "openrouter":
+            env_parts.append(
+                f'{key}="${{{OPENROUTER_API_KEY_ENV}:?'
+                f'{OPENROUTER_API_KEY_ENV} is required}}"'
+            )
+        else:
+            env_parts.append(f"{key}={shlex.quote(value)}")
+    return " ".join([*env_parts, cmd])
 
 
 if __name__ == "__main__":

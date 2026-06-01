@@ -18,15 +18,17 @@ RUN apk add --no-cache tinyproxy ca-certificates
 
 COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
 COPY filter-allow.txt /etc/tinyproxy/filter
+COPY entrypoint.sh /usr/local/bin/peers-egress-entrypoint
 
 # tinyproxy needs writable runtime + log dirs. The runtime container
 # runs with --read-only --tmpfs /run/tinyproxy --tmpfs /var/log/tinyproxy
 # (see _build_proxy_argv); ensure the paths exist on the image so
 # mounting the tmpfs over them does not surprise the daemon.
 RUN mkdir -p /run/tinyproxy /var/log/tinyproxy \
-    && chown -R tinyproxy:tinyproxy /run/tinyproxy /var/log/tinyproxy
+    && chown -R tinyproxy:tinyproxy /run/tinyproxy /var/log/tinyproxy \
+    && chmod 0755 /usr/local/bin/peers-egress-entrypoint
 
 USER tinyproxy
 EXPOSE 3128
 
-ENTRYPOINT ["tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]
+ENTRYPOINT ["/usr/local/bin/peers-egress-entrypoint"]

@@ -8,3 +8,15 @@ dist/
 .worktrees/
 .handoff-msg.txt
 handoff-msg.txt
+
+# Secrets / credentials — never commit. Belt-and-suspenders alongside
+# scripts/scrub-guard.py (which scans staged content). Keep key material
+# out of `git add` in the first place.
+*.key
+*.pem
+.env
+.env.*
+*.claude.json
+secrets.*
+*credentials*
+*.secret

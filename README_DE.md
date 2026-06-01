@@ -1,10 +1,30 @@
 # peers
 
-Ein kleines Python-Substrat, das **n ≥ 2** AI-Coding-CLIs (Claude
-Code, Codex, …) als kooperierende Peers gegen messbare Projektziele
-laufen lässt. Beide (oder mehrere) Seiten machen Code, prüfen die
-Arbeit der anderen und arbeiten so lange weiter, bis alle definierten
-Ziele grün sind.
+**Zwei AI-Coding-Agenten sind besser als einer — wenn man sie es beweisen lässt.**
+
+peers lässt **n ≥ 2** AI-Coding-CLIs (Claude Code, Codex, …) als kooperierende
+Peers laufen, die sich nicht einfach *einig* sind, dass etwas fertig ist —
+sie müssen erst **harte, messbare Gates** bestehen: Tests grün, Coverage hält,
+keine Regression, kein TODO/Stub/übersprungener Test, keine Secrets. Ein Peer
+implementiert, der **andere reviewt blind** (ohne die Notizen des ersten zu
+sehen), und ein **adversarialer Skeptiker** auditiert nach, bevor ein „fertig"
+akzeptiert wird. Läuft **unbeaufsichtigt**, **budget-gedeckelt** und
+**container-isoliert**.
+
+**Warum das einen einzelnen Agenten im Loop schlägt:**
+
+- **Gegated, nicht aus dem Bauch.** „Sieht fertig aus" konvergiert nie —
+  *Gates grün + Skeptiker-clean* schon. Kein Konvergenz-Theater.
+- **Blindes Peer-Review fängt Rubber-Stamping** — ein unabhängiges zweites
+  Augenpaar, per Konstruktion.
+- **Ein adversarialer Skeptiker jagt die Edge-Cases**, die deine Tests übersehen.
+- **Unbeaufsichtigt & sicher:** Idle-Timeout-Überwachung, USD-/Tick-Budget-Caps,
+  rootless cap-dropped Container, Egress-Allowlisting.
+
+In einem instrumentierten Test baute peers einen Ausdrucks-Interpreter
+greenfield *und* brownfield auf **0 Defekte über 50.000 zufällige
+Testprogramme** — fing eingebaute Regressionen und fand selbst Edge-Case-Bugs,
+die die Acceptance-Suite nie geprüft hat.
 
 > English version: [README.md](README.md).
 
@@ -59,8 +79,8 @@ podman run --rm -it \
     --cap-drop=ALL \
     --security-opt=no-new-privileges \
     -v $PWD:/work \
-    -v $HOME/.claude:/home/peer/.claude \
-    -v $HOME/.codex:/home/peer/.codex \
+    -v $HOME/.claude:~/.claude \
+    -v $HOME/.codex:~/.codex \
     peers:dev run
 ```
 
@@ -207,11 +227,16 @@ möglich.
 peers:
   - name: claude
     tool: claude
+    model: opus        # optional; weglassen = CLI-Default
+    reasoning: high    # claude: low|medium|high|xhigh|max
     argv: ["claude", "-p", "--dangerously-skip-permissions", "{PROMPT}"]
     prompt_mode: argv-substitute
 
   - name: codex
     tool: codex
+    model: gpt-5.1-codex-max
+    reasoning: xhigh   # codex: minimal|low|medium|high|xhigh
+    provider: openai   # openai|openrouter
     argv: ["codex", "exec", "{PROMPT}"]
     prompt_mode: argv-substitute
 
@@ -224,6 +249,24 @@ peers:
 
 Die alte `tools: {claude: …, codex: …}`-Mapping wird weiterhin
 gelesen und transparent ins neue Schema übersetzt (backward compat).
+
+`model`, `reasoning` und `provider` sind optionale Convenience-Felder.
+Explizite `argv`-Flags gewinnen weiterhin. Beim Scaffolden kannst du
+sie direkt setzen:
+
+```sh
+peers-ctl new meine-app --modes=audit \
+  --peer-model claude=opus \
+  --peer-provider codex=openrouter \
+  --peer-model codex=~openai/gpt-latest \
+  --peer-reasoning codex=xhigh
+```
+
+Für OpenRouter vor `peers run`, `peers tick`, `peers tmux up` oder
+`peers-ctl start` `OPENROUTER_API_KEY` exportieren; diese Kommandos
+brechen früh ab, wenn der Key fehlt. Im Container-Modus wird nur der
+Env-Name durchgereicht und `openrouter.ai` nur für opt-in-Projekte in
+der Egress-Proxy-Allowlist geöffnet.
 
 **Name-Validation:** `[A-Za-z0-9][A-Za-z0-9_-]{0,31}` — keine
 Path-Traversal-Zeichen, keine Shell-Metachars, keine tmux-Ambiguität.

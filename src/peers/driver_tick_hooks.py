@@ -33,47 +33,14 @@ from peers.skeptic_engine import PHASE_B_SKEPTIC_GATES, SkepticEngine
 from peers.turn_manager import TurnManager
 
 
-# Item 7: convergence-wall hard halt. v9-v12 all burned full budget
-# struggling on tests-pass + no-prior-regression. After N consecutive
-# red ticks on a watched gate, exit cleanly with stop-reason `stuck:<gate>`
-# instead of letting the loop spin until max_runtime.
-_DEFAULT_STUCK_HALT_AFTER = 5
-_DEFAULT_STUCK_HALT_GATES = ("tests-pass", "no-prior-regression")
-
-
-def compute_stuck_gate_halt_reason(state: dict[str, Any]) -> str | None:
-    """Return `stuck:<gate>` if any watched gate stuck >= threshold ticks.
-
-    Threshold default 5, override via state['config']['goals']['stuck_halt_after'].
-    Watched-gate set defaults to (tests-pass, no-prior-regression), override
-    via state['config']['goals']['stuck_halt_gates'] (list of goal ids).
-    A threshold of 0 disables the halt entirely (legacy behavior).
-    """
-    cfg_goals = ((state.get("config") or {}).get("goals") or {})
-    raw_n = cfg_goals.get("stuck_halt_after", _DEFAULT_STUCK_HALT_AFTER)
-    try:
-        threshold = int(raw_n)
-    except (TypeError, ValueError):
-        threshold = _DEFAULT_STUCK_HALT_AFTER
-    if threshold <= 0:
-        return None
-    raw_gates = cfg_goals.get("stuck_halt_gates")
-    if raw_gates:
-        watched = tuple(str(g) for g in raw_gates)
-    else:
-        watched = _DEFAULT_STUCK_HALT_GATES
-    stuck = state.get("stuck_counter") or {}
-    # Pick the worst (highest count) watched gate that crossed threshold.
-    worst_gate: str | None = None
-    worst_count = -1
-    for gate in watched:
-        count = int(stuck.get(gate, 0))
-        if count >= threshold and count > worst_count:
-            worst_gate = gate
-            worst_count = count
-    if worst_gate is None:
-        return None
-    return f"stuck:{worst_gate}"
+# Convergence-wall stuck detection + progress-aware reset live in
+# peers.stuck_progress (split out for the module line-budget). Re-export
+# so existing `from peers.driver_tick_hooks import ...` imports still work.
+from peers.stuck_progress import (  # noqa: E402
+    compute_stuck_gate_halt_reason,
+    count_done_plan_steps,
+    reset_stuck_on_progress,
+)
 
 
 class DriverTickHooksMixin:
@@ -216,6 +183,11 @@ class DriverTickHooksMixin:
             return {"reason": reason, "state": state}, {}
         results = self.engine.evaluate_hard_gates()
         self._record_results(state, results)
+        # Forgive the watched terminal gate's red streak when a PLAN step
+        # was completed this tick (implement-mode tests-pass false-halt
+        # fix). Runs AFTER _record_results incremented the counter and
+        # BEFORE the next tick's compute_stuck_gate_halt_reason reads it.
+        self._reset_stuck_on_progress(state)
         # Task 6.5: maintain implement-mode two-phase convergence counters
         # before consulting `_all_green_including_soft`. No-op for other
         # modes (strict backward-compat).
@@ -453,6 +425,14 @@ class DriverTickHooksMixin:
                     state["stuck_counter"][gid] = 1
             else:
                 state["stuck_counter"].pop(gid, None)
+
+    def _reset_stuck_on_progress(self, state: dict[str, Any]) -> None:
+        """Wire `reset_stuck_on_progress` to the live PLAN.md + mode."""
+        reset_stuck_on_progress(
+            state,
+            count_done_plan_steps(self.repo / "PLAN.md"),
+            self.mode_name,
+        )
 
     def _read_inbox(self, others: list[str],
                     state: dict[str, Any],

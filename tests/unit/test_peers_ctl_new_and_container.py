@@ -41,6 +41,44 @@ def test_new_with_spec_writes_SPEC_md(tmp_path: Path):
     assert (target / "SPEC.md").read_text().startswith("# Spec")
 
 
+def test_new_peer_flags_patch_generated_config(tmp_path: Path):
+    import yaml
+    from peers_ctl.cli import cmd_new
+
+    target = tmp_path / "with-peer-flags"
+    rc = cmd_new(
+        target,
+        name="with-peer-flags",
+        config_dir=tmp_path / "ctl",
+        peer_model=["claude=opus", "codex=~openai/gpt-latest"],
+        peer_reasoning=["codex=xhigh"],
+        peer_provider=["codex=openrouter"],
+    )
+
+    assert rc == 0
+    cfg = yaml.safe_load((target / ".peers" / "config.yaml").read_text())
+    peers = {peer["name"]: peer for peer in cfg["peers"]}
+    assert peers["claude"]["model"] == "opus"
+    assert peers["codex"]["model"] == "~openai/gpt-latest"
+    assert peers["codex"]["reasoning"] == "xhigh"
+    assert peers["codex"]["provider"] == "openrouter"
+
+
+def test_new_invalid_peer_flags_leave_no_target(tmp_path: Path):
+    from peers_ctl.cli import cmd_new
+
+    target = tmp_path / "bad-peer-flags"
+    rc = cmd_new(
+        target,
+        name="bad-peer-flags",
+        config_dir=tmp_path / "ctl",
+        peer_provider=["claude=openai"],
+    )
+
+    assert rc == 2
+    assert not target.exists()
+
+
 def test_new_with_spec_file_path(tmp_path: Path):
     from peers_ctl.cli import cmd_new
     spec_file = tmp_path / "spec.md"
@@ -141,7 +179,12 @@ def test_build_container_argv_shape(tmp_path: Path):
     argv = _build_container_argv(p, max_ticks=7, extra_args=("--dry-run",))
     assert argv[0] == "podman"
     assert "--rm" in argv
-    assert "--userns=keep-id" in argv
+    # In full isolation the main container shares the egress-proxy's
+    # user namespace (which IS keep-id) rather than minting its own,
+    # so it owns the shared netns and can mount sysfs (BUG: see
+    # test_build_container_argv_shares_proxy_userns_for_sysfs).
+    assert "--userns=container:peers-egress-proxy_x" in argv
+    assert "--userns=keep-id" not in argv
     # Image is "peers:dev", followed by the entrypoint args
     # (entrypoint is `peers`, so we just pass `run [...]`).
     assert "peers:dev" in argv
@@ -206,8 +249,8 @@ def test_build_container_argv_provides_tmpfs_for_writable_paths(
     write to. Without these, claude/codex (npm, pip, /tmp scratch)
     fail with EROFS mid-tick. Cover at minimum:
       - /tmp                  (scratch for shell tools, codex sessions)
-      - /home/peer/.cache     (pip cache, generic xdg cache)
-      - /home/peer/.npm       (npm install cache)
+      - ~/.cache     (pip cache, generic xdg cache)
+      - ~/.npm       (npm install cache)
     """
     from peers_ctl.runner import _build_container_argv
     from peers_ctl.store import Project
@@ -220,7 +263,7 @@ def test_build_container_argv_provides_tmpfs_for_writable_paths(
         if a == "--tmpfs" and i + 1 < len(argv):
             tmpfs_specs.append(argv[i + 1])
     targets = {spec.split(":", 1)[0] for spec in tmpfs_specs}
-    for required in ("/tmp", "/home/peer/.cache", "/home/peer/.npm"):
+    for required in ("/tmp", "~/.cache", "~/.npm"):
         assert required in targets, (
             f"missing --tmpfs {required} in argv (tmpfs_specs="
             f"{tmpfs_specs!r}, argv={argv!r})"
@@ -360,7 +403,301 @@ def test_build_container_argv_uses_auth_proxy_without_claude_json_mount(
     env_specs = [argv[i + 1] for i, a in enumerate(argv)
                  if a in ("-e", "--env") and i + 1 < len(argv)]
     assert "ANTHROPIC_BASE_URL=http://127.0.0.1:8080" in env_specs
-    assert not any(".claude.json:/home/peer/.claude.json" in a for a in argv)
+    assert not any(".claude.json:~/.claude.json" in a for a in argv)
+
+
+def _write_openrouter_config(target: Path, *, legacy: bool = False) -> None:
+    peer_dir = target / ".peers"
+    peer_dir.mkdir(parents=True, exist_ok=True)
+    if legacy:
+        body = """
+driver: orchestrator
+comm: git
+tools:
+  claude:
+    argv: ["claude", "-p", "{PROMPT}"]
+    prompt_mode: argv-substitute
+    provider: openrouter
+  codex:
+    argv: ["codex", "exec", "{PROMPT}"]
+    prompt_mode: argv-substitute
+budget: {max_iterations: 1, max_runtime_s: 60, max_consecutive_failures: 1}
+health: {idle_timeout_s: 5, absolute_max_runtime_s: 10}
+"""
+    else:
+        body = """
+driver: orchestrator
+comm: git
+peers:
+  - name: claude
+    tool: claude
+    argv: ["claude", "-p", "{PROMPT}"]
+    prompt_mode: argv-substitute
+    provider: openrouter
+  - name: codex
+    tool: codex
+    argv: ["codex", "exec", "{PROMPT}"]
+    prompt_mode: argv-substitute
+budget: {max_iterations: 1, max_runtime_s: 60, max_consecutive_failures: 1}
+health: {idle_timeout_s: 5, absolute_max_runtime_s: 10}
+"""
+    (peer_dir / "config.yaml").write_text(body)
+
+
+def _write_codex_openrouter_custom_env_config(
+    target: Path,
+    env_key: str = "CUSTOM_OR_KEY",
+) -> None:
+    peer_dir = target / ".peers"
+    peer_dir.mkdir(parents=True, exist_ok=True)
+    (peer_dir / "config.yaml").write_text(f"""
+driver: orchestrator
+comm: git
+peers:
+  - name: claude
+    tool: claude
+    argv: ["claude", "-p", "{{PROMPT}}"]
+    prompt_mode: argv-substitute
+  - name: codex
+    tool: codex
+    argv:
+      - codex
+      - exec
+      - -c
+      - model_provider = "openrouter"
+      - -c
+      - model_providers.openrouter.env_key = "{env_key}"
+      - "{{PROMPT}}"
+    prompt_mode: argv-substitute
+    provider: openrouter
+budget: {{max_iterations: 1, max_runtime_s: 60, max_consecutive_failures: 1}}
+health: {{idle_timeout_s: 5, absolute_max_runtime_s: 10}}
+""")
+
+
+def _write_invalid_peer_config(target: Path) -> None:
+    peer_dir = target / ".peers"
+    peer_dir.mkdir(parents=True, exist_ok=True)
+    (peer_dir / "config.yaml").write_text("""
+driver: orchestrator
+comm: git
+peers:
+  - name: claude
+    tool: claude
+    argv: ["claude", "-p", "{PROMPT}"]
+    prompt_mode: argv-substitute
+    provider: openai
+budget: {max_iterations: 1, max_runtime_s: 60, max_consecutive_failures: 1}
+health: {idle_timeout_s: 5, absolute_max_runtime_s: 10}
+""")
+
+
+def _write_minimal_peer_config(target: Path) -> None:
+    peer_dir = target / ".peers"
+    peer_dir.mkdir(parents=True, exist_ok=True)
+    (peer_dir / "config.yaml").write_text("""
+driver: orchestrator
+comm: git
+peers:
+  - name: claude
+    tool: claude
+    argv: ["claude", "-p", "{PROMPT}"]
+    prompt_mode: argv-substitute
+budget: {max_iterations: 1, max_runtime_s: 60, max_consecutive_failures: 1}
+health: {idle_timeout_s: 5, absolute_max_runtime_s: 10}
+""")
+
+
+def _env_specs(argv: list[str]) -> list[str]:
+    return [
+        argv[i + 1] for i, value in enumerate(argv)
+        if value in ("-e", "--env") and i + 1 < len(argv)
+    ]
+
+
+def test_build_proxy_argv_adds_openrouter_runtime_allowlist(tmp_path: Path):
+    from peers_ctl.runner import _build_proxy_argv
+    from peers_ctl.store import Project
+
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_openrouter_config(target)
+    argv = _build_proxy_argv(Project(name="x", path=str(target)))
+
+    assert "PEERS_EGRESS_EXTRA_HOSTS=^openrouter\\.ai$" in _env_specs(argv)
+
+
+def test_build_proxy_argv_detects_openrouter_in_legacy_tools_shape(
+    tmp_path: Path,
+):
+    from peers_ctl.runner import _build_proxy_argv
+    from peers_ctl.store import Project
+
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_openrouter_config(target, legacy=True)
+    argv = _build_proxy_argv(Project(name="x", path=str(target)))
+
+    assert "PEERS_EGRESS_EXTRA_HOSTS=^openrouter\\.ai$" in _env_specs(argv)
+
+
+def test_build_proxy_argv_rejects_invalid_peer_config(tmp_path: Path):
+    from peers_ctl.runner import _build_proxy_argv
+    from peers_ctl.store import Project
+
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_invalid_peer_config(target)
+
+    with pytest.raises(ValueError, match="invalid peer config"):
+        _build_proxy_argv(Project(name="x", path=str(target)))
+
+
+def test_proxy_image_runtime_filter_files_are_wired_together():
+    root = ROOT / "proxy"
+    entrypoint = (root / "entrypoint.sh").read_text()
+    tinyproxy = (root / "tinyproxy.conf").read_text()
+    containerfile = (root / "Containerfile.proxy").read_text()
+
+    assert "PEERS_EGRESS_EXTRA_HOSTS" in entrypoint
+    assert 'Filter "/tmp/tinyproxy-filter"' in tinyproxy
+    assert "entrypoint.sh" in containerfile
+    assert "peers-egress-entrypoint" in containerfile
+
+
+def test_build_container_argv_passes_openrouter_key_name(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_openrouter_config(target)
+    monkeypatch.setattr(r.Path, "home", classmethod(lambda cls: tmp_path))
+    argv = r._build_container_argv(
+        Project(name="x", path=str(target)), max_ticks=1, extra_args=(),
+    )
+
+    env_specs = _env_specs(argv)
+    assert "OPENROUTER_API_KEY" in env_specs
+    assert not any(s.startswith("OPENROUTER_API_KEY=") for s in env_specs)
+
+
+def test_build_container_argv_detects_openrouter_in_legacy_tools_shape(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_openrouter_config(target, legacy=True)
+    monkeypatch.setattr(r.Path, "home", classmethod(lambda cls: tmp_path))
+    argv = r._build_container_argv(
+        Project(name="x", path=str(target)), max_ticks=1, extra_args=(),
+    )
+
+    assert "OPENROUTER_API_KEY" in _env_specs(argv)
+
+
+def test_build_container_argv_passes_custom_openrouter_env_key(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_codex_openrouter_custom_env_config(target)
+    monkeypatch.setattr(r.Path, "home", classmethod(lambda cls: tmp_path))
+
+    argv = r._build_container_argv(
+        Project(name="x", path=str(target)), max_ticks=1, extra_args=(),
+    )
+
+    env_specs = _env_specs(argv)
+    assert "CUSTOM_OR_KEY" in env_specs
+    assert "OPENROUTER_API_KEY" not in env_specs
+
+
+def test_start_project_container_requires_openrouter_key(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from peers_ctl.runner import _start_project_container
+    from peers_ctl.store import Project, Store
+
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_openrouter_config(target)
+    store = Store(tmp_path / "ctl")
+    project = Project(name="x", path=str(target))
+    store.add(project)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+        _start_project_container(
+            store, project, tmp_path / "log.txt", 1, None, (),
+        )
+
+
+def test_start_project_container_requires_custom_openrouter_key(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from peers_ctl.runner import _start_project_container
+    from peers_ctl.store import Project, Store
+
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_codex_openrouter_custom_env_config(target)
+    store = Store(tmp_path / "ctl")
+    project = Project(name="x", path=str(target))
+    store.add(project)
+    monkeypatch.delenv("CUSTOM_OR_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-present")
+
+    with pytest.raises(ValueError, match="CUSTOM_OR_KEY"):
+        _start_project_container(
+            store, project, tmp_path / "log.txt", 1, None, (),
+        )
+
+
+def test_start_project_container_rejects_invalid_peer_config_before_podman(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project, Store
+
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_invalid_peer_config(target)
+    store = Store(tmp_path / "ctl")
+    project = Project(name="x", path=str(target))
+    store.add(project)
+    monkeypatch.setattr(r, "_container_running", lambda _name: False)
+    monkeypatch.setattr(
+        r, "enforce_container_drift_for_modes", lambda _modes: ("ok", ""),
+    )
+    cleanup_called = False
+
+    def fake_cleanup(_name: str) -> None:
+        nonlocal cleanup_called
+        cleanup_called = True
+
+    monkeypatch.setattr(r, "_cleanup_stale_container", fake_cleanup)
+
+    with pytest.raises(ValueError, match="invalid peer config"):
+        r._start_project_container(
+            store, project, tmp_path / "log.txt", 1, None, (),
+        )
+
+    assert cleanup_called is False
 
 
 def test_egress_proxy_can_be_disabled_via_env(
@@ -392,6 +729,109 @@ def test_egress_proxy_can_be_disabled_via_env(
                  if a in ("-e", "--env") and i + 1 < len(argv)]
     assert not any(s.startswith("HTTPS_PROXY=")
                    for s in env_specs), env_specs
+
+
+def test_build_proxy_argv_shares_keep_id_userns(tmp_path: Path) -> None:
+    """Root cause of the full-isolation `runc rc=126: mounting sysfs to
+    /sys: operation not permitted`: the kernel only lets a process mount
+    a fresh sysfs if its user namespace OWNS the network namespace. The
+    egress-proxy is the netns owner for the whole chain (auth + main join
+    it via --network=container:<proxy>). It therefore must carry
+    --userns=keep-id so that the shared userns it creates is the same
+    keep-id mapping the main container needs for /work FS-perm alignment;
+    auth + main then join THIS userns and so own the netns they mount
+    sysfs into."""
+    from peers_ctl.runner import _build_proxy_argv
+    from peers_ctl.store import Project
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    (tmp_path / "tgt").mkdir()
+    argv = _build_proxy_argv(p)
+    assert "--userns=keep-id" in argv, argv
+
+
+def test_build_auth_proxy_argv_shares_proxy_userns(tmp_path: Path) -> None:
+    """The auth-proxy joins the egress-proxy's netns; to mount sysfs it
+    must also join the egress-proxy's USER namespace. --userns=container:
+    and --network=container: must point at the SAME owner."""
+    from peers_ctl.runner import _build_auth_proxy_argv
+    from peers_ctl.store import Project
+    (tmp_path / ".claude.json").write_text("{}")
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    argv = _build_auth_proxy_argv(p, home=tmp_path)
+    assert "--userns=container:peers-egress-proxy_x" in argv, argv
+    assert "--network=container:peers-egress-proxy_x" in argv, argv
+
+
+def test_build_auth_proxy_argv_owns_userns_when_egress_disabled(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """With egress disabled but auth enabled, the auth-proxy becomes the
+    head of the chain (main joins ITS netns). It must own a keep-id
+    userns so the main container can share it and mount sysfs."""
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+    monkeypatch.setattr(r, "EGRESS_PROXY_DISABLED", True)
+    (tmp_path / ".claude.json").write_text("{}")
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    argv = r._build_auth_proxy_argv(p, home=tmp_path)
+    assert "--userns=keep-id" in argv, argv
+    assert not any(a.startswith("--userns=container:") for a in argv), argv
+
+
+def test_build_container_argv_shares_proxy_userns_for_sysfs(
+    tmp_path: Path,
+) -> None:
+    """Full isolation: the main container must share the egress-proxy's
+    userns+netns (NOT mint its own keep-id userns), otherwise it doesn't
+    own the joined netns and `runc create` fails mounting sysfs to /sys
+    (rc=126). The userns and network owners must match."""
+    from peers_ctl.runner import _build_container_argv
+    from peers_ctl.store import Project
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    (tmp_path / "tgt").mkdir()
+    argv = _build_container_argv(p, max_ticks=1, extra_args=())
+    assert "--userns=container:peers-egress-proxy_x" in argv, argv
+    assert "--network=container:peers-egress-proxy_x" in argv, argv
+    # Must NOT also carry a standalone keep-id (that mints a separate
+    # userns and reintroduces the bug).
+    assert "--userns=keep-id" not in argv, argv
+
+
+def test_build_container_argv_shares_auth_userns_when_egress_disabled(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Egress disabled + auth enabled: main joins the auth-proxy's netns,
+    so it must share the auth-proxy's userns too (same sysfs rule)."""
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+    monkeypatch.setattr(r, "EGRESS_PROXY_DISABLED", True)
+    monkeypatch.setattr(r.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(r, "AUTH_PROXY_DISABLED", False)
+    (tmp_path / ".claude.json").write_text("{}")
+    (tmp_path / "tgt").mkdir()
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    argv = r._build_container_argv(p, max_ticks=1, extra_args=())
+    assert "--userns=container:peers-auth-proxy_x" in argv, argv
+    assert "--network=container:peers-auth-proxy_x" in argv, argv
+    assert "--userns=keep-id" not in argv, argv
+
+
+def test_build_container_argv_keeps_keep_id_in_full_bypass(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Egress disabled + auth disabled: the main container owns its own
+    netns (PODMAN_NETWORK or default slirp), so a self-minted keep-id
+    userns DOES own that netns — sysfs mounts fine. Keep keep-id here."""
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+    monkeypatch.setattr(r, "EGRESS_PROXY_DISABLED", True)
+    monkeypatch.setattr(r, "AUTH_PROXY_DISABLED", True)
+    monkeypatch.setattr(r.Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "tgt").mkdir()
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    argv = r._build_container_argv(p, max_ticks=1, extra_args=())
+    assert "--userns=keep-id" in argv, argv
+    assert not any(a.startswith("--userns=container:") for a in argv), argv
 
 
 def test_parse_truthy_env_recognizes_off_variants() -> None:
@@ -449,8 +889,8 @@ def test_start_project_container_writes_starttime(tmp_path: Path,
     cfg = tmp_path / "ctl"
     store = Store(cfg)
     target = tmp_path / "tgt"
-    (target / ".peers").mkdir(parents=True)
-    (target / ".peers" / "config.yaml").write_text("driver: orchestrator\n")
+    target.mkdir()
+    _write_minimal_peer_config(target)
     store.add(Project(name="x", path=str(target)))
 
     # Stub podman: Phase-3i uses `podman run -d` (exits ~immediately
@@ -498,8 +938,8 @@ def test_start_project_container_refuses_running_same_name(
     cfg = tmp_path / "ctl"
     store = Store(cfg)
     target = tmp_path / "tgt"
-    (target / ".peers").mkdir(parents=True)
-    (target / ".peers" / "config.yaml").write_text("driver: orchestrator\n")
+    target.mkdir()
+    _write_minimal_peer_config(target)
     store.add(Project(name="x", path=str(target)))
 
     stub = tmp_path / "podman_stub.sh"
@@ -552,8 +992,8 @@ def test_start_project_container_refuses_major_version_drift(
     cfg = tmp_path / "ctl"
     store = Store(cfg)
     target = tmp_path / "tgt"
-    (target / ".peers").mkdir(parents=True)
-    (target / ".peers" / "config.yaml").write_text("driver: orchestrator\n")
+    target.mkdir()
+    _write_minimal_peer_config(target)
     store.add(Project(name="x", path=str(target)))
 
     import peers_ctl.runner as runner_mod
@@ -574,8 +1014,8 @@ def test_start_project_container_warns_on_minor_version_drift(
     cfg = tmp_path / "ctl"
     store = Store(cfg)
     target = tmp_path / "tgt"
-    (target / ".peers").mkdir(parents=True)
-    (target / ".peers" / "config.yaml").write_text("driver: orchestrator\n")
+    target.mkdir()
+    _write_minimal_peer_config(target)
     store.add(Project(name="x", path=str(target)))
 
     stub = tmp_path / "podman_stub.sh"
@@ -616,8 +1056,8 @@ def test_start_project_container_cleans_up_when_registry_update_fails(
     cfg = tmp_path / "ctl"
     store = Store(cfg)
     target = tmp_path / "tgt"
-    (target / ".peers").mkdir(parents=True)
-    (target / ".peers" / "config.yaml").write_text("driver: orchestrator\n")
+    target.mkdir()
+    _write_minimal_peer_config(target)
     store.add(Project(name="x", path=str(target)))
 
     stub = tmp_path / "podman_stub.sh"

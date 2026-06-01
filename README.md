@@ -1,7 +1,29 @@
 # peers
 
-A small Python substrate that drives **n ≥ 2** AI coding CLIs (Claude
-Code, Codex, …) as cooperating peers toward measurable project goals.
+**Two AI coding agents are better than one — if you make them prove it.**
+
+peers drives **n ≥ 2** AI coding CLIs (Claude Code, Codex, …) as cooperating
+peers that don't just *agree* a task is done — they have to clear **hard,
+measurable gates** first: tests pass, coverage holds, no regression, no
+TODO/stub/skipped-test, secrets clean. One peer implements, the **other
+blind-reviews** (without seeing the first's notes), and an **adversarial
+skeptic** re-audits before any "done" is accepted. Runs **unattended**,
+**budget-capped**, and **container-sandboxed**.
+
+**Why it beats a single agent on a loop:**
+
+- **Gated, not vibes-based.** "Looks done" never converges — *gates green +
+  skeptic-clean* does. No convergence theater.
+- **Blind peer review catches rubber-stamping** — an independent second pair
+  of eyes, by construction.
+- **An adversarial skeptic hunts the edge cases** your tests miss.
+- **Unattended & safe:** idle-timeout supervision, USD/tick budget caps,
+  rootless cap-dropped container, egress allow-listing.
+
+In an instrumented diagnostic, peers built an expression-language interpreter
+both greenfield and brownfield to **0 defects over 50,000 random test
+programs** — catching planted regressions and self-finding edge-case bugs the
+acceptance suite never probed.
 
 > Deutsche Version: [README_DE.md](README_DE.md).
 
@@ -97,21 +119,21 @@ peers-ctl start mything --max-ticks 20 --max-usd 5
 
 Modes are baked into `.peers/goals.yaml` at scaffold-time. To re-run
 the SAME project with a DIFFERENT mode set (e.g. you ran `audit` first
-and now want `security-devils-advocate` on top):
+and now want `audit,thorough` on top):
 
 ```sh
 # Variant 1: re-init in place (DESTRUCTIVE — overwrites goals.yaml + checks)
 peers-ctl new mything /path/to/your-project \
-  --modes=audit,security-devils-advocate --force
+  --modes=audit,thorough --force
 # Then start as usual:
 peers-ctl start mything --container --max-ticks 30
 
 # Variant 2: separate worktree (NON-DESTRUCTIVE, recommended)
 git -C /path/to/your-project worktree add \
-  /path/to/your-project-devils HEAD
-peers-ctl new mything-devils /path/to/your-project-devils \
-  --container --modes=audit,security-devils-advocate
-peers-ctl start --container mything-devils
+  /path/to/your-project-thorough HEAD
+peers-ctl new mything-thorough /path/to/your-project-thorough \
+  --container --modes=audit,thorough
+peers-ctl start --container mything-thorough
 # Cherry-pick the substantive fixes back to your main worktree when done.
 ```
 
@@ -505,14 +527,14 @@ with `--live` to redraw that detail view.
 Example `peers-ctl doctor` output:
 
 ```
-peers-ctl doctor — 3 project(s) registered, config dir /home/me/.config/peers-ctl
+peers-ctl doctor — 3 project(s) registered, config dir ~/.config/peers-ctl
 
-  [ok] snake                /home/me/code/snake
+  [ok] snake                ~/code/snake
            2 peer(s), 5 goal(s)
   [ok] cpu-emu              /tmp/peers-dogfood-r2/cpu-emu
            2 peer(s), 8 goal(s)
-  [FAIL] freshproject       /home/me/code/freshproject
-           missing /home/me/code/freshproject/.peers/config.yaml
+  [FAIL] freshproject       ~/code/freshproject
+           missing ~/code/freshproject/.peers/config.yaml
 
 Warnings:
   - `codex` is not on PATH. If any project uses it, either add it to PATH
@@ -533,11 +555,16 @@ neutral about names; pick what you want.
 peers:
   - name: claude
     tool: claude
+    model: opus        # optional; omit to use CLI default
+    reasoning: high    # claude: low|medium|high|xhigh|max
     argv: ["claude", "-p", "--dangerously-skip-permissions", "{PROMPT}"]
     prompt_mode: argv-substitute
 
   - name: codex
     tool: codex
+    model: gpt-5.1-codex-max
+    reasoning: xhigh   # codex: minimal|low|medium|high|xhigh
+    provider: openai   # openai|openrouter
     argv: ["codex", "exec", "{PROMPT}"]
     prompt_mode: argv-substitute
 
@@ -550,6 +577,24 @@ peers:
 
 The legacy `tools: {claude: …, codex: …}` mapping is still loaded for
 back-compat and auto-promoted to the new shape.
+
+`model`, `reasoning`, and `provider` are optional convenience fields.
+Explicit `argv` switches still win. To scaffold them without editing
+YAML:
+
+```sh
+peers-ctl new myapp --modes=audit \
+  --peer-model claude=opus \
+  --peer-provider codex=openrouter \
+  --peer-model codex=~openai/gpt-latest \
+  --peer-reasoning codex=xhigh
+```
+
+For OpenRouter, export `OPENROUTER_API_KEY` before `peers run`,
+`peers tick`, `peers tmux up`, or `peers-ctl start`; these commands fail
+early if the key is missing. Container mode passes the key name through
+and opens only `openrouter.ai` in the egress proxy allow-list for projects
+that opt in.
 
 ## Reviewer modes (soft goals)
 
@@ -581,8 +626,8 @@ podman build --network=host -f Containerfile -t peers:dev .
 podman run --rm -it --userns=keep-id --cap-drop=ALL \
     --security-opt=no-new-privileges \
     -v $PWD:/work \
-    -v $HOME/.claude:/home/peer/.claude \
-    -v $HOME/.codex:/home/peer/.codex \
+    -v $HOME/.claude:~/.claude \
+    -v $HOME/.codex:~/.codex \
     peers:dev run
 ```
 

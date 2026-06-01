@@ -72,10 +72,46 @@ for line in plan_text.splitlines():
 
 touches_re = re.compile(r"^\s*-\s*touches:\s*(.+?)\s*$")
 
+import os
+
+# Identify the CURRENT committer by peer name, not git author email. Both
+# peers usually commit under one shared container git identity, so an email
+# comparison cannot tell them apart. The orchestrator exports PEERS_PEER_NAME
+# into each peer's process; the hook (a child of that process) inherits it.
+# Fall back to the git author email when the env var is absent (e.g. a
+# hand-made commit outside the loop).
+_peer_env = os.environ.get("PEERS_PEER_NAME", "").strip()
 current_email = subprocess.run(
     ["git", "config", "user.email"],
     capture_output=True, text=True,
 ).stdout.strip()
+current_id = f"peer:{_peer_env.lower()}" if _peer_env else f"email:{current_email}"
+
+_peer_trailer_re = re.compile(r"^Peer:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
+
+
+def _impl_identity(path):
+    """Peer identity (Peer: trailer, else email:<author>) of the last commit
+    that modified ``path``."""
+    sha = subprocess.run(
+        ["git", "log", "-1", "--format=%H", "--", path],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if not sha:
+        return ""
+    body = subprocess.run(
+        ["git", "log", "-1", "--format=%B", sha],
+        capture_output=True, text=True,
+    ).stdout
+    m = _peer_trailer_re.search(body)
+    if m:
+        return f"peer:{m.group(1).lower()}"
+    ae = subprocess.run(
+        ["git", "log", "-1", "--format=%ae", sha],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return f"email:{ae}" if ae else ""
+
 
 violations = []
 for sid in sorted(checkoffs):
@@ -99,16 +135,12 @@ for sid in sorted(checkoffs):
         )
         continue
     for tf in touches_files:
-        res = subprocess.run(
-            ["git", "log", "-1", "--format=%ae", "--", tf],
-            capture_output=True, text=True,
-        )
-        last_author = res.stdout.strip()
-        if not last_author:
+        impl_id = _impl_identity(tf)
+        if not impl_id:
             # File new in this commit or not yet tracked — can't enforce
             continue
-        if last_author == current_email:
-            violations.append((sid, tf, last_author, current_email))
+        if impl_id == current_id:
+            violations.append((sid, tf, impl_id, current_id))
 
 if violations:
     print("REJECTED: reviewer-only-checkoff violation", file=sys.stderr)

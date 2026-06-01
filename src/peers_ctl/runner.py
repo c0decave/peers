@@ -28,7 +28,19 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Sequence
 
-from peers.safe_io import _ensure_private_dir, open_text_in_dir_no_symlink
+import yaml
+
+from peers.budget_accountant import OPERATOR_BUDGET_OVERRIDE_FILE
+from peers.model_provider import (
+    OPENROUTER_EXTRA_HOST_RE,
+    required_peer_runtime_env_keys,
+)
+from peers.peer_spec import load_peer_specs
+from peers.safe_io import (
+    _ensure_private_dir,
+    open_text_in_dir_no_symlink,
+    read_text_no_symlink,
+)
 from peers_ctl.store import Project, Store, is_pid_alive
 
 
@@ -390,6 +402,59 @@ def _auth_proxy_was_used(project: Project) -> bool:
     return "auth_proxy=1" in (project.notes or "") or _auth_proxy_enabled()
 
 
+def _project_uses_openrouter(project: Project) -> bool:
+    specs = _load_project_peer_specs(project)
+    return bool(specs) and any(spec.provider == "openrouter" for spec in specs)
+
+
+def _load_project_peer_specs(project: Project):
+    cfg_path = Path(project.path) / ".peers" / "config.yaml"
+    if not cfg_path.exists():
+        return None
+    try:
+        raw = read_text_no_symlink(cfg_path)
+        cfg = yaml.safe_load(raw)
+    except OSError as e:
+        raise ValueError(f"cannot read {cfg_path}: {e}") from e
+    except yaml.YAMLError as e:
+        raise ValueError(f"cannot parse {cfg_path}: {e}") from e
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{cfg_path} top-level must be a mapping")
+    try:
+        return load_peer_specs(cfg)
+    except ValueError as e:
+        raise ValueError(f"invalid peer config {cfg_path}: {e}") from e
+
+
+def _egress_extra_allow_hosts(project: Project) -> tuple[str, ...]:
+    if _project_uses_openrouter(project):
+        return (OPENROUTER_EXTRA_HOST_RE,)
+    return ()
+
+
+def _require_openrouter_env_for_container(project: Project) -> None:
+    required_keys = _project_provider_env_keys(project)
+    if not required_keys:
+        return
+    missing = [
+        key for key in required_keys
+        if not os.environ.get(key, "").strip()
+    ]
+    if missing:
+        joined = ", ".join(missing)
+        raise ValueError(
+            f"project {project.name!r} uses provider: openrouter; export "
+            f"{joined} before `peers-ctl start --container`"
+        )
+
+
+def _project_provider_env_keys(project: Project) -> tuple[str, ...]:
+    specs = _load_project_peer_specs(project)
+    if not specs:
+        return ()
+    return required_peer_runtime_env_keys(specs)
+
+
 def _build_proxy_argv(project: Project) -> list[str]:
     """Compose a `podman run -d` invocation for the egress-proxy
     sidecar. The proxy is a security component — it has no business
@@ -417,6 +482,18 @@ def _build_proxy_argv(project: Project) -> list[str]:
     argv = [
         PODMAN_CMD, "run", "-d", "--rm",
         "--name", _proxy_container_name(project),
+        # The egress-proxy is the network-namespace OWNER for the whole
+        # sidecar chain: the auth-proxy and the main container both join
+        # its netns via --network=container:<proxy>. The kernel only
+        # permits mounting a fresh sysfs at /sys if the caller's USER
+        # namespace owns that netns. So the proxy creates the shared
+        # userns here with keep-id (the same host-uid mapping the main
+        # container needs for /work FS-perm alignment); auth + main join
+        # THIS userns. Without it, the main container minted its own
+        # keep-id userns, did not own the joined netns, and `runc create`
+        # failed with `mounting sysfs to /sys: operation not permitted`
+        # (rc=126) — the full-isolation start was unusable.
+        "--userns=keep-id",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
         "--read-only",
@@ -441,6 +518,9 @@ def _build_proxy_argv(project: Project) -> list[str]:
     # reachable only by the pair, not other host users.
     if EGRESS_PROXY_NETWORK:
         argv.append(f"--network={EGRESS_PROXY_NETWORK}")
+    extra_hosts = _egress_extra_allow_hosts(project)
+    if extra_hosts:
+        argv += ["-e", f"PEERS_EGRESS_EXTRA_HOSTS={','.join(extra_hosts)}"]
     argv.append(EGRESS_PROXY_IMAGE)
     return argv
 
@@ -460,9 +540,19 @@ def _build_auth_proxy_argv(project: Project, home: Path | None = None) -> list[s
         "-v", f"{token_file}:/auth/.claude.json",
     ]
     if EGRESS_PROXY_DISABLED:
+        # No egress proxy → the auth-proxy is the head of the chain that
+        # the main container joins. It must own a keep-id userns so the
+        # main container can share it and mount sysfs (unless host net is
+        # forced, in which case sysfs is bind-mounted from the host and
+        # userns ownership is moot — keep-id is harmless either way).
+        argv.append("--userns=keep-id")
         if PODMAN_NETWORK:
             argv.append(f"--network={PODMAN_NETWORK}")
     else:
+        # Share BOTH the egress-proxy's userns and netns. They must point
+        # at the same owner so the auth-proxy owns the netns it mounts
+        # sysfs into (see _build_proxy_argv for the sysfs/userns rule).
+        argv.append(f"--userns=container:{_proxy_container_name(project)}")
         argv.append(f"--network=container:{_proxy_container_name(project)}")
         argv += [
             "-e", f"HTTPS_PROXY={EGRESS_PROXY_URL}",
@@ -625,7 +715,10 @@ def _build_container_argv(project: Project,
     argv = [
         PODMAN_CMD, "run", "-d", "--rm",
         "--name", _container_name(project),
-        "--userns=keep-id",
+        # NOTE: the user namespace is selected per network-mode below,
+        # NOT here. When the container joins a sidecar's netns it must
+        # share THAT sidecar's userns (so it owns the netns and can mount
+        # sysfs); only when it owns its own netns does it mint keep-id.
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
         # raise pids cgroup limit (podman default 2048). The
@@ -643,29 +736,29 @@ def _build_container_argv(project: Project,
         # class (prompt-injection cannot drop binaries into /usr,
         # /etc, /var). tmpfs targets cover paths real workloads write:
         #   /tmp                  scratch for shell tools, codex temp
-        #   /home/peer/.cache     pip / xdg cache
-        #   /home/peer/.npm       npm install cache
+        #   ~/.cache     pip / xdg cache
+        #   ~/.npm       npm install cache
         # nosuid+nodev on every tmpfs prevents mode-escalation if the
         # rootfs is later opened up.
         "--read-only",
         # B108: container-internal mount destinations, not host paths.
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",  # nosec B108
-        "--tmpfs", "/home/peer/.cache:rw,nosuid,nodev,size=256m",
-        "--tmpfs", "/home/peer/.npm:rw,nosuid,nodev,size=128m",
+        "--tmpfs", "~/.cache:rw,nosuid,nodev,size=256m",
+        "--tmpfs", "~/.npm:rw,nosuid,nodev,size=128m",
         "-v", f"{Path(project.path).resolve()}:/work",
-        "-v", f"{home / '.claude'}:/home/peer/.claude",
-        "-v", f"{home / '.codex'}:/home/peer/.codex",
+        "-v", f"{home / '.claude'}:~/.claude",
+        "-v", f"{home / '.codex'}:~/.codex",
     ]
     # Legacy mode: claude reads its main config from ~/.claude.json.
     # In the hardened default, only the auth-proxy sidecar gets that
     # rw mount and the workspace receives ANTHROPIC_BASE_URL instead.
     if (not auth_proxy) and (home / ".claude.json").is_file():
         argv += ["-v",
-                 f"{home / '.claude.json'}:/home/peer/.claude.json"]
+                 f"{home / '.claude.json'}:~/.claude.json"]
     # Per-user git identity so peer commits have a sensible author.
     if (home / ".gitconfig").is_file():
         argv += ["-v",
-                 f"{home / '.gitconfig'}:/home/peer/.gitconfig:ro"]
+                 f"{home / '.gitconfig'}:~/.gitconfig:ro"]
     # Phase-2 hardening B2: route the peers container through the
     # egress-proxy sidecar by sharing its network namespace. The
     # sidecar allow-lists outbound HTTPS to LLM API hostnames; all
@@ -674,12 +767,27 @@ def _build_container_argv(project: Project,
     # route via the sidecar. NO_PROXY=localhost keeps loopback
     # direct so peer<->proxy itself doesn't loop.
     if EGRESS_PROXY_DISABLED and auth_proxy:
-        argv += [f"--network=container:{_auth_proxy_container_name(project)}"]
+        # Joins the auth-proxy's netns → must share the auth-proxy's
+        # userns too, so it owns the netns and can mount sysfs.
+        argv += [
+            f"--userns=container:{_auth_proxy_container_name(project)}",
+            f"--network=container:{_auth_proxy_container_name(project)}",
+        ]
     elif EGRESS_PROXY_DISABLED:
+        # Owns its own netns (PODMAN_NETWORK or default slirp/pasta), so a
+        # self-minted keep-id userns DOES own that netns — sysfs is fine.
+        argv += ["--userns=keep-id"]
         if PODMAN_NETWORK:
             argv += [f"--network={PODMAN_NETWORK}"]
     else:
-        argv += [f"--network=container:{_proxy_container_name(project)}"]
+        # Full isolation: share BOTH the egress-proxy's userns and netns
+        # (same owner) so the container owns the joined netns and can
+        # mount sysfs. The shared userns is the proxy's keep-id mapping,
+        # so /work FS-perm alignment is preserved.
+        argv += [
+            f"--userns=container:{_proxy_container_name(project)}",
+            f"--network=container:{_proxy_container_name(project)}",
+        ]
         argv += [
             "-e", f"HTTPS_PROXY={EGRESS_PROXY_URL}",
             "-e", f"HTTP_PROXY={EGRESS_PROXY_URL}",
@@ -687,6 +795,8 @@ def _build_container_argv(project: Project,
         ]
     if auth_proxy:
         argv += ["-e", f"ANTHROPIC_BASE_URL={AUTH_PROXY_URL}"]
+    for env_key in _project_provider_env_keys(project):
+        argv += ["-e", env_key]
     argv += [CONTAINER_IMAGE, "run"]
     if max_ticks is not None:
         argv += ["--max-ticks", str(max_ticks)]
@@ -757,19 +867,67 @@ def _write_state(project: Project, state: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _budget_override_path(project: Project) -> Path:
+    return Path(project.path) / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE
+
+
+def _persist_budget_override(project: Project, **caps: int) -> None:
+    """Merge operator cap overrides into `.peers/budget-overrides.json`.
+
+    This sidecar is what makes `--max-runtime` actually stick: the inner
+    loop re-overlays config.yaml's caps onto state.budget on every start
+    (clobbering any value we write to state.json), then re-applies this
+    sidecar on top. Writing it here also fixes the first-start case —
+    state.json does not exist yet on a freshly-init'd project, so a
+    state-only write silently dropped the override.
+    """
+    path = _budget_override_path(project)
+    existing: dict[str, object] = {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            existing = loaded
+    except (OSError, ValueError):
+        existing = {}
+    existing.update(caps)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(existing, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def _clear_budget_override(project: Project) -> None:
+    try:
+        _budget_override_path(project).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _apply_budget_overrides(
     project: Project, max_runtime_s: int | None, reset_budget: bool,
 ) -> None:
-    """Mutate `.peers/state.json` to honour operator-supplied budget
-    flags BEFORE the peers process is spawned. No-op when both flags
-    are inactive. If state.json is missing, this is a no-op too —
-    the inner loop's _overlay_config_limits will pick the
-    config.yaml defaults instead.
+    """Honour operator-supplied budget flags BEFORE the peers process is
+    spawned. No-op when both flags are inactive.
+
+    `--max-runtime` is persisted to the `.peers/budget-overrides.json`
+    sidecar (so it survives the inner loop's config.yaml overlay AND works
+    before state.json exists), and mirrored into state.json when present so
+    the pre-flight budget-exhausted check and `peers-ctl peek` see it
+    immediately. `--reset-budget` clears the sidecar (back to config
+    defaults) and zeroes the spent counters in state.json.
     """
     if max_runtime_s is None and not reset_budget:
         return
+    if reset_budget:
+        # Returning to config defaults: drop any persisted cap override.
+        _clear_budget_override(project)
+    if max_runtime_s is not None:
+        _persist_budget_override(project, max_runtime_s=max_runtime_s)
     state = _read_state(project)
     if state is None:
+        # First start of a freshly-init'd project: state.json doesn't
+        # exist yet. The sidecar above already carries the override; the
+        # orchestrator applies it after building initial state.
         return
     budget = state.setdefault("budget", {})
     if reset_budget:
@@ -901,6 +1059,7 @@ def _start_project_container(
     drift_level, drift_msg = enforce_container_drift_for_modes(project_modes)
     if drift_level == "warn" and drift_msg:
         print(f"peers-ctl: warning: {drift_msg}", file=sys.stderr)
+    _require_openrouter_env_for_container(project)
     _cleanup_stale_container(cname)
     try:
         # Phase-2 hardening B2: bring the egress-proxy sidecar up FIRST,

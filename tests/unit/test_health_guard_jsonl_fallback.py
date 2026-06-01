@@ -8,7 +8,7 @@ from peers.health_guard import claude_session_jsonl_path, jsonl_mtime_within
 def test_claude_session_jsonl_path_encodes_absolute_cwd(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    path = claude_session_jsonl_path("/mnt/ext/home/user/c0de/project")
+    path = claude_session_jsonl_path("/mnt/ext~/c0de/project")
 
     assert path == (
         tmp_path / ".claude" / "projects"

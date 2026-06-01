@@ -110,7 +110,13 @@ Abschnitt **Bekannte Lücken** lesen.
   `Authorization: Bearer ...`.
 - **Refresh on 401** — Token wird aus der gemounteten Datei erneuert und
   die API-Anfrage einmal wiederholt. Endpoint kommt aus
-  `AUTH_PROXY_OAUTH_TOKEN_URL` oder `tokenUrl`.
+  `AUTH_PROXY_OAUTH_TOKEN_URL` oder `tokenUrl`. Der Endpoint muss eine
+  `https://`-URL sein, damit der `refresh_token` nie im Klartext an einen
+  Off-Box-Host geht; `http://` ist nur für die Loopback-Hosts `127.0.0.1`,
+  `::1` und `localhost` erlaubt (RFC 8252 §7.3) — die verlassen die
+  Maschine nie und erlauben lokalen Dev/Integration-Tests den Flow ohne
+  TLS. Eine fehlerhafte URL wird gleich behandelt (strukturierter Fehler,
+  kein Crash).
 - **Read-only rootfs mit expliziten Schreibpfaden** — nur `/tmp` und
   `/auth` sind als tmpfs beschreibbar. Token-Refresh nutzt normal
   atomic replace; Datei-Bindmounts fallen auf fsync'd In-place-Rewrite
@@ -123,10 +129,10 @@ Abschnitt **Bekannte Lücken** lesen.
 
 - **`cap-drop=ALL + no-new-privileges`** — keine privileged Ops, keine
   suid-Eskalation.
-- **`userns=keep-id`** — UID 1000 innen entspricht UID 1000 außen.
+- **`userns` mit dem netns-Owner geteilt** — die rootless-Mapping (UID 1000 innen = 1000 außen, `keep-id`) wird vom **egress-Proxy** (dem Owner des network namespace) erzeugt. Auth-Proxy und Main-Container joinen ihn via `--userns=container:<egress-proxy>`, sodass alle drei *einen* user namespace teilen. Das ist zwingend: Der Kernel erlaubt das Mounten eines frischen `sysfs` auf `/sys` nur, wenn der eigene user namespace den geteilten network namespace *besitzt* — ein Main-Container mit eigenem `keep-id`-userns scheiterte daher an `runc create` mit `mounting sysfs to /sys: operation not permitted` (rc=126). In den Bypass-/Host-Net-Modi besitzt der Container seinen eigenen netns und behält ein selbst erzeugtes `keep-id`.
 - **`--read-only` rootfs** — keine Persistenz in `/usr`, `/etc`, `/var`.
-- **Explizite `--tmpfs`** für `/tmp`, `/home/peer/.cache`,
-  `/home/peer/.npm`, jeweils `nosuid,nodev`.
+- **Explizite `--tmpfs`** für `/tmp`, `~/.cache`,
+  `~/.npm`, jeweils `nosuid,nodev`.
 - **Netzwerk via Egress-Proxy** — `--network=container:peers-egress-proxy_<project>`
   plus `HTTPS_PROXY`.
 - **Kein `~/.claude.json` im Workspace bei aktivem Auth-Proxy** —
@@ -144,7 +150,10 @@ Abschnitt **Bekannte Lücken** lesen.
 
 ## Erforderliche Outbound-Domains
 
-Kanonische Quelle ist [`proxy/filter-allow.txt`](../proxy/filter-allow.txt).
+Kanonische Basis-Allowlist ist
+[`proxy/filter-allow.txt`](../proxy/filter-allow.txt). Projektbezogene
+Runtime-Erweiterungen, aktuell OpenRouter, werden via
+`PEERS_EGRESS_EXTRA_HOSTS` injiziert und nicht vom Host gemountet.
 
 ### Erforderlich
 
@@ -153,6 +162,12 @@ Kanonische Quelle ist [`proxy/filter-allow.txt`](../proxy/filter-allow.txt).
 | `api.anthropic.com` | claude CLI / Auth-Proxy | Anthropic Messages API | Nein |
 | `chatgpt.com` + `*.chatgpt.com` | codex CLI | Subscription/WebSocket/OAuth Flow | kontrolliert durch OpenAI-Account |
 | `api.openai.com` | codex CLI | API-Key-Pfad | Nein |
+
+### Runtime-Erweiterungen (nur bei opt-in-Projekten)
+
+| Host | Trigger | Zweck | Multi-Tenant? |
+|---|---|---|---|
+| `openrouter.ai` | Peer mit `provider: openrouter` | OpenRouter-Gateway für Claude-/Codex-kompatible Modelle | Kein user-kontrolliertes Subdomain-Wildcard; exakter Host |
 
 ### Spekulativ / aktuell nicht erlaubt
 

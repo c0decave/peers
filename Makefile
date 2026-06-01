@@ -60,8 +60,8 @@ run:
 		--cap-drop=ALL \
 		--security-opt=no-new-privileges \
 		-v $(TARGET):/work \
-		-v $(HOST_HOME)/.claude:/home/peer/.claude \
-		-v $(HOST_HOME)/.codex:/home/peer/.codex \
+		-v $(HOST_HOME)/.claude:~/.claude \
+		-v $(HOST_HOME)/.codex:~/.codex \
 		$(IMAGE) $(ARGS)
 
 ## init-target    — run `peers init` inside TARGET
@@ -80,8 +80,8 @@ shell:
 		--cap-drop=ALL \
 		--security-opt=no-new-privileges \
 		-v $(TARGET):/work \
-		-v $(HOST_HOME)/.claude:/home/peer/.claude \
-		-v $(HOST_HOME)/.codex:/home/peer/.codex \
+		-v $(HOST_HOME)/.claude:~/.claude \
+		-v $(HOST_HOME)/.codex:~/.codex \
 		--entrypoint bash $(IMAGE)
 
 ## hooks-install  — install local pre-push checks

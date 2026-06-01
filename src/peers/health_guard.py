@@ -535,6 +535,7 @@ class HealthGuard:
         halt_patterns: Sequence[str] | None = None,
         poll_interval_s: float = 0.25,
         buf_cap_bytes: int = _BUF_SOFT_CAP_BYTES,
+        extra_env: dict[str, str] | None = None,
     ) -> RunResult:
         if prompt_mode == "argv-substitute":
             effective_argv = [a.replace("{PROMPT}", prompt) for a in argv]
@@ -560,6 +561,9 @@ class HealthGuard:
         # prefers them when both classes could match the same line.
         combined_patterns = compiled_halt_patterns + compiled_patterns
         halt_pattern_strs = {p.pattern for p in compiled_halt_patterns}
+        child_env = None
+        if extra_env:
+            child_env = {**os.environ, **extra_env}
 
         t0 = time.monotonic()
         try:
@@ -578,6 +582,7 @@ class HealthGuard:
                 # with the peer, so a stray pkill from claude-code's
                 # node subprocess SIGTERMs PID 1.
                 start_new_session=True,
+                env=child_env,
             )
         except (FileNotFoundError, PermissionError, OSError) as e:
             return RunResult(

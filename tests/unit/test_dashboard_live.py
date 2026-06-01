@@ -441,7 +441,7 @@ def test_dashboard_soft_goal_passed_tolerates_non_list_history_BUG_205():
     from peers.goals import Goal
 
     goal = Goal(
-        gid="soft-quorum",
+        id="soft-quorum",
         type="soft",
         reviewer="quorum",
         quorum_num=2,

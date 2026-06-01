@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -144,7 +145,15 @@ def _format_duration(ms: object) -> str:
     Keeps the raw ms value so existing tooling that greps for it still
     works, but appends a parenthetical seconds rounding for readability.
     """
+    if isinstance(ms, bool):
+        # bool is a subclass of int; rendering True as "1ms" surprises
+        # readers more than rejecting it.
+        return "-"
     if isinstance(ms, (int, float)) and ms >= 0:
+        # int(inf) raises OverflowError; runs.jsonl produced with
+        # allow_nan=True can contain Infinity literals.
+        if isinstance(ms, float) and not math.isfinite(ms):
+            return "-"
         if ms >= 1000:
             return f"{int(ms)}ms ({ms / 1000:.2f}s)"
         return f"{int(ms)}ms"

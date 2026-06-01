@@ -213,3 +213,51 @@ def test_multiple_checkoffs_one_violation_rejects_all(tmp_path):
         "checkoff both",
     )
     assert sha2 == ""  # rejected
+
+
+# --- shared git identity: hook keys on PEERS_PEER_NAME + Peer: trailer -----
+import os  # noqa: E402
+
+
+def _commit_peer(tmp_path: Path, peer: str, files: list[str], message: str) -> str:
+    """Commit under a single shared git identity, tagging the peer via the
+    PEERS_PEER_NAME env var (which the hook reads) and a `Peer:` trailer."""
+    _git(tmp_path, "config", "user.email", "dash@localhost.local")
+    _git(tmp_path, "config", "user.name", "dash")
+    if files:
+        _git(tmp_path, "add", *files)
+    env = {**os.environ, "PEERS_PEER_NAME": peer}
+    res = subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-q", "-m",
+         f"{message}\n\nPeer: {peer}"],
+        capture_output=True, text=True, env=env,
+    )
+    if res.returncode != 0:
+        return ""
+    return _git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_shared_identity_self_checkoff_rejected(tmp_path):
+    _setup_repo_with_hook(tmp_path)
+    src = tmp_path / "src" / "auth.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def auth(): pass")
+    _write_plan(tmp_path, "- [ ] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    assert _commit_peer(tmp_path, "claude", ["src/auth.py", "PLAN.md"], "impl")
+    # claude tries to check off its own work, same shared git identity
+    _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    sha = _commit_peer(tmp_path, "claude", ["PLAN.md"], "self-checkoff")
+    assert sha == ""  # REJECTED despite shared git author
+
+
+def test_shared_identity_other_checkoff_allowed(tmp_path):
+    _setup_repo_with_hook(tmp_path)
+    src = tmp_path / "src" / "auth.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def auth(): pass")
+    _write_plan(tmp_path, "- [ ] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    assert _commit_peer(tmp_path, "claude", ["src/auth.py", "PLAN.md"], "impl")
+    # codex checks off — different peer, same shared git identity
+    _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    sha = _commit_peer(tmp_path, "codex", ["PLAN.md"], "review checkoff")
+    assert sha  # ALLOWED

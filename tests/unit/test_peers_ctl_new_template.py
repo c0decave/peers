@@ -26,7 +26,7 @@ import pytest
 
 
 def _init_fake_substrate(repo: Path) -> None:
-    """Build a tiny git repo that stands in for the dogf00d-claudex
+    """Build a tiny git repo that stands in for the peers
     substrate. Tests use this instead of the real ~12 MB clone target
     to keep the suite fast and offline."""
     repo.mkdir(parents=True, exist_ok=True)
@@ -318,6 +318,29 @@ def test_self_audit_template_unknown_template_name_rejected(
     assert rc != 0
     err = capsys.readouterr().err
     assert "template" in err.lower()
+    assert not target.exists()
+
+
+def test_self_audit_template_invalid_peer_flags_do_not_clone(
+    tmp_path: Path, capsys,
+) -> None:
+    from peers_ctl.cli import cmd_new
+
+    src = tmp_path / "substrate-src"
+    _init_fake_substrate(src)
+    target = tmp_path / "peers-an earlier audit"
+
+    rc = cmd_new(
+        target,
+        name="peers-an earlier audit",
+        template="internal testing",
+        template_from=src,
+        peer_provider=["claude=openai"],
+        config_dir=tmp_path / "ctl",
+    )
+
+    assert rc == 2
+    assert "peer override" in capsys.readouterr().err
     assert not target.exists()
 
 

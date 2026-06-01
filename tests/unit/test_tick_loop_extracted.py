@@ -268,6 +268,43 @@ def test_tick_loop_forwards_healthguard_invocation_arguments():
         "error_patterns": ["ERR"],
         "halt_patterns": ["HALT"],
         "buf_cap_bytes": 1024,
+        # The orchestrator always exposes the current peer name to the
+        # peer subprocess (and thus its git hooks) for peer attribution.
+        "extra_env": {"PEERS_PEER_NAME": "claude"},
+    }
+
+
+def test_tick_loop_translates_semantic_peer_fields(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    state = {"iteration": 0}
+    driver = _Driver()
+
+    def prepare(state, turn_manager, results):
+        spec = SimpleNamespace(
+            argv=("claude", "-p", "{PROMPT}"),
+            prompt_mode="argv-substitute",
+            tool="claude",
+            model="anthropic/claude-opus-4.8",
+            reasoning="high",
+            provider="openrouter",
+        )
+        return "claude", spec, "prompt"
+
+    driver._prepare_tick_prompt = prepare
+
+    TickLoop(driver).run(state, _TurnManager(driver.events), None, 0)
+
+    assert driver.health.last_args == ((
+        "claude", "-p",
+        "--model", "anthropic/claude-opus-4.8",
+        "--effort", "high",
+        "{PROMPT}",
+    ),)
+    assert driver.health.last_kwargs["extra_env"] == {
+        "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
+        "ANTHROPIC_AUTH_TOKEN": "sk-or-test",
+        "ANTHROPIC_API_KEY": "",
+        "PEERS_PEER_NAME": "claude",
     }
 
 

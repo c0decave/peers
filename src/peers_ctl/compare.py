@@ -8,6 +8,7 @@ and `.peers/log/runs.jsonl` directly — no LLM calls, no container starts.
 from __future__ import annotations
 
 import json
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,18 +100,35 @@ def _read_bug_counts(project_path: Path) -> tuple[int, dict[str, int]]:
     return total, dict(by_severity)
 
 
+def _safe_int(value: object, default: int | None = 0) -> int | None:
+    """Coerce ``value`` to int, returning ``default`` on TypeError/ValueError.
+
+    BUG-403: a corrupted or hand-edited ``state.json`` can have a non-numeric
+    string / list / dict in a field that ``collect_project_metrics`` casts
+    via ``int()``. Without this guard one bad project poisons the whole
+    cross-run report. Mirrors the existing TypeError/ValueError guard on
+    ``spent_usd``.
+    """
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 def collect_project_metrics(name: str, path: Path) -> ProjectMetrics:
     m = ProjectMetrics(name=name, path=path)
     state = _read_state(path) or {}
-    m.iteration = int(state.get("iteration", 0))
-    m.consecutive_clean_ticks = int(state.get("consecutive_clean_ticks", 0))
+    m.iteration = _safe_int(state.get("iteration", 0)) or 0
+    m.consecutive_clean_ticks = _safe_int(
+        state.get("consecutive_clean_ticks", 0)
+    ) or 0
     budget = state.get("budget", {}) or {}
-    m.spent_runtime_s = int(budget.get("spent_runtime_s", 0))
-    m.spent_iterations = int(budget.get("spent_iterations", 0))
+    m.spent_runtime_s = _safe_int(budget.get("spent_runtime_s", 0)) or 0
+    m.spent_iterations = _safe_int(budget.get("spent_iterations", 0)) or 0
     raw_max = budget.get("max_runtime_s")
-    m.max_runtime_s = int(raw_max) if raw_max is not None else None
-    m.wasted_runtime_s = int(budget.get("wasted_runtime_s", 0))
-    m.spent_tokens = int(budget.get("spent_tokens", 0))
+    m.max_runtime_s = _safe_int(raw_max, default=None) if raw_max is not None else None
+    m.wasted_runtime_s = _safe_int(budget.get("wasted_runtime_s", 0)) or 0
+    m.spent_tokens = _safe_int(budget.get("spent_tokens", 0)) or 0
     try:
         m.spent_usd = float(budget.get("spent_usd", 0.0))
     except (TypeError, ValueError):
@@ -139,10 +157,7 @@ def collect_project_metrics(name: str, path: Path) -> ProjectMetrics:
     # met the goals.convergence_n config (or default 3).
     cfg = state.get("config") or {}
     raw_n = (cfg.get("goals") or {}).get("convergence_n", 3)
-    try:
-        n_needed = int(raw_n)
-    except (TypeError, ValueError):
-        n_needed = 3
+    n_needed = _safe_int(raw_n, default=3) or 3
     if m.consecutive_clean_ticks >= n_needed:
         # The convergence first happened (iter - n_needed + 1).
         m.ticks_to_convergence = max(1, m.iteration - n_needed + 1)
@@ -216,3 +231,63 @@ def render_comparison(metrics_list: list[ProjectMetrics]) -> str:
     for r in rows:
         out_lines.append(_format_row(r))
     return "\n".join(out_lines) + "\n"
+
+
+def _resolve_project_dir(name: str, config_dir: Path | None) -> Path | None:
+    """Resolve a project name to its on-disk directory.
+
+    Registry first (so ``peers-ctl add /path`` projects resolve to their
+    explicit path), then ``$PEERS_PROJECTS_ROOT/<name>`` for bare-name
+    projects scaffolded via ``peers-ctl new``. Mirrors
+    :func:`peers_ctl.replay._resolve_project_dir`.
+    """
+    from peers_ctl.cli import projects_root
+    from peers_ctl.store import Store
+
+    try:
+        project = Store(config_dir).get(name)
+    except (OSError, ValueError):
+        project = None
+    if project is not None:
+        p = Path(project.path)
+        if p.is_dir():
+            return p
+    candidate = projects_root() / name
+    if candidate.is_dir():
+        return candidate
+    return None
+
+
+def cmd_compare(names: list[str], config_dir: Path | None = None) -> int:
+    """Thin adapter for cli.py dispatch: render a comparison table.
+
+    Resolves each project name to its directory, collects metrics, and
+    prints the side-by-side table to stdout. Returns 0 on success, 2 if
+    fewer than two names resolve to existing projects (so the operator
+    learns which name was wrong instead of getting an empty table).
+    """
+    if len(names) < 2:
+        print("peers-ctl compare: need at least 2 project names",
+              file=sys.stderr)
+        return 2
+
+    metrics = []
+    missing = []
+    for name in names:
+        path = _resolve_project_dir(name, config_dir)
+        if path is None:
+            missing.append(name)
+            continue
+        metrics.append(collect_project_metrics(name, path))
+
+    for name in missing:
+        print(f"peers-ctl compare: no such project: {name}",
+              file=sys.stderr)
+
+    if len(metrics) < 2:
+        print("peers-ctl compare: need at least 2 resolvable projects "
+              f"(resolved {len(metrics)})", file=sys.stderr)
+        return 2
+
+    sys.stdout.write(render_comparison(metrics))
+    return 0

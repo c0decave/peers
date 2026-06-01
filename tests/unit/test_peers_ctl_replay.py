@@ -263,3 +263,32 @@ def test_replay_invalid_project_name_returns_exit_2(tmp_path: Path) -> None:
     assert rc == 2
     text = opts.out.getvalue()
     assert "invalid" in text.lower() or "project name" in text.lower()
+
+
+def test_replay_edge_boundary_duration_infinity_renders_dash_BUG_304(
+    tmp_path: Path,
+) -> None:
+    """BUG-304 reproducer: a runs.jsonl entry whose ``duration_ms`` is
+    ``+Infinity`` (which Python's json.loads accepts when the producer
+    used ``allow_nan=True``) must render as the same ``-`` fallback that
+    NaN / None / negative durations get, NOT crash the whole replay with
+    OverflowError from ``int(float('inf'))``. Boundary case — replay
+    should be defensive about runs.jsonl payloads it didn't write."""
+    log_dir = tmp_path / "projects" / "demo" / ".peers" / "log"
+    log_dir.mkdir(parents=True)
+    # Python's json module emits / accepts the literal token 'Infinity'
+    # in non-strict mode. Write it directly so we don't depend on the
+    # producer's serializer flags.
+    (log_dir / "runs.jsonl").write_text(
+        '{"iteration": 1, "peer": "claude", "classification": "success", '
+        '"duration_ms": Infinity, "success": true, '
+        '"head_before": "aaa", "head_after": "bbb"}\n'
+    )
+    opts = _opts()
+    rc = replay_project("demo", opts)
+    assert rc == 0, f"expected clean replay, got {rc}: {opts.out.getvalue()}"
+    text = opts.out.getvalue()
+    assert "iteration: 1" in text
+    # The duration line must surface as the unknown-marker, not crash
+    # and not print a bogus 'inf'-derived integer.
+    assert "duration: -" in text

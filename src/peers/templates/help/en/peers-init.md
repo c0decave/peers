@@ -8,6 +8,8 @@ the loop can be started against it.
 ```
 peers [-C <dir>] init [--force] [--driver {orchestrator,hooks,sessions}]
                       [--install] [--modes <list>] [--lang <lang>]
+                      [--peer-model VALUE] [--peer-reasoning VALUE]
+                      [--peer-provider VALUE]
 ```
 
 ## DESCRIPTION
@@ -46,6 +48,11 @@ existing `.peers/` without `--force`.
 - `--lang <lang>` — `python` (default), `js`, `rust`, `go`. Controls
   which language-specific check scripts the audit mode installs.
 - `--audit-templates` — DEPRECATED alias for `--modes=audit`.
+- `--peer-model VALUE` — set `model` in generated config. Repeatable.
+  `VALUE` applies to all peers; `NAME=VALUE` or `TOOL=VALUE` targets.
+- `--peer-reasoning VALUE` — set `reasoning` in generated config.
+- `--peer-provider VALUE` — set `provider` (`anthropic`, `openai`,
+  `openrouter`) in generated config.
 
 ## EXAMPLES
 ```
@@ -60,6 +67,11 @@ peers init --force --modes=audit,thorough
 
 # Hook-driven mode with auto-install into host config.
 peers init --driver=hooks --install
+
+# Pin Codex to OpenRouter at scaffold time.
+peers init --peer-provider codex=openrouter \
+           --peer-model codex=~openai/gpt-latest \
+           --peer-reasoning codex=xhigh
 ```
 
 ## FILES
@@ -80,6 +92,8 @@ Also touched:
 ## ENVIRONMENT
 - `PEERS_MODES_DIR` — extra directory scanned by `peers.modes.discover()`
   when resolving `--modes` (in addition to bundled + `~/.config/peers/modes/`).
+- `OPENROUTER_API_KEY` — required at runtime when a peer has
+  `provider: openrouter`.
 - `HOME` — used to refuse `init` against `$HOME`.
 
 ## SEE ALSO

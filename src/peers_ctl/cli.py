@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.resources
 from collections import deque
 import datetime as _dt
 import json
@@ -16,11 +17,14 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 
+import yaml
+
 from peers.help_man import (
     attach_help_man_flags,
     pick_lang,
     print_help_man,
 )
+from peers.peer_spec import apply_peer_field_overrides
 from peers.safe_io import (
     open_text_in_dir_no_symlink,
     open_text_read_no_symlink,
@@ -82,6 +86,12 @@ def expand_project_arg(arg: Path) -> Path:
 
 def _store(config_dir: Path | None = None) -> Store:
     return Store(config_dir)
+
+
+def _peers_template_config_path() -> Path:
+    return Path(str(
+        importlib.resources.files("peers").joinpath("templates", "config.yaml")
+    ))
 
 
 def _ensure_scaffold_docs(target: Path, name: str,
@@ -147,7 +157,7 @@ def _container_run_in(target: Path, *peers_args: str) -> int:
         "-v", f"{target.resolve()}:/work",
     ]
     if (home / ".gitconfig").is_file():
-        argv += ["-v", f"{home / '.gitconfig'}:/home/peer/.gitconfig:ro"]
+        argv += ["-v", f"{home / '.gitconfig'}:~/.gitconfig:ro"]
     argv += [f"--network={PODMAN_NETWORK or 'none'}"]
     argv += [CONTAINER_IMAGE, *peers_args]
     try:
@@ -449,6 +459,9 @@ def cmd_new(path: Path, name: str | None = None,
             template: str | None = None,
             template_from: Path | None = None,
             anchors_from: Path | None = None,
+            peer_model: list[str] | None = None,
+            peer_reasoning: list[str] | None = None,
+            peer_provider: list[str] | None = None,
             config_dir: Path | None = None) -> int:
     """One-shot project scaffold: create the target directory, git
     init it with an empty initial commit, run `peers init` against
@@ -482,6 +495,22 @@ def cmd_new(path: Path, name: str | None = None,
             f"known: {', '.join(_KNOWN_TEMPLATES)}",
             file=sys.stderr,
         )
+        return 2
+    try:
+        template_cfg = yaml.safe_load(
+            read_text_no_symlink(_peers_template_config_path())
+        )
+        if not isinstance(template_cfg, dict):
+            raise ValueError("template config.yaml top-level must be a mapping")
+        apply_peer_field_overrides(
+            template_cfg,
+            peer_model=peer_model,
+            peer_reasoning=peer_reasoning,
+            peer_provider=peer_provider,
+        )
+    except (OSError, ValueError, yaml.YAMLError) as e:
+        print(f"peers-ctl new: peer override validation failed: {e}",
+              file=sys.stderr)
         return 2
     # --template internal testing: bootstrap the substrate internal testing layout
     # (clone + branch + anchors + commit) BEFORE the rest of the
@@ -727,6 +756,25 @@ def cmd_new(path: Path, name: str | None = None,
             return 1
         if r.stderr.strip():
             print(r.stderr.strip(), file=sys.stderr)
+
+    if peer_model or peer_reasoning or peer_provider:
+        cfg_path = target / ".peers" / "config.yaml"
+        try:
+            cfg = yaml.safe_load(read_text_no_symlink(cfg_path))
+            cfg = apply_peer_field_overrides(
+                cfg,
+                peer_model=peer_model,
+                peer_reasoning=peer_reasoning,
+                peer_provider=peer_provider,
+            )
+        except (OSError, ValueError, yaml.YAMLError) as e:
+            print(f"peers-ctl new: peer override validation failed: {e}",
+                  file=sys.stderr)
+            return 2
+        write_text_no_symlink(
+            cfg_path,
+            yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True),
+        )
 
     # 2b. implement-mode: copy live PLAN.md and write frozen contracts.
     # `peers init` has already created .peers/ above; do this regardless
@@ -1950,6 +1998,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     p_new.add_argument(
+        "--peer-model", action="append", default=None,
+        help="set model in scaffolded config.yaml; VALUE applies to all "
+             "peers, NAME=VALUE/TOOL=VALUE targets matching peers",
+    )
+    p_new.add_argument(
+        "--peer-reasoning", action="append", default=None,
+        help="set reasoning effort in scaffolded config.yaml; VALUE applies "
+             "to all peers, NAME=VALUE/TOOL=VALUE targets matching peers",
+    )
+    p_new.add_argument(
+        "--peer-provider", action="append", default=None,
+        help="set provider in scaffolded config.yaml "
+             "(anthropic/openai/openrouter)",
+    )
+    p_new.add_argument(
         "--plan", default=None,
         help=(
             "PLAN.md file for implement-mode (Task 1.3). Required when "
@@ -2268,6 +2331,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                        template=args.template,
                        template_from=args.template_from,
                        anchors_from=args.anchors_from,
+                       peer_model=args.peer_model,
+                       peer_reasoning=args.peer_reasoning,
+                       peer_provider=args.peer_provider,
                        config_dir=cd)
     if args.cmd == "ack-block":
         return cmd_ack_block(args.project_name, args.step_id, args.reason)
@@ -2326,6 +2392,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cmd == "doctor":
         return cmd_doctor(cd)
     if args.cmd == "compare":
+        from peers_ctl.compare import cmd_compare
         return cmd_compare(list(args.names), cd)
     if args.cmd == "replay":
         from peers_ctl.replay import cmd_replay

@@ -15,8 +15,8 @@ gone paths as `missing`), then prints a four-column table:
 
 ```
 NAME                 STATE    PID      PATH
-my-app               running  12345    /home/x/c0de/peers-c0de/my-app
-older-proj           idle              /home/x/c0de/peers-c0de/older-proj
+my-app               running  12345    ~/c0de/peers-c0de/my-app
+older-proj           idle              ~/c0de/peers-c0de/older-proj
 ```
 
 States are:

@@ -92,6 +92,25 @@ def load_claude_oauth(path: Path) -> OAuthConfig:
     )
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_HTTPS_REQUIRED_MSG = (
+    "OAuth refresh endpoint must be an https:// URL "
+    "(or http:// to a loopback host)"
+)
+
+
+def _is_loopback_http(parsed: urllib.parse.SplitResult) -> bool:
+    """RFC 8252 §7.3: http:// to a loopback host stays on the local machine
+    and therefore does not expose the refresh_token over the wire. The
+    BUG-203 cleartext-exfiltration vector requires an off-box URL; loopback
+    is safe and is the only way local integration tests / dev-mode setups
+    can exercise the refresh flow without provisioning TLS."""
+    if parsed.scheme.lower() != "http":
+        return False
+    host = parsed.hostname
+    return host is not None and host.lower() in _LOOPBACK_HOSTS
+
+
 def _token_url(config: OAuthConfig) -> str:
     url = os.environ.get("AUTH_PROXY_OAUTH_TOKEN_URL") or config.token_url
     if not url:
@@ -99,12 +118,22 @@ def _token_url(config: OAuthConfig) -> str:
             "OAuth refresh endpoint is not configured; set "
             "AUTH_PROXY_OAUTH_TOKEN_URL or tokenUrl in the token file"
         )
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme.lower() != "https" or not parsed.netloc:
-        raise OAuthRefreshError(
-            "OAuth refresh endpoint must be an https:// URL"
-        )
-    return url
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        # urlsplit raises ValueError on malformed IPv6 bracket pairs
+        # (e.g. ``http://[invalid/token``). Surface this as the same
+        # OAuthRefreshError every other bad-URL path produces so the
+        # proxy returns a structured 502, not an opaque 500.
+        raise OAuthRefreshError(_HTTPS_REQUIRED_MSG) from None
+    scheme = parsed.scheme.lower()
+    if not parsed.netloc:
+        raise OAuthRefreshError(_HTTPS_REQUIRED_MSG)
+    if scheme == "https":
+        return url
+    if _is_loopback_http(parsed):
+        return url
+    raise OAuthRefreshError(_HTTPS_REQUIRED_MSG)
 
 
 def refresh_access_token(

@@ -122,31 +122,53 @@ def _find_checkoff_commit(project_root: Path, step_id: str) -> str | None:
     return None
 
 
-def _author_email(project_root: Path, sha: str) -> str:
+# Each peer's commits carry a `Peer: <name>` trailer in the message body,
+# written by the orchestrator. This is the authoritative peer attribution:
+# the git *author* is often a single shared identity (the container's git
+# user), under which an email comparison cannot tell the two peers apart and
+# the gate would silently pass. We key on the trailer and fall back to the
+# author email only when no trailer is present (legacy / hand-made commits).
+_PEER_TRAILER_RE = re.compile(r"^Peer:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
+
+
+def _commit_identity(project_root: Path, sha: str) -> str:
+    """Return a peer-identity token for ``sha``.
+
+    Prefers the ``Peer: <name>`` trailer; falls back to ``email:<author>``
+    so the two namespaces never collide.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(project_root), "log", "-1", "--format=%B", sha],
+        capture_output=True, text=True,
+    )
+    if proc.returncode == 0:
+        m = _PEER_TRAILER_RE.search(proc.stdout)
+        if m:
+            return f"peer:{m.group(1).lower()}"
     proc = subprocess.run(
         ["git", "-C", str(project_root), "log", "-1", "--format=%ae", sha],
         capture_output=True, text=True,
     )
-    return proc.stdout.strip() if proc.returncode == 0 else ""
+    ae = proc.stdout.strip() if proc.returncode == 0 else ""
+    return f"email:{ae}" if ae else ""
 
 
-def _last_impl_author(project_root: Path, checkoff_sha: str, path: str) -> str:
-    """Return the author email of the most recent commit modifying
-    ``path`` strictly before ``checkoff_sha``.
+def _last_impl_identity(project_root: Path, checkoff_sha: str, path: str) -> str:
+    """Peer identity of the most recent commit modifying ``path`` strictly
+    before ``checkoff_sha``.
 
-    Returns ``""`` if no such commit exists (file was never touched
-    before the checkoff, e.g. the checkoff commit itself introduces
-    the file — which is itself a different kind of failure that
-    ``plan-step-traceable`` catches).
+    Returns ``""`` if no such commit exists (file was never touched before
+    the checkoff — a different failure that ``plan-step-traceable`` catches).
     """
     proc = subprocess.run(
-        ["git", "-C", str(project_root), "log", "-1", "--format=%ae",
+        ["git", "-C", str(project_root), "log", "-1", "--format=%H",
          f"{checkoff_sha}~1", "--", path],
         capture_output=True, text=True,
     )
-    if proc.returncode != 0:
+    impl_sha = proc.stdout.strip() if proc.returncode == 0 else ""
+    if not impl_sha:
         return ""
-    return proc.stdout.strip()
+    return _commit_identity(project_root, impl_sha)
 
 
 def main(project_dir: str = ".") -> int:
@@ -185,19 +207,19 @@ def main(project_dir: str = ".") -> int:
             # step that was born [x] (rare) or whose toggle predates
             # PLAN.md being tracked. We cannot enforce here; defer.
             continue
-        checkoff_author = _author_email(project_root, checkoff_sha)
-        if not checkoff_author:
+        checkoff_id = _commit_identity(project_root, checkoff_sha)
+        if not checkoff_id:
             continue
         for tf in step.touches:
-            impl_author = _last_impl_author(project_root, checkoff_sha, tf)
-            if not impl_author:
+            impl_id = _last_impl_identity(project_root, checkoff_sha, tf)
+            if not impl_id:
                 # File was new in checkoff commit, or untracked before:
                 # plan-step-traceable handles that class of failure.
                 continue
-            if impl_author == checkoff_author:
+            if impl_id == checkoff_id:
                 violations.append(
-                    f"  {step.id}: checkoff by {checkoff_author} matches "
-                    f"implementation author {impl_author} for {tf}"
+                    f"  {step.id}: checkoff by {checkoff_id} matches "
+                    f"implementation author {impl_id} for {tf}"
                 )
 
     if violations:

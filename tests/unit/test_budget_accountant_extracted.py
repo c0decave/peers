@@ -104,3 +104,63 @@ def test_record_tick_accounting_failure_tracks_wasted_runtime():
     assert state["budget"]["spent_runtime_s"] == 30
     assert state["budget"]["wasted_runtime_s"] == 9
     assert state["budget"]["consecutive_failures"] == 3
+
+
+def test_operator_override_wins_over_config_budget(tmp_path):
+    """Reproduces the --max-runtime clobber bug: `_apply_config_budget`
+    overlays config.yaml's cap onto state every loop start, so an operator
+    `--max-runtime` (persisted to the override sidecar) must be re-applied
+    AFTER the config overlay to win. Spent counters and config-only caps
+    are unaffected."""
+    import json
+    from pathlib import Path
+    from peers.budget_accountant import (
+        _apply_config_budget,
+        apply_operator_budget_overrides,
+        OPERATOR_BUDGET_OVERRIDE_FILE,
+    )
+
+    repo = Path(tmp_path)
+    (repo / ".peers").mkdir()
+    (repo / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE).write_text(
+        json.dumps({"max_runtime_s": 43200})
+    )
+    state = {"budget": {"max_runtime_s": 43200, "spent_runtime_s": 10}}
+    cfg_budget = {"max_runtime_s": 21600, "max_iterations": 200}
+
+    _apply_config_budget(state, cfg_budget)
+    # The config overlay clobbers the operator cap — this is the bug.
+    assert state["budget"]["max_runtime_s"] == 21600
+
+    applied = apply_operator_budget_overrides(state, repo)
+    # The operator override is restored and wins.
+    assert state["budget"]["max_runtime_s"] == 43200
+    assert applied == {"max_runtime_s": 43200}
+    # Config-only caps still come from config; spent counters untouched.
+    assert state["budget"]["max_iterations"] == 200
+    assert state["budget"]["spent_runtime_s"] == 10
+
+
+def test_read_operator_budget_overrides_absent_and_malformed(tmp_path):
+    """Absent / non-dict / malformed-JSON files yield {}, and only
+    recognised numeric budget caps survive (unknown keys and bool values
+    are dropped — bool is an int subclass and would be a footgun)."""
+    import json
+    from pathlib import Path
+    from peers.budget_accountant import (
+        read_operator_budget_overrides,
+        OPERATOR_BUDGET_OVERRIDE_FILE,
+    )
+
+    repo = Path(tmp_path)
+    assert read_operator_budget_overrides(repo) == {}
+
+    (repo / ".peers").mkdir()
+    f = repo / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE
+    f.write_text(json.dumps(
+        {"max_runtime_s": 43200, "unknown_key": 1, "max_iterations": True}
+    ))
+    assert read_operator_budget_overrides(repo) == {"max_runtime_s": 43200}
+
+    f.write_text("{not valid json")
+    assert read_operator_budget_overrides(repo) == {}

@@ -6,6 +6,7 @@ import threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from auth_proxy import server as auth_proxy_server
 from auth_proxy.server import make_server
 
 
@@ -15,26 +16,13 @@ def _serve(server: ThreadingHTTPServer) -> threading.Thread:
     return thread
 
 
-def test_auth_proxy_refreshes_on_401_and_retries(tmp_path):
+def test_auth_proxy_refreshes_on_401_and_retries(tmp_path, monkeypatch):
     seen: list[tuple[str, str | None]] = []
 
     class UpstreamHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0") or "0")
             self.rfile.read(length)
-            if self.path == "/oauth/token":
-                seen.append(("refresh", None))
-                body = json.dumps({
-                    "access_token": "new-token",
-                    "refresh_token": "refresh-token-2",
-                    "expires_in": 60,
-                }).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
             seen.append(("api", self.headers.get("Authorization")))
             if self.headers.get("Authorization") == "Bearer old-token":
                 self.send_response(401)
@@ -57,10 +45,28 @@ def test_auth_proxy_refreshes_on_401_and_retries(tmp_path):
         "oauthAccount": {
             "accessToken": "old-token",
             "refreshToken": "refresh-token",
-            "tokenUrl": f"{upstream_url}/oauth/token",
+            "tokenUrl": "https://auth.example/token",
             "expiresAt": 1,
         }
     }), encoding="utf-8")
+
+    # The real OAuth refresh now requires an https:// endpoint,
+    # so this end-to-end test stubs the refresh — the actual token-URL
+    # validation + refresh request are covered by the unit tests in
+    # tests/unit/test_auth_proxy.py. Here we only assert the proxy's
+    # 401→refresh→retry control flow.
+    def fake_refresh(path):
+        seen.append(("refresh", None))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["oauthAccount"]["accessToken"] = "new-token"
+        data["oauthAccount"]["refreshToken"] = "refresh-token-2"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return "new-token"
+
+    monkeypatch.setattr(
+        auth_proxy_server, "refresh_claude_config", fake_refresh,
+    )
+
     proxy = make_server(
         host="127.0.0.1",
         port=0,

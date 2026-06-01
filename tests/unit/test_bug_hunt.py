@@ -506,6 +506,49 @@ def test_bug_reproduce_trailer_collected(tmp_path: Path):
     assert s.reproduced_count == 1
 
 
+def test_historical_tdd_reproducer_subject_collected_BUG_305(tmp_path: Path):
+    repo = _init_repo(tmp_path / "r")
+    _file_blocking_bug(repo, "BUG-305")
+    _commit(repo, textwrap.dedent("""\
+        TDD: reproducer for BUG-305 (old commit shape)
+
+        This commit predates the Bug-Reproduce trailer convention but
+        clearly identifies the failing test target in the subject.
+
+        Peer: claude
+    """))
+    s = summarize(repo)
+    assert "BUG-305" in s.reproductions
+    assert s.reproductions["BUG-305"][0].reproduced_by == "claude"
+
+
+def test_gate_tdd_rejects_untrailered_non_tdd_subject_BUG_305(tmp_path: Path):
+    from peers.bug_hunt import gate_tdd_pass
+
+    repo = _init_repo(tmp_path / "r")
+    _file_blocking_bug(repo, "BUG-306", sev="med")
+    _commit(repo, textwrap.dedent("""\
+        test: reproduce BUG-306 without trailer
+
+        Looks like a test commit but does not use the historical TDD
+        subject form or the Bug-Reproduce trailer.
+
+        Peer: claude
+    """))
+    _commit(repo, textwrap.dedent("""\
+        fix BUG-306
+
+        ## Bug-Resolution
+        {"id":"BUG-306","status":"fixed"}
+
+        Peer: codex
+        Bug-Resolves: BUG-306
+    """))
+    ok, diag = gate_tdd_pass(repo)
+    assert ok is False
+    assert "no Bug-Reproduce" in diag
+
+
 def test_bug_reproduce_multiple_per_bug(tmp_path: Path):
     """Three reproduce commits (happy/edge/sad) for one bug — all
     counted, in commit-order."""

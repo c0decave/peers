@@ -69,6 +69,23 @@ def collect_passing() -> set[str] | None:
     return passing
 
 
+def collect_passing_with_retry(attempts: int = 2) -> set[str] | None:
+    """`collect_passing`, retried up to `attempts` times.
+
+    A single empty/unparseable JUnit XML is usually a transient infra hiccup
+    (load spike, a test racing the gate's wall-clock timeout, a momentary
+    spawn refusal), not a real signal. Retrying once absorbs that so the gate
+    does not accumulate the convergence-wall stuck-counter on noise. Returns
+    the first parseable result, or None only if EVERY attempt failed to
+    produce XML (then the caller fails closed — see calc v2 diagnostic).
+    """
+    for _ in range(max(1, attempts)):
+        result = collect_passing()
+        if result is not None:
+            return result
+    return None
+
+
 def main() -> int:
     if "--snapshot" in sys.argv:
         BASELINE.parent.mkdir(parents=True, exist_ok=True)
@@ -83,9 +100,29 @@ def main() -> int:
         print(f"no_regression: missing {BASELINE}; run once with --snapshot")
         return 1
     expected = set(BASELINE.read_text().splitlines()) - {""}
-    current = collect_passing()
+    if not expected:
+        # Fix A (calc v2): an empty baseline (0 tests green at run start, e.g.
+        # a greenfield build from zero) has nothing that CAN regress. Pass
+        # WITHOUT running pytest at all, so the gate is never exposed to the
+        # no-XML / gate-timeout failure mode for zero benefit.
+        print(
+            "no_regression: empty baseline (0 tests green at run start) — "
+            "nothing to regress against; clean"
+        )
+        return 0
+    current = collect_passing_with_retry()
     if current is None:
-        print("no_regression FAIL: pytest did not produce a parseable JUnit XML")
+        # Fix B (safe variant): retried and still no parseable XML. This is an
+        # INFRASTRUCTURE failure (pytest could not run / a test hangs past the
+        # gate timeout / spawn refused), not proof of a regression — but we
+        # fail closed because we genuinely cannot measure, and passing here
+        # could mask a full-suite test that the acceptance subset never runs.
+        print(
+            "no_regression FAIL: INFRA — pytest produced no parseable JUnit "
+            "XML after retries; cannot measure regression (failing closed). "
+            "Likely a missing pytest, a sandbox spawn refusal, or a test that "
+            "hangs/exceeds the per-gate timeout."
+        )
         return 1
     regressed = expected - current
     if not regressed:
@@ -99,11 +136,12 @@ def main() -> int:
         "re-running pytest once to rule out flakes...",
         flush=True,
     )
-    second = collect_passing()
+    second = collect_passing_with_retry()
     if second is None:
         print(
-            "no_regression FAIL: retry pytest run did not produce parseable "
-            "JUnit XML — failing closed since flake-tolerance cannot be confirmed"
+            "no_regression FAIL: INFRA — confirm-run produced no parseable "
+            "JUnit XML after retries; failing closed (cannot tell a flake from "
+            "a real regression)"
         )
         return 1
     persistent = expected - second

@@ -195,6 +195,38 @@ health: {idle_timeout_s: 5, absolute_max_runtime_s: 10}
     assert "tools" in capsys.readouterr().err.lower()
 
 
+def test_cmd_run_rejects_missing_openrouter_key(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    target = _init_target_repo(tmp_path / "t")
+    _write_config(target, """
+driver: orchestrator
+comm: git
+peers:
+  - name: claude
+    tool: claude
+    argv: ["claude", "-p", "{PROMPT}"]
+    prompt_mode: argv-substitute
+    provider: openrouter
+  - name: codex
+    tool: codex
+    argv: ["codex", "exec", "{PROMPT}"]
+    prompt_mode: argv-substitute
+budget: {max_iterations: 1, max_runtime_s: 60, max_consecutive_failures: 1}
+health: {idle_timeout_s: 5, absolute_max_runtime_s: 10}
+""")
+
+    rc = cmd_run(target=target, max_ticks=1)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "runtime error" in err
+    assert "OPENROUTER_API_KEY" in err
+
+
 def test_cmd_run_max_usd_overrides_config_budget(tmp_path: Path, monkeypatch):
     import peers.cli as cli_mod
 

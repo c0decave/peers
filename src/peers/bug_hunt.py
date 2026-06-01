@@ -57,6 +57,10 @@ SEVERITY_ORDER = ("crit", "high", "med", "low", "info")
 BLOCKING_SEVERITIES = frozenset({"crit", "high", "med"})
 _SEVERITY_RANK = {sev: i for i, sev in enumerate(SEVERITY_ORDER)}
 _TRAILER_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]{1,}):\s*(.*?)\s*$")
+_TDD_SUBJECT_RE = re.compile(
+    r"^TDD:\s*reproducer\s+for\s+(BUG-\d+)\b",
+    re.IGNORECASE,
+)
 _URL_SCHEME_KEYS = {"http", "https", "ftp", "ftps", "ssh", "file", "ws", "wss"}
 
 
@@ -86,8 +90,9 @@ class BugResolution:
 
 @dataclass
 class BugReproduction:
-    """A commit that carries `Bug-Reproduce: BUG-NNN` — a failing test
-    added BEFORE the fix, for the TDD-reproduce-first workflow."""
+    """A commit that carries `Bug-Reproduce: BUG-NNN`, or the older
+    `TDD: reproducer for BUG-NNN` subject form — a failing test added
+    BEFORE the fix, for the TDD-reproduce-first workflow."""
     id: str
     sha: str = ""
     reproduced_by: str | None = None
@@ -159,6 +164,19 @@ def parse_commit_trailers(message: str) -> dict[str, list[str]]:
             break
         out.setdefault(key, []).insert(0, value)
     return out
+
+
+def _historical_tdd_subject_reproduce_ids(message: str) -> list[str]:
+    """Return BUG ids from the pre-trailer TDD subject convention.
+
+    Early audit turns used commits titled `TDD: reproducer for BUG-NNN`
+    before the stricter `Bug-Reproduce:` trailer was documented. Keep the
+    compatibility window narrow so ordinary "test: reproduce BUG-NNN"
+    subjects cannot satisfy the gate by accident.
+    """
+    subject = message.splitlines()[0].strip() if message else ""
+    match = _TDD_SUBJECT_RE.match(subject)
+    return [match.group(1).upper()] if match else []
 
 
 def _first_json_block(body: str) -> dict | None:
@@ -322,7 +340,12 @@ def summarize(repo: Path) -> BugSummary:
         # Bug-Reproduce is a parallel signal: "this commit adds the
         # failing test for the bug, BEFORE the fix lands". Used by
         # TDD-style audits to enforce reproduce-then-fix ordering.
+        #
+        # Compatibility: early internal testing turns used `TDD: reproducer
+        # for BUG-NNN` subjects before adding the explicit trailer.
         reproduce_ids = trailers.get("Bug-Reproduce", [])
+        if not reproduce_ids:
+            reproduce_ids = _historical_tdd_subject_reproduce_ids(body)
         peer_trailer = (trailers.get("Peer") or [None])[0]
 
         json_block = _first_json_block(body) if (report_ids or resolve_ids
@@ -627,8 +650,9 @@ def main(argv: list[str] | None = None) -> int:
       gate     [path]   — print rollup; exit 0 iff no blocking-severity
                           bug is open (deferred does NOT block).
       gate-tdd [path]   — exit 0 iff every blocking fix has at least one
-                          preceding `Bug-Reproduce:` commit; for TDD-
-                          style audits that require the test to be
+                          preceding `Bug-Reproduce:` commit (or older
+                          `TDD: reproducer for BUG-NNN` subject); for
+                          TDD-style audits that require the test to be
                           committed BEFORE the fix.
     """
     import argparse

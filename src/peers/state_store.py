@@ -38,7 +38,11 @@ import os
 from pathlib import Path
 from typing import Any, Iterable
 
-from peers.safe_io import open_text_no_symlink, read_bytes_no_symlink
+from peers.safe_io import (
+    _open_dir_fd_no_symlink,
+    open_text_no_symlink,
+    read_bytes_no_symlink,
+)
 
 SCHEMA_VERSION = 2
 _STATE_FILE_MAX_BYTES = 5 * 1024 * 1024
@@ -336,14 +340,18 @@ class StateStore:
         # between os.replace() and the next implicit dir-flush would
         # leave the rename undone on power loss.
         try:
-            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)
+            # open the parent with O_NOFOLLOW (+ dev/ino recheck) so
+            # the durability fsync refuses a symlinked/swapped parent instead
+            # of following it into an attacker-controlled directory.
+            dir_fd = _open_dir_fd_no_symlink(self.path.parent)
             try:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
         except OSError:
-            # Some filesystems (FAT, NFS) don't support dir-fsync;
-            # we tried our best, ignore.
+            # Some filesystems (FAT, NFS) don't support dir-fsync, and a
+            # symlinked/swapped parent is refused above — in both cases the
+            # best-effort durability fsync is skipped rather than followed.
             pass
 
 
