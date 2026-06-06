@@ -1906,7 +1906,8 @@ def cmd_modes_show(name: str) -> int:
     return 0
 
 
-def cmd_doctor(config_dir: Path | None = None) -> int:
+def cmd_doctor(config_dir: Path | None = None, *,
+               claude_smoke: bool = False) -> int:
     """Pre-flight check (Item 9): verify the host has everything
     ``peers-ctl start`` needs.
 
@@ -1917,9 +1918,12 @@ def cmd_doctor(config_dir: Path | None = None) -> int:
     currently used — doctor's scope is the host environment, not
     per-project state (see ``peers-ctl status`` / ``peers-ctl report``
     for the latter).
+
+    ``claude_smoke`` adds the opt-in live probe: a real ``claude -p`` in
+    a throwaway peer container that fails fast on a startup hang.
     """
     from peers_ctl.doctor import run_doctor
-    return run_doctor()
+    return run_doctor(claude_smoke=claude_smoke)
 
 
 _HELP_MAN_HINT = "\n(use --help-man for detailed docs + examples)"
@@ -2278,11 +2282,20 @@ def build_parser() -> argparse.ArgumentParser:
         sub, "prune", help_text="delete old log files")
     p_prune.add_argument("--older-than-days", type=int, default=7)
 
-    _add_help_man_subparser(
+    p_doctor = _add_help_man_subparser(
         sub, "doctor",
         help_text=(
             "pre-flight check: verify peers + git + peer CLIs are "
             "on PATH and each registered project's config loads."
+        ),
+    )
+    p_doctor.add_argument(
+        "--claude-smoke", action="store_true",
+        help=(
+            "also run a live smoke: a real `claude -p` in a throwaway "
+            "peer container, failing fast if no model output comes back "
+            "(catches the claude-code startup-hang class). Needs the "
+            "image + auth + network and makes one tiny API call; ~30-90s."
         ),
     )
 
@@ -2409,7 +2422,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cmd == "prune":
         return cmd_prune(args.older_than_days, cd)
     if args.cmd == "doctor":
-        return cmd_doctor(cd)
+        return cmd_doctor(cd, claude_smoke=args.claude_smoke)
     if args.cmd == "compare":
         from peers_ctl.compare import cmd_compare
         return cmd_compare(list(args.names), cd)

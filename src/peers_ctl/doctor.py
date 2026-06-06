@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -32,9 +33,15 @@ from peers_ctl.runner import (
     CONTAINER_IMAGE as PEERS_IMAGE,
     EGRESS_PROXY_IMAGE,
     PODMAN_CMD,
+    _ensure_auth_proxy_running,
+    _ensure_egress_proxy_running,
     _host_peers_version,
     _image_peers_version,
+    _peer_container_runtime_flags,
+    _stop_auth_proxy_best_effort,
+    _stop_egress_proxy_best_effort,
 )
+from peers_ctl.store import Project
 
 
 # Module-level constants are exposed so tests can monkeypatch them
@@ -335,6 +342,214 @@ def probe_git() -> ProbeResult:
 
 
 # ---------------------------------------------------------------------------
+# Live claude smoke probe (opt-in: `peers-ctl doctor --claude-smoke`)
+# ---------------------------------------------------------------------------
+#
+# A throwaway `claude -p` inside the REAL peer container is the only probe that
+# actually exercises the startup path that hung under claude-code 2.1.145
+# (read-only home + missing writable ~/.claude.json). It is opt-in because,
+# unlike every other probe, it needs the image built + auth + network, makes
+# one tiny real API call, and brings the auth/egress sidecars up and down.
+
+
+SMOKE_CONTAINER_NAME = "peers-doctor-claude-smoke"
+_SMOKE_PROMPT = "Reply with the single word: OK"
+_DEFAULT_SMOKE_TIMEOUT_S = 90.0
+_CONFIG_HANG_DOC = "docs/2026-06-06-claude-2.1.145-config-hang.md"
+_CONFIG_NOT_FOUND_SIG = "configuration file not found"
+
+
+@dataclass(frozen=True)
+class SmokeOutcome:
+    """Result of one `claude -p` run inside the throwaway peer container.
+
+    Attributes:
+        returncode: claude's exit code, or ``None`` when the run was
+            killed because it exceeded the timeout (the startup-hang case).
+        stdout / stderr: captured output.
+        timed_out: True iff the run was killed at the deadline.
+        duration_s: wall-clock seconds the run took.
+    """
+
+    returncode: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool
+    duration_s: float
+
+
+def _smoke_timeout_s() -> float:
+    """Live-smoke deadline. A hung claude idles forever, so any finite
+    timeout detects it; 90 s is generous for a cold container + first
+    model call. Override with ``PEERS_CTL_SMOKE_TIMEOUT_S``."""
+    raw = os.environ.get("PEERS_CTL_SMOKE_TIMEOUT_S", "")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_SMOKE_TIMEOUT_S
+    return val if val > 0 else _DEFAULT_SMOKE_TIMEOUT_S
+
+
+def _smoke_project() -> Project:
+    """A throwaway, unpersisted Project so the smoke reuses the real
+    runner wiring (container/sidecar names + the exact mount layout).
+    Doctor is host-level, so there is no real project — cwd stands in
+    for /work."""
+    return Project(name="doctor-claude-smoke", path=str(Path.cwd()))
+
+
+def _ensure_smoke_sidecars(project: Project) -> None:
+    """Bring up whatever auth/egress sidecars the configured mode needs
+    (each a no-op when its mode is disabled) so the smoke routes auth and
+    egress exactly like a real peer turn."""
+    _ensure_egress_proxy_running(project)
+    _ensure_auth_proxy_running(project)
+
+
+def _stop_smoke_sidecars(project: Project) -> None:
+    """Best-effort teardown of whatever :func:`_ensure_smoke_sidecars`
+    started. Always run, even when the smoke raised or timed out."""
+    _stop_auth_proxy_best_effort(project)
+    _stop_egress_proxy_best_effort(project)
+
+
+def _podman_rm_force(name: str) -> None:
+    """`podman rm -f NAME`, swallowing every error — used to pre-clean a
+    stale smoke container and to reap one the timeout left behind (a
+    foreground `--rm` does not fire when we kill podman at the deadline)."""
+    if shutil.which(PODMAN_CMD) is None:
+        return
+    try:
+        subprocess.run(
+            [PODMAN_CMD, "rm", "-f", name],
+            capture_output=True, timeout=15, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _as_text(val: object) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, bytes):
+        return val.decode("utf-8", "replace")
+    return str(val)
+
+
+def _run_claude_smoke_container(project: Project,
+                                timeout_s: float) -> SmokeOutcome:
+    """Run `claude -p` once in a throwaway peer container, captured and
+    time-bounded.
+
+    The image is ``ENTRYPOINT ["peers"]``, so ``--entrypoint claude``
+    overrides it. There is deliberately **no** ``--bare``: we want the
+    real hooks/plugins/config startup path, because that is exactly what
+    hangs. The container is wired by :func:`_peer_container_runtime_flags`,
+    so its ``--read-only`` + mount + auth/netns layout matches a real turn.
+    """
+    _podman_rm_force(SMOKE_CONTAINER_NAME)
+    argv = [
+        PODMAN_CMD, "run", "--rm", "--name", SMOKE_CONTAINER_NAME,
+        *_peer_container_runtime_flags(project),
+        "--entrypoint", "claude",
+        PEERS_IMAGE, "-p", _SMOKE_PROMPT,
+    ]
+    start = time.monotonic()
+    try:
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _podman_rm_force(SMOKE_CONTAINER_NAME)
+        return SmokeOutcome(
+            returncode=None,
+            stdout=_as_text(exc.stdout),
+            stderr=_as_text(exc.stderr),
+            timed_out=True,
+            duration_s=time.monotonic() - start,
+        )
+    return SmokeOutcome(
+        returncode=r.returncode,
+        stdout=r.stdout or "",
+        stderr=r.stderr or "",
+        timed_out=False,
+        duration_s=time.monotonic() - start,
+    )
+
+
+def _first_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _smoke_result(outcome: SmokeOutcome, timeout_s: float) -> ProbeResult:
+    """Map a :class:`SmokeOutcome` to a :class:`ProbeResult`.
+
+    OK only when claude produced real model output; every failure is a
+    required MISS whose hint distinguishes a startup hang (the 2.1.145
+    config-hang class) from other breakage.
+    """
+    out = (outcome.stdout or "").strip()
+    if outcome.timed_out:
+        return ProbeResult(
+            status="MISS", label="claude smoke",
+            value=f"no output in {int(timeout_s)}s — possible startup hang",
+            hint=f"claude produced no model output; see {_CONFIG_HANG_DOC}",
+            required=True,
+        )
+    if outcome.returncode == 0 and out:
+        return ProbeResult(
+            status="OK", label="claude smoke",
+            value=f"claude replied ({len(out)} chars in "
+                  f"{outcome.duration_s:.1f}s)",
+            hint="", required=True,
+        )
+    if _CONFIG_NOT_FOUND_SIG in (outcome.stderr or "").lower():
+        hint = (f"claude-code '{_CONFIG_NOT_FOUND_SIG}' loop — the 2.1.145 "
+                f"config-hang class; see {_CONFIG_HANG_DOC}")
+    else:
+        hint = f"claude -p exited rc={outcome.returncode} with no model output"
+    detail = (_first_line(outcome.stderr) or _first_line(outcome.stdout)
+              or "no model output")
+    return ProbeResult(
+        status="MISS", label="claude smoke", value=detail[:80],
+        hint=hint, required=True,
+    )
+
+
+def probe_claude_smoke(timeout_s: float | None = None) -> ProbeResult:
+    """Live preflight: run a real `claude -p` in a throwaway peer
+    container and fail fast if no model output comes back.
+
+    Catches the claude-code startup-hang regression class (and, in
+    hardened mode, the auth-proxy/egress path) before a multi-hour run
+    silently wastes itself on a claude that never produces output. The
+    sidecars are always torn down, and any unexpected error degrades to
+    a MISS rather than crashing the doctor report.
+    """
+    deadline = _smoke_timeout_s() if timeout_s is None else timeout_s
+    project = _smoke_project()
+    _ensure_smoke_sidecars(project)
+    try:
+        try:
+            outcome = _run_claude_smoke_container(project, deadline)
+        except Exception as exc:  # never crash the report
+            return ProbeResult(
+                status="MISS", label="claude smoke",
+                value="smoke probe error",
+                hint=f"{type(exc).__name__}: {exc}",
+                required=True,
+            )
+    finally:
+        _stop_smoke_sidecars(project)
+    return _smoke_result(outcome, deadline)
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -363,8 +578,8 @@ def _format_row(result: ProbeResult, label_width: int, value_width: int) -> str:
     return line.rstrip()
 
 
-def run_doctor(probes: tuple[Callable[[], ProbeResult], ...] | None = None
-               ) -> int:
+def run_doctor(probes: tuple[Callable[[], ProbeResult], ...] | None = None,
+               *, claude_smoke: bool = False) -> int:
     """Run every probe, print the tabular report, return the exit code.
 
     Returns 0 iff every probe with ``required=True`` returned ``OK``;
@@ -372,10 +587,14 @@ def run_doctor(probes: tuple[Callable[[], ProbeResult], ...] | None = None
     does not affect the exit code.
 
     Caller can inject a custom probe tuple for testing — production
-    uses :data:`_PROBES`.
+    uses :data:`_PROBES`. When ``claude_smoke`` is set, the opt-in live
+    :func:`probe_claude_smoke` is appended (it is never in the default
+    set because it launches a real container + makes an API call).
     """
     if probes is None:
         probes = _PROBES
+    if claude_smoke:
+        probes = tuple(probes) + (probe_claude_smoke,)
     results = [probe() for probe in probes]
 
     label_width = max((len(r.label) for r in results), default=8)
@@ -406,6 +625,7 @@ def run_doctor(probes: tuple[Callable[[], ProbeResult], ...] | None = None
 
 __all__ = [
     "ProbeResult",
+    "SmokeOutcome",
     "PEERS_IMAGE",
     "EGRESS_PROXY_IMAGE",
     "AUTH_PROXY_IMAGE",
@@ -418,5 +638,6 @@ __all__ = [
     "probe_version_drift",
     "probe_oauth_or_apikey",
     "probe_git",
+    "probe_claude_smoke",
     "run_doctor",
 ]

@@ -127,6 +127,34 @@ Stop-Hooks-Kette ohne manuelle JSON/TOML-Editierung gewired ist.
 
 ---
 
+## Modi
+
+Ein **Modus** ist ein wiederverwendbares Bündel aus Audit-Zielen +
+Check-Skripten, das `peers-ctl new --modes=…` in `.peers/` ablegt. Modi
+sind **stapelbar** (kommaseparierte Liste) — Ausnahmen: `describe` und
+`implement` laufen eigenständig. Aktuelle eingebaute Modi:
+
+| Modus | Was er tut |
+|---|---|
+| `audit` | Bug-Hunt + 3-Klassen-Testabdeckung + Secrets + Dependencies + API-Stabilität + Regression + Diff-Größe + Skip/xfail-Begründung. Fundament — fast immer nötig |
+| `thorough` | Anti-Konvergenz-Theater-Hard-Gate: N=3 aufeinanderfolgende saubere Ticks + Skeptiker-Pass + Aggressive-Honesty-Soft-Goals. Stapelt auf `audit` |
+| `describe` | iterativer Doku-Modus — Peers schreiben SPEC.md/ARCHITECTURE.md/DESIGN.md, bis N=2 nicht-substanzielle Doc-Commits. Vor dem Audit auf einem Repo ohne Docs; nicht mit Audit-Modi kombinierbar |
+| `document` | erzeugt + pflegt maschinenlesbare Docs: eine `CODEMAP.yaml`, drift-gegated gegen den geparsten AST (jeder Eintrag trifft ein reales Symbol mit passender Signatur), plus `AGENTS.md` und `ARCHITECTURE.md` synchron dazu. Docs, die nicht stillschweigend verrotten; stapelbar oder eigenständig vor einem Audit |
+| `implement` | End-to-end-Feature-Implementierung aus einer PLAN.md — eingefrorener Akzeptanz-Vertrag, Blind-Review zwischen Peers, Reviewer-Checkoffs, Honesty-/Cleanliness-Gates. Eigenständig; siehe [docs/MODES_IMPLEMENT_DE.md](docs/MODES_IMPLEMENT_DE.md) |
+
+```sh
+# Empfohlener Default für bestehenden Code:
+peers-ctl new myapp --modes=audit,thorough
+
+# Verifizierte, drift-gegatete Docs erzeugen (CODEMAP + AGENTS.md + ARCHITECTURE.md):
+peers-ctl new myapp --modes=document
+
+# Feature aus einer PLAN.md bauen (eigenständig):
+peers-ctl new myfeature --container --modes=implement --plan ./PLAN.md
+```
+
+`peers-ctl modes list` zeigt immer den aktuellen eingebauten Satz.
+
 ## Mehrere Projekte — `peers-ctl`
 
 `peers-ctl` ist der Host-seitige Controller, der mehrere Peers-Loops

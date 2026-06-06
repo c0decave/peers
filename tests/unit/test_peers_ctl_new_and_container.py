@@ -2,6 +2,7 @@
 `peers-ctl start --container` path."""
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -202,6 +203,49 @@ def test_build_container_argv_shape(tmp_path: Path):
     assert any(f"{tmp_path / 'tgt'}:/work" in a for a in argv)
 
 
+def test_build_container_argv_mounts_opencode_auth_when_present(
+    tmp_path: Path, monkeypatch,
+):
+    """When the host has opencode config + credentials, the container mounts
+    them so an `opencode` peer can authenticate inside --container (parity with
+    ~/.claude and ~/.codex)."""
+    from peers_ctl import runner
+    from peers_ctl.runner import _build_container_argv
+    from peers_ctl.store import Project
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude").mkdir(parents=True)
+    (fake_home / ".codex").mkdir(parents=True)
+    (fake_home / ".config" / "opencode").mkdir(parents=True)
+    (fake_home / ".local" / "share" / "opencode").mkdir(parents=True)
+    monkeypatch.setattr(runner.Path, "home", staticmethod(lambda: fake_home))
+    (tmp_path / "tgt").mkdir()
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    argv = _build_container_argv(p, max_ticks=1, extra_args=())
+    joined = " ".join(argv)
+    assert (f"{fake_home}/.config/opencode:~/.config/opencode"
+            in joined)
+    assert (f"{fake_home}/.local/share/opencode:"
+            "~/.local/share/opencode" in joined)
+
+
+def test_build_container_argv_skips_opencode_when_absent(
+    tmp_path: Path, monkeypatch,
+):
+    """opencode is an optional peer — when its host dirs are absent, no
+    opencode mount is added (don't create empty/nonexistent mounts)."""
+    from peers_ctl import runner
+    from peers_ctl.runner import _build_container_argv
+    from peers_ctl.store import Project
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude").mkdir(parents=True)
+    (fake_home / ".codex").mkdir(parents=True)
+    monkeypatch.setattr(runner.Path, "home", staticmethod(lambda: fake_home))
+    (tmp_path / "tgt").mkdir()
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    argv = _build_container_argv(p, max_ticks=1, extra_args=())
+    assert "opencode" not in " ".join(argv)
+
+
 def test_build_container_argv_carries_pids_limit(tmp_path: Path):
     """podman's default pids cgroup
     is 2048, which gets exhausted by claude/codex orphan grandchildren
@@ -263,7 +307,8 @@ def test_build_container_argv_provides_tmpfs_for_writable_paths(
         if a == "--tmpfs" and i + 1 < len(argv):
             tmpfs_specs.append(argv[i + 1])
     targets = {spec.split(":", 1)[0] for spec in tmpfs_specs}
-    for required in ("/tmp", "~/.cache", "~/.npm"):
+    for required in ("/tmp", "~/.cache", "~/.npm",
+                     "~/.local/state"):
         assert required in targets, (
             f"missing --tmpfs {required} in argv (tmpfs_specs="
             f"{tmpfs_specs!r}, argv={argv!r})"
@@ -381,9 +426,50 @@ def test_build_auth_proxy_argv_owns_claude_json_mount(
     assert "--name" in argv
     assert "peers-auth-proxy_x" in argv
     assert f"{tmp_path / '.claude.json'}:/auth/.claude.json" in argv
-    assert "/auth:rw,nosuid,nodev,size=4m,mode=700" in argv
+    # The proxy runs as the token-file owner (the invoking host uid) and the
+    # /auth tmpfs is traversable+writable by it (mode 1733: owner rwx, others
+    # wx, sticky) so it can read the mode-600 token and write the refresh
+    # temp file under --userns=keep-id, where the default user is NOT the
+    # token owner. mode=700 (root-owned tmpfs) made the uid-1000 proxy unable
+    # to even traverse /auth -> EACCES on the token (the auth-proxy 502).
+    assert "/auth:rw,nosuid,nodev,size=4m,mode=1733" in argv
+    assert "/auth:rw,nosuid,nodev,size=4m,mode=700" not in argv
+    assert "--user" in argv
+    assert f"{os.getuid()}:{os.getgid()}" in argv
     assert "--network=container:peers-egress-proxy_x" in argv
     assert "--read-only" in argv
+
+
+def test_build_auth_proxy_argv_prefers_relocated_credentials(
+    tmp_path: Path,
+) -> None:
+    """claude-code relocated the OAuth token from ~/.claude.json to
+    ~/.claude/.credentials.json. The auth-proxy must mount that file when it
+    exists (the proxy reads /auth/.claude.json regardless of host source)."""
+    from peers_ctl.runner import _build_auth_proxy_argv
+    from peers_ctl.store import Project
+    (tmp_path / ".claude.json").write_text("{}")
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / ".credentials.json").write_text("{}")
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+
+    argv = _build_auth_proxy_argv(p, home=tmp_path)
+
+    creds = tmp_path / ".claude" / ".credentials.json"
+    assert f"{creds}:/auth/.claude.json" in argv
+    assert f"{tmp_path / '.claude.json'}:/auth/.claude.json" not in argv
+
+
+def test_build_auth_proxy_argv_falls_back_to_claude_json(tmp_path: Path) -> None:
+    """No relocated credentials file -> mount legacy ~/.claude.json."""
+    from peers_ctl.runner import _build_auth_proxy_argv
+    from peers_ctl.store import Project
+    (tmp_path / ".claude.json").write_text("{}")
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+
+    argv = _build_auth_proxy_argv(p, home=tmp_path)
+
+    assert f"{tmp_path / '.claude.json'}:/auth/.claude.json" in argv
 
 
 def test_build_container_argv_uses_auth_proxy_without_claude_json_mount(

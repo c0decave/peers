@@ -39,6 +39,16 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _commits_between(repo: Path, since: str | None, until: str | None) -> list[str]:
+    """Return the SHAs in ``(since, until]``, oldest-first."""
+    if not since or not until:
+        return []
+    r = _git(repo, "rev-list", "--reverse", f"{since}..{until}")
+    if r.returncode != 0:
+        return []
+    return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
+
 def commits_in_range(repo: Path, since: str | None) -> list[str]:
     """Return the SHAs in ``(since, HEAD]``, oldest-first.
 
@@ -48,12 +58,7 @@ def commits_in_range(repo: Path, since: str | None) -> list[str]:
     ``since`` is falsy (bootstrap: no prior HEAD to diff against) or on any git
     error.
     """
-    if not since:
-        return []
-    r = _git(repo, "rev-list", "--reverse", f"{since}..HEAD")
-    if r.returncode != 0:
-        return []
-    return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+    return _commits_between(repo, since, "HEAD")
 
 
 def attest_commits(
@@ -68,7 +73,7 @@ def attest_commits(
     No-op (returns ``[]``) when ``since_sha`` is falsy (first tick / bootstrap)
     or the range is empty (the tick produced no commits).
     """
-    shas = commits_in_range(repo, since_sha)
+    shas = _commits_between(repo, since_sha, head_sha)
     for sha in shas:
         _git(repo, "notes", f"--ref={NOTES_REF}", "add", "-f", "-m", peer, sha)
     return shas

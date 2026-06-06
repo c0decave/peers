@@ -54,6 +54,24 @@ def test_attest_covers_every_commit_in_range(tmp_path):
     assert attest.attested_peer(tmp_path, base) is None
 
 
+def test_attest_commits_stops_at_observed_head(tmp_path):
+    """BUG-144: attest_commits receives the orchestrator's observed
+    head_sha, so it must not attribute commits that appear after that
+    snapshot. Otherwise a concurrent/manual commit between the HEAD
+    capture and notes write could be misattributed to the peer whose
+    tick just ended."""
+    _init(tmp_path)
+    base = _commit(tmp_path, "base.py")
+    observed = _commit(tmp_path, "observed.py")
+    later = _commit(tmp_path, "later.py")
+
+    written = attest.attest_commits(tmp_path, "codex", base, observed)
+
+    assert written == [observed]
+    assert attest.attested_peer(tmp_path, observed) == "codex"
+    assert attest.attested_peer(tmp_path, later) is None
+
+
 def test_attest_none_since_is_noop(tmp_path):
     _init(tmp_path)
     a = _commit(tmp_path, "a.py")
@@ -93,3 +111,38 @@ def test_commits_in_range_none_since_is_empty(tmp_path):
     _init(tmp_path)
     _commit(tmp_path, "a.py")
     assert attest.commits_in_range(tmp_path, None) == []
+
+
+def test_commits_in_range_invalid_since_returns_empty(tmp_path):
+    """sad: a non-existent ``since`` SHA must NOT crash and must NOT
+    silently fall through to "all commits" — git rev-list will fail
+    with rc!=0 and ``commits_in_range`` returns ``[]``. The
+    orchestrator relies on this fail-closed contract: bogus delta →
+    nothing attributed, rather than attributing the whole history to
+    one peer."""
+    _init(tmp_path)
+    _commit(tmp_path, "a.py")
+    assert attest.commits_in_range(tmp_path, "deadbeef" * 5) == []
+
+
+def test_attested_peer_unknown_sha_returns_none(tmp_path):
+    """sad: ``attested_peer`` for a SHA git doesn't recognise must
+    return ``None`` (not raise) — the reviewer-checkoff gate uses the
+    None result to mean "no substrate attribution, fall back to
+    trailer". Crashing would convert a single bad lookup into a hard
+    orchestrator halt."""
+    _init(tmp_path)
+    _commit(tmp_path, "a.py")
+    assert attest.attested_peer(tmp_path, "0" * 40) is None
+
+
+def test_attest_commits_on_invalid_since_is_noop(tmp_path):
+    """sad: ``attest_commits`` with a bogus ``since_sha`` must NOT
+    attribute anything — ``commits_in_range`` returns ``[]`` and the
+    write loop is skipped. Defends against the orchestrator attributing
+    a peer to commits it didn't make when HEAD-tracking glitches."""
+    _init(tmp_path)
+    a = _commit(tmp_path, "a.py")
+    written = attest.attest_commits(tmp_path, "claude", "deadbeef" * 5, a)
+    assert written == []
+    assert attest.attested_peer(tmp_path, a) is None

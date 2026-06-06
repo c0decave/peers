@@ -12,7 +12,7 @@ class _TurnManager:
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
-    def advance(self, *, success: bool) -> None:
+    def advance(self, *, success: bool, rate_limited: bool = False) -> None:
         self.events.append(f"turn_advance:{success}")
 
 
@@ -66,6 +66,7 @@ class _Driver:
         post_success: bool = True,
         anti_success: bool | None = None,
         dry_success: bool | None = None,
+        pre_results: dict[str, Any] | None = None,
     ) -> None:
         self.events: list[str] = []
         self.comm = _Comm()
@@ -86,6 +87,7 @@ class _Driver:
         self._post_success = post_success
         self._anti_success = anti_success
         self._dry_success = dry_success
+        self._pre_results = pre_results
 
     def _verify_peer_dir_identity(self) -> None:
         self.events.append("verify")
@@ -99,7 +101,9 @@ class _Driver:
             return {"reason": "pre-exit", "state": state}, {}
         if self._pre_tick_calls > 1:
             return {"reason": "done", "state": state}, {}
-        return None, {"tests-pass": object()}
+        return None, self._pre_results or {
+            "tests-pass": SimpleNamespace(state="pass"),
+        }
 
     def _maybe_checkpoint_exit(
         self, state: dict[str, Any], ticks: int,
@@ -164,6 +168,7 @@ class _Driver:
 
     def _update_peer_health(
         self, state: dict[str, Any], peer: str, success: bool,
+        rate_limited: bool = False,
     ) -> None:
         self.events.append("peer_health")
 
@@ -181,6 +186,17 @@ class _Driver:
 
     def _maybe_halt(self, state: dict[str, Any]) -> None:
         self.events.append("maybe_halt")
+
+    def _refresh_goals_after_tick(
+        self, state: dict[str, Any], goal_ids: Any,
+    ) -> None:
+        self.events.append(f"refresh_goals:{','.join(goal_ids)}")
+        state.setdefault("goals_status", {})["tests-pass"] = {
+            "state": "pass",
+            "diagnostic": "",
+            "duration_ms": 1,
+        }
+        state.setdefault("stuck_counter", {}).pop("tests-pass", None)
 
     def _append_warnings_history(
         self, state: dict[str, Any], warnings: list[str],
@@ -318,8 +334,17 @@ def test_tick_loop_translates_semantic_peer_fields(monkeypatch):
 
 
 def test_failed_tick_advances_false_and_skips_success_only_tamper_check():
-    state = {"iteration": 0}
-    driver = _Driver(post_success=False)
+    state = {
+        "iteration": 0,
+        "goals_status": {
+            "tests-pass": {"state": "fail", "diagnostic": "old"},
+        },
+        "stuck_counter": {"tests-pass": 1},
+    }
+    driver = _Driver(
+        post_success=False,
+        pre_results={"tests-pass": SimpleNamespace(state="fail")},
+    )
 
     result = TickLoop(driver).run(state, _TurnManager(driver.events), None, 0)
 
@@ -327,7 +352,34 @@ def test_failed_tick_advances_false_and_skips_success_only_tamper_check():
     assert state["iteration"] == 1
     assert "turn_advance:False" in driver.events
     assert "tamper" not in driver.events
+    assert not any(e.startswith("refresh_goals") for e in driver.events)
+    assert state["goals_status"]["tests-pass"]["state"] == "fail"
+    assert state["stuck_counter"]["tests-pass"] == 1
     assert "run_log:12:0.5" in driver.events
+
+
+def test_successful_tick_refreshes_post_handoff_goal_status():
+    state = {
+        "iteration": 0,
+        "goals_status": {
+            "tests-pass": {"state": "fail", "diagnostic": "stale"},
+        },
+        "stuck_counter": {"tests-pass": 3},
+    }
+    driver = _Driver(
+        pre_results={"tests-pass": SimpleNamespace(state="fail")},
+    )
+
+    result = TickLoop(driver).run(state, _TurnManager(driver.events), None, 0)
+
+    assert result["reason"] == "done"
+    assert state["goals_status"]["tests-pass"]["state"] == "pass"
+    assert "tests-pass" not in state["stuck_counter"]
+    assert (
+        driver.events.index("attest")
+        < driver.events.index("refresh_goals:tests-pass")
+        < driver.events.index("run_log:12:0.5")
+    )
 
 
 def test_tick_loop_returns_pre_tick_exit_before_checkpoint_or_invoke():

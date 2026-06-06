@@ -37,6 +37,11 @@ class Goal:
     # `quorum: "2/3"` in YAML becomes (2, 3) at load time.
     quorum_num: int | None = None
     quorum_den: int | None = None
+    # Per-goal subprocess deadline that overrides the engine-wide
+    # default. `None` means inherit `GoalEngine.timeout_s`. Documented
+    # in templates as `Goal.timeout_s`; before BUG-146 the field was
+    # missing so the override was silently dropped.
+    timeout_s: int | None = None
 
 
 def _parse_quorum(raw: Any, gid: str) -> tuple[int | None, int | None]:
@@ -135,6 +140,11 @@ def load_goals(path: Path) -> list[Goal]:
             entry.get("review_interval", 5), "review_interval", gid
         )
         quorum_num, quorum_den = _parse_quorum(entry.get("quorum"), gid)
+        timeout_s_raw = entry.get("timeout_s")
+        if timeout_s_raw is None:
+            timeout_s: int | None = None
+        else:
+            timeout_s = _positive_int(timeout_s_raw, "timeout_s", gid)
         reviewer = entry.get("reviewer")
         if reviewer is not None and reviewer not in VALID_REVIEWER_MODES:
             raise ValueError(
@@ -157,6 +167,7 @@ def load_goals(path: Path) -> list[Goal]:
             review_interval=review_interval,
             quorum_num=quorum_num,
             quorum_den=quorum_den,
+            timeout_s=timeout_s,
         )
         if g.type == "hard":
             if not isinstance(g.cmd, str) or not g.cmd.strip():

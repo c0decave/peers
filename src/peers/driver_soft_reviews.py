@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from peers.driver_helpers import _extract_first_json_object
@@ -7,6 +8,11 @@ from peers.goals import Goal
 
 
 _SOFT_CONSENSUS_FALSY = frozenset({"false", "0", "no", "off", ""})
+_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def _looks_like_git_sha(value: str) -> bool:
+    return bool(_GIT_SHA_RE.fullmatch(value.strip()))
 
 
 def soft_consensus_required_for_convergence(state: dict[str, Any]) -> bool:
@@ -134,11 +140,31 @@ class DriverSoftReviewsMixin:
                 return False
         return True
 
+    def _soft_goal_for_review_target(self, goal_id: str | None) -> Goal | None:
+        if not goal_id:
+            return None
+        return next(
+            (g for g in self.goals if g.id == goal_id and g.type == "soft"),
+            None,
+        )
+
+    def _peer_review_trailer_is_soft_goal(self, goal_id: str | None) -> bool:
+        """True when Peer-Review-Of should count as soft-review accounting."""
+        if not goal_id:
+            return False
+        if self._soft_goal_for_review_target(goal_id) is not None:
+            return True
+        # The general peer protocol also uses Peer-Review-Of for product
+        # code reviews targeted at commits. Those are not soft-goal attempts.
+        return not _looks_like_git_sha(goal_id)
+
     def _record_soft_review_from_commit(self, state: dict[str, Any],
                                         commit, reviewer: str) -> bool:
         """G4: a peer can ship a soft review by committing with body
         containing `## Review` plus a `Peer-Review-Of: <goal_id>`
-        trailer. The body must be parseable as JSON (one block).
+        trailer. SHA-shaped Peer-Review-Of values are product code-review
+        targets, not soft reviews. The body must be parseable as JSON (one
+        block).
 
         Parsing failures used to be silent — the peer would never
         learn why their review didn't count. We now surface each
@@ -155,11 +181,10 @@ class DriverSoftReviewsMixin:
         goal_id = commit.trailers.get("Peer-Review-Of")
         if not goal_id:
             return False
-        target_goal = next(
-            (g for g in self.goals if g.id == goal_id and g.type == "soft"),
-            None,
-        )
+        target_goal = self._soft_goal_for_review_target(goal_id)
         if target_goal is None:
+            if _looks_like_git_sha(goal_id):
+                return False
             state.setdefault("warnings", []).append(
                 f"soft-review ignored: commit {commit.sha[:8]} carries "
                 f"Peer-Review-Of: {goal_id!r} but no soft goal with "

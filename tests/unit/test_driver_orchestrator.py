@@ -11,6 +11,7 @@ from peers.driver_orchestrator import (
     OrchestratorDriver, BudgetCheck, _apply_config_budget,
 )
 from peers.health_guard import RunResult
+from peers.goal_engine import GoalResult
 from peers.peer_spec import PeerSpec
 from peers.state_store import DEFAULT_STATE
 
@@ -397,6 +398,85 @@ def test_budget_exit_re_evaluates_goals(tmp_path: Path):
         f"budget-exit failed to re-evaluate hard goals; "
         f"saved={saved['goals_status']}"
     )
+
+
+def test_post_tick_goal_refresh_clears_stale_failure(tmp_path: Path, monkeypatch):
+    repo = _make_repo(tmp_path / "r")
+    drv = _make_driver(repo)
+    state = copy.deepcopy(DEFAULT_STATE)
+    state["goals_status"] = {
+        "tests-pass": {"state": "fail", "diagnostic": "stale"},
+    }
+    state["stuck_counter"] = {"tests-pass": 2}
+
+    monkeypatch.setattr(
+        drv.engine,
+        "evaluate_hard_gates",
+        lambda **_kwargs: {
+            "tests-pass": GoalResult("tests-pass", "pass", 5),
+        },
+    )
+
+    drv._refresh_goals_after_tick(state, ["tests-pass"])
+
+    assert state["goals_status"]["tests-pass"]["state"] == "pass"
+    assert "tests-pass" not in state["stuck_counter"]
+
+
+def test_post_tick_goal_refresh_does_not_double_count_persistent_failure(
+    tmp_path: Path, monkeypatch,
+):
+    repo = _make_repo(tmp_path / "r")
+    drv = _make_driver(repo)
+    state = copy.deepcopy(DEFAULT_STATE)
+    state["goals_status"] = {
+        "tests-pass": {"state": "fail", "diagnostic": "pre-tick"},
+    }
+    state["stuck_counter"] = {"tests-pass": 4}
+
+    monkeypatch.setattr(
+        drv.engine,
+        "evaluate_hard_gates",
+        lambda **_kwargs: {
+            "tests-pass": GoalResult(
+                "tests-pass", "fail", 5, diagnostic="still red",
+            ),
+        },
+    )
+
+    drv._refresh_goals_after_tick(state, ["tests-pass"])
+
+    assert state["goals_status"]["tests-pass"]["state"] == "fail"
+    assert state["goals_status"]["tests-pass"]["diagnostic"] == "still red"
+    assert state["stuck_counter"]["tests-pass"] == 4
+
+
+def test_post_tick_goal_refresh_records_new_failure(
+    tmp_path: Path, monkeypatch,
+):
+    repo = _make_repo(tmp_path / "r")
+    drv = _make_driver(repo)
+    state = copy.deepcopy(DEFAULT_STATE)
+    state["goals_status"] = {
+        "tests-pass": {"state": "pass", "diagnostic": ""},
+    }
+    state["stuck_counter"] = {}
+
+    monkeypatch.setattr(
+        drv.engine,
+        "evaluate_hard_gates",
+        lambda **_kwargs: {
+            "tests-pass": GoalResult(
+                "tests-pass", "fail", 5, diagnostic="new breakage",
+            ),
+        },
+    )
+
+    drv._refresh_goals_after_tick(state, ["tests-pass"])
+
+    assert state["goals_status"]["tests-pass"]["state"] == "fail"
+    assert state["goals_status"]["tests-pass"]["diagnostic"] == "new breakage"
+    assert state["stuck_counter"]["tests-pass"] == 1
 
 
 def test_runs_jsonl_is_appended_per_tick(tmp_path: Path):

@@ -12,6 +12,7 @@ import time
 from typing import Any, Protocol, Sequence
 
 from peers.model_provider import build_peer_argv
+from peers.rate_limit import rate_limit_backoff_s
 
 
 class _Comm(Protocol):
@@ -133,6 +134,11 @@ class TickLoopDriver(Protocol):
     def _maybe_halt(self, state: dict[str, Any]) -> None:
         ...
 
+    def _refresh_goals_after_tick(
+        self, state: dict[str, Any], goal_ids: Sequence[str],
+    ) -> None:
+        ...
+
     def _append_warnings_history(
         self, state: dict[str, Any], warnings: list[str],
     ) -> None:
@@ -192,6 +198,7 @@ _REQUIRED_DRIVER_ATTRS = (
     "_detect_tampering",
     "_attest_tick_commits",
     "_maybe_halt",
+    "_refresh_goals_after_tick",
     "_append_warnings_history",
     "_append_run_log",
     "_save_state",
@@ -225,6 +232,7 @@ class _TickInvocation:
     upcoming_tick: int
     run: Any
     tick_dt: int
+    pre_tick_failed_goal_ids: tuple[str, ...]
 
 
 class TickLoop:
@@ -322,6 +330,10 @@ class TickLoop:
         driver._verify_peer_dir_identity()
         self._validate_run_result(run)
         tick_dt = int(time.monotonic() - tick_t0)
+        pre_tick_failed_goal_ids = tuple(
+            gid for gid, result in results.items()
+            if getattr(result, "state", None) == "fail"
+        )
         return _TickInvocation(
             peer=peer,
             spec=spec,
@@ -329,6 +341,7 @@ class TickLoop:
             upcoming_tick=upcoming_tick,
             run=run,
             tick_dt=tick_dt,
+            pre_tick_failed_goal_ids=pre_tick_failed_goal_ids,
         )
 
     def _handle_halt_if_needed(
@@ -369,14 +382,21 @@ class TickLoop:
         success = driver._apply_anti_cheating_outcome(state, peer, success)
         success = driver._apply_dry_run_reset(state, success)
 
-        turn_manager.advance(success=success)
+        # v17 finding: a transient server rate-limit (429/5xx/overloaded) is
+        # NOT the peer's fault. It must not degrade the peer or count as a
+        # consecutive fail — the loop rotates to the other peer (a natural
+        # backoff) and applies a small explicit backoff to avoid a hot spin
+        # when every peer is being rate-limited at once.
+        rate_limited = getattr(run, "classification", None) == "rate-limited"
+        turn_manager.advance(success=success, rate_limited=rate_limited)
         driver._record_tick_accounting(state, success, invocation.tick_dt, peer=peer)
 
         tokens_this_tick, usd_this_tick = driver._account_tokens_usd(
             state, invocation.spec.tool, run,
         )
 
-        driver._update_peer_health(state, peer, success)
+        driver._update_peer_health(state, peer, success, rate_limited=rate_limited)
+        self._apply_rate_limit_backoff(state, rate_limited, peer)
         state["dirty_worktree"] = driver._dirty_worktree(state)
         if success:
             driver._detect_tampering(state)
@@ -391,6 +411,11 @@ class TickLoop:
         driver._attest_tick_commits(
             peer, driver._head_before_invoke, head_after_sha,
         )
+        if success and invocation.pre_tick_failed_goal_ids:
+            driver._refresh_goals_after_tick(
+                state,
+                invocation.pre_tick_failed_goal_ids,
+            )
         driver._append_run_log(
             state, peer, run, success,
             tokens_this_tick=tokens_this_tick,
@@ -404,6 +429,29 @@ class TickLoop:
             state, peer, run, success, invocation.tick_dt, head_after_sha,
         )
         driver._update_convergence_counter(state)
+
+    def _apply_rate_limit_backoff(
+        self, state: dict[str, Any], rate_limited: bool, peer: str,
+    ) -> None:
+        """Sleep a small, growing backoff after a rate-limited tick (v17).
+
+        The dominant spacing is the OTHER peer's tick (the loop rotated away);
+        this explicit sleep only matters when EVERY peer is rate-limited at
+        once, preventing a hot spin. The streak resets on any non-rate-limited
+        tick."""
+        if not rate_limited:
+            state["rate_limit_streak"] = 0
+            return
+        streak = int(state.get("rate_limit_streak", 0)) + 1
+        state["rate_limit_streak"] = streak
+        delay = rate_limit_backoff_s(streak)
+        if delay > 0:
+            print(
+                f"peers: peer={peer} rate-limited (streak={streak}); "
+                f"backing off {delay}s before next tick",
+                file=sys.stderr, flush=True,
+            )
+            time.sleep(delay)
 
     @staticmethod
     def _validate_driver_contract(driver: object) -> None:

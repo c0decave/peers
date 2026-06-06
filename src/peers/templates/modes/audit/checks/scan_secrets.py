@@ -25,6 +25,15 @@ PATTERNS = [
 ]
 SKIP = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv", ".peers"}
 MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_ALLOWLIST_BYTES = 64 * 1024
+
+# per-repo file listing documented false positives. fa15e9f added
+# the file but the scanner never read it. Format per non-empty/non-comment
+# line: ``path:line:label`` where ``path`` is relative to the scan root,
+# ``line`` is the 1-based line number, and ``label`` is the exact pattern
+# label the scanner emits (e.g. ``private key``, ``API key``). Lines that
+# start with ``#`` and blank lines are ignored.
+ALLOWLIST_FILENAME = ".secrets-allowlist"
 
 
 def tracked_files(root: str) -> list[Path]:
@@ -37,9 +46,44 @@ def tracked_files(root: str) -> list[Path]:
     return [path for path in Path(root).rglob("*") if path.is_file()]
 
 
+def load_allowlist(root: str) -> set[tuple[str, int, str]]:
+    """Return the set of ``(rel_path, line, label)`` triples exempted via
+    ``.secrets-allowlist``. Missing file → empty set (no exemptions).
+    Unsafe, oversized, and malformed entries are skipped: an unparseable
+    line just fails to exempt anything, it cannot widen exposure.
+    BUG-143, BUG-149."""
+    allow: set[tuple[str, int, str]] = set()
+    try:
+        raw_bytes = read_bytes_no_symlink(
+            Path(root) / ALLOWLIST_FILENAME,
+            max_bytes=MAX_ALLOWLIST_BYTES + 1,
+        )
+    except OSError:
+        return allow
+    if len(raw_bytes) > MAX_ALLOWLIST_BYTES:
+        return allow
+    raw = raw_bytes.decode("utf-8", errors="replace")
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split(":", 2)
+        if len(parts) != 3:
+            continue
+        rel_path, lineno_str, label = (p.strip() for p in parts)
+        try:
+            lineno = int(lineno_str)
+        except ValueError:
+            continue
+        allow.add((rel_path, lineno, label))
+    return allow
+
+
 def main(root: str = ".") -> int:
     findings: list[str] = []
     files = tracked_files(root)
+    allowlist = load_allowlist(root)
+    root_path = Path(root)
     for file in files:
         if any(part in SKIP for part in file.parts):
             continue
@@ -54,9 +98,15 @@ def main(root: str = ".") -> int:
             findings.append(f"{file}: file too large to scan (>{MAX_FILE_BYTES} bytes)")
             continue
         text = raw.decode("utf-8", errors="ignore")
+        try:
+            rel = file.relative_to(root_path).as_posix()
+        except ValueError:
+            rel = file.as_posix()
         for rx, label in PATTERNS:
             for match in rx.finditer(text):
                 line = text[:match.start()].count("\n") + 1
+                if (rel, line, label) in allowlist:
+                    continue
                 findings.append(f"{file}:{line}: {label}")
     if findings:
         print("secrets FAIL:\n  " + "\n  ".join(findings))

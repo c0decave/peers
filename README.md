@@ -49,6 +49,7 @@ Available modes: see `peers-ctl modes list`. Stack multiple with
 | `audit` | bug-hunt + 3-class test coverage + secrets + deps + API stability + regression + diff-size + skip/xfail justification |
 | `thorough` | anti-convergence-theater hard gate: N=3 consecutive clean ticks + skeptic-pass + aggressive-honesty soft goals |
 | `describe` | iterative doc-writing mode — peers write SPEC.md/ARCHITECTURE.md/DESIGN.md until N consecutive non-substantive doc commits. Use BEFORE audit on a repo that lacks docs; not composable with audit modes |
+| `document` | generate + maintain machine-readable docs: a `CODEMAP.yaml` drift-gated against the parsed AST (every entry maps to a real symbol with a matching signature), plus `AGENTS.md` and `ARCHITECTURE.md` kept in sync with it. Docs that can't silently rot; stackable, or run standalone before an audit |
 | `implement` | end-to-end feature implementation from a markdown PLAN.md — frozen acceptance contract, blind-review between peers, reviewer-only checkoffs, HONESTY_AUDIT + cleanliness gates (no TODO/FIXME/stubs/skipped tests at convergence). Standalone; see [docs/MODES_IMPLEMENT.md](docs/MODES_IMPLEMENT.md) |
 
 Typical multi-mode runs:
@@ -63,6 +64,9 @@ peers-ctl new myapp --modes=audit
 # write docs first, audit later (two separate runs):
 peers-ctl new myapp --modes=describe                   # run 1
 peers-ctl new myapp-audit --modes=audit,thorough       # run 2
+
+# generate verified, drift-gated docs (CODEMAP + AGENTS.md + ARCHITECTURE.md):
+peers-ctl new myapp --modes=document
 
 # implement a feature from a PLAN.md (standalone — not composable):
 peers-ctl new myfeature --container --modes=implement --plan ./PLAN.md
@@ -242,6 +246,27 @@ commits. Hard gates:
 Run `--modes=describe` FIRST on a repo that lacks docs, cherry-pick
 the produced files into a follow-up `--modes=audit,…` run.
 
+### `document` (generate + drift-gate machine-readable docs)
+
+Peers build a verified, machine-readable **`CODEMAP.yaml`** of the
+codebase, then keep **`AGENTS.md`** and **`ARCHITECTURE.md`** in sync
+with it. Unlike `describe` (free-form prose), every artifact is gated
+against the parsed AST, so the docs cannot silently rot. Hard gates:
+- `codemap-grounded` / `codemap-signature-match` / `codemap-complete`:
+  every CODEMAP entry maps to a real symbol, signatures match the parsed
+  AST, and the public API is fully covered (no missing or phantom nodes)
+- `codemap-summaries-complete`: every entry carries a human summary
+- `agents-in-sync`: `AGENTS.md` matches the CODEMAP it derives from
+- `architecture-grounded`: every anchor in `ARCHITECTURE.md` resolves to
+  a real CODEMAP node
+
+Soft goals: `summaries-cross-review` + `architecture-cross-review` — the
+other peer reviews the generated prose for accuracy.
+
+**Stackable**, but commonly run on its own to lay down docs:
+`--modes=document`. A substrate-only structural CODEMAP also runs as a
+free pre-tick step in every mode (opt out with `--no-codemap`).
+
 ### `implement` (build a feature from PLAN.md)
 
 End-to-end feature implementation from a markdown PLAN.md.
@@ -257,6 +282,7 @@ reviewer-only checkoffs, escape valves (`[PARTIAL]` / `[BLOCKED]` /
 |---|---|
 | First touch on undocumented repo | `--modes=describe` (alone, run-1) then `--modes=audit,thorough` (run-2) |
 | Existing Python lib / CLI tool | `audit,thorough` |
+| Want living, drift-gated docs (CODEMAP/AGENTS/ARCHITECTURE) | `--modes=document` |
 | Implement a planned feature | `--modes=implement --plan ./PLAN.md` |
 
 `peers-ctl modes list` always shows the current built-in set.

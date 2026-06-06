@@ -11,9 +11,30 @@ def _driver_module() -> Any:
     return driver_orchestrator
 
 
+def _recent_fails(history: list[Any]) -> float:
+    """Sum the fail-credit of a recent_runs window. True=0.0, False=1.0,
+    float entry x contributes (1 - x). Stored as float so the DEGRADED
+    threshold sees the exact fractional total without rounding-up."""
+    total = 0.0
+    for x in history:
+        if x is True:
+            pass
+        elif x is False:
+            total += 1.0
+        else:
+            total += (1.0 - float(x))
+    return total
+
+
+# A degraded peer is benched, but after this many iterations it gets ONE
+# recovery turn (instead of being starved forever while a healthy peer exists).
+# A failed recovery restarts the cooldown; a success returns it to healthy.
+DEFAULT_RECOVERY_INTERVAL = 8
+
+
 class DriverPeerHealthMixin:
     def _update_peer_health(self, state: dict[str, Any], peer: str,
-                            success: bool) -> None:
+                            success: bool, rate_limited: bool = False) -> None:
         """Track per-peer recent failures (sliding window of 5). A peer
         with ≥ 3 failures out of the last 5 is marked `degraded`; a
         single success returns it to `healthy`. This is asymmetric on
@@ -28,6 +49,16 @@ class DriverPeerHealthMixin:
         bias check happens at the loop level via stuck_counter.)"""
         t = state["peers"][peer]
         history = t.setdefault("recent_runs", [])  # list of bool OR float
+        # v17 finding: a TRANSIENT server rate-limit (429/5xx/overloaded) is
+        # not the peer's fault. It counts as a neutral entry (0.0 fail credit),
+        # never pushes the peer toward DEGRADED, and leaves the current state +
+        # recovery cooldown untouched — the loop rotated away and will retry.
+        if rate_limited:
+            history.append(True)
+            if len(history) > 5:
+                del history[:-5]
+            t["recent_fails"] = _recent_fails(history)
+            return
         # Bug C: productive-commit-no-handoff counts as 0.5 fail (not 1.0).
         # Peers committing real work but missing the handoff trailer should
         # be hinted toward fixing the format, not penalized into DEGRADED.
@@ -44,17 +75,7 @@ class DriverPeerHealthMixin:
         history.append(entry)
         if len(history) > 5:
             del history[:-5]
-        # Treat True as 0.0 fail, False as 1.0 fail, float entry as
-        # (1 - value). Stored as float so DEGRADED threshold sees the
-        # exact fractional total without rounding-up surprises.
-        recent_fails = 0.0
-        for x in history:
-            if x is True:
-                pass
-            elif x is False:
-                recent_fails += 1.0
-            else:
-                recent_fails += (1.0 - float(x))
+        recent_fails = _recent_fails(history)
         t["recent_fails"] = recent_fails
         prev_state = t.get("state")
         if success and prev_state == "degraded":
@@ -64,6 +85,10 @@ class DriverPeerHealthMixin:
             # stale "degraded since tick N" when state is healthy.
             t.pop("degraded_reason", None)
             t.pop("degraded_at_iter", None)
+            # I4: clear the recovery cooldown too, else a later re-degradation
+            # inherits this stale marker and is granted an immediate recovery
+            # turn instead of waiting the full cooldown.
+            t.pop("recovery_cooldown_iter", None)
         elif (not success) and recent_fails >= 3:
             t["state"] = "degraded"
             if prev_state != "degraded":
@@ -74,6 +99,15 @@ class DriverPeerHealthMixin:
                         else round(recent_fails, 1)
                     ),
                 )
+            else:
+                # v17 anti-starvation: an already-degraded peer that ran this
+                # tick (a recovery attempt) and failed restarts its recovery
+                # cooldown, so it is benched again rather than retried every
+                # tick — but it is NOT starved forever (turn_manager grants a
+                # fresh recovery turn after the cooldown elapses). Tracked in a
+                # SEPARATE field so `degraded_at_iter` stays the immutable
+                # first-degradation marker the operator sees.
+                t["recovery_cooldown_iter"] = state.get("iteration", 0)
         elif t.get("failed_cheating", 0) >= 2:
             t["state"] = "degraded"
             if prev_state != "degraded":

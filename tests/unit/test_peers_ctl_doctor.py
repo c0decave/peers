@@ -417,3 +417,188 @@ def test_cli_dispatches_doctor_subcommand(monkeypatch, tmp_path):
 
     assert rc == 0
     assert called.get("yes") is True
+
+
+# ---------------------------------------------------------------------------
+# probe_claude_smoke() + run_doctor(claude_smoke=...) — opt-in live preflight
+#
+# The smoke launches a REAL `claude -p` in a throwaway peer container (wired
+# exactly like a real turn) and fails fast on a startup hang. Heavy, so it is
+# NOT in the default _PROBES; every test stubs the single podman/claude seam
+# (`_run_claude_smoke_container`) and the sidecar lifecycle so the suite never
+# touches the host.
+# ---------------------------------------------------------------------------
+
+
+def _ok_probe():
+    return doctor_mod.ProbeResult(
+        status="OK", label="stub", value="ok", hint="", required=True,
+    )
+
+
+def _stub_smoke_sidecars(monkeypatch, calls=None):
+    """Neutralize the real podman sidecar lifecycle; optionally record order."""
+    def _ens(_project):
+        if calls is not None:
+            calls.append("ensure")
+
+    def _stop(_project):
+        if calls is not None:
+            calls.append("stop")
+
+    monkeypatch.setattr(doctor_mod, "_ensure_smoke_sidecars", _ens)
+    monkeypatch.setattr(doctor_mod, "_stop_smoke_sidecars", _stop)
+
+
+def _set_smoke_outcome(monkeypatch, outcome=None, raises=None, calls=None):
+    def _run(_project, _timeout_s):
+        if calls is not None:
+            calls.append("run")
+        if raises is not None:
+            raise raises
+        return outcome
+
+    monkeypatch.setattr(doctor_mod, "_run_claude_smoke_container", _run)
+
+
+def test_run_doctor_excludes_claude_smoke_by_default(monkeypatch):
+    """Bare `peers-ctl doctor` must NOT run the heavy live smoke."""
+    ran = {"smoke": False}
+
+    def _boom():
+        ran["smoke"] = True
+        return _ok_probe()
+
+    monkeypatch.setattr(doctor_mod, "probe_claude_smoke", _boom)
+
+    rc = doctor_mod.run_doctor(probes=(_ok_probe,))
+
+    assert rc == 0
+    assert ran["smoke"] is False
+
+
+def test_run_doctor_includes_claude_smoke_when_requested(monkeypatch, capsys):
+    called = {"n": 0}
+
+    def _smoke():
+        called["n"] += 1
+        return doctor_mod.ProbeResult(
+            status="OK", label="claude smoke", value="replied",
+            hint="", required=True,
+        )
+
+    monkeypatch.setattr(doctor_mod, "probe_claude_smoke", _smoke)
+
+    rc = doctor_mod.run_doctor(probes=(), claude_smoke=True)
+
+    assert called["n"] == 1
+    assert rc == 0
+    assert "claude smoke" in capsys.readouterr().out
+
+
+def test_probe_claude_smoke_ok_on_model_output(monkeypatch):
+    _stub_smoke_sidecars(monkeypatch)
+    _set_smoke_outcome(monkeypatch, doctor_mod.SmokeOutcome(
+        returncode=0, stdout="OK\n", stderr="", timed_out=False,
+        duration_s=3.2,
+    ))
+
+    result = doctor_mod.probe_claude_smoke()
+
+    assert result.status == "OK"
+    assert result.required is True
+    assert "repl" in result.value.lower()
+
+
+def test_probe_claude_smoke_miss_on_timeout(monkeypatch):
+    _stub_smoke_sidecars(monkeypatch)
+    _set_smoke_outcome(monkeypatch, doctor_mod.SmokeOutcome(
+        returncode=None, stdout="", stderr="", timed_out=True,
+        duration_s=90.0,
+    ))
+
+    result = doctor_mod.probe_claude_smoke()
+
+    assert result.status == "MISS"
+    assert result.required is True
+    assert "hang" in (result.value + " " + result.hint).lower()
+
+
+def test_probe_claude_smoke_miss_on_config_hang_signature(monkeypatch):
+    _stub_smoke_sidecars(monkeypatch)
+    _set_smoke_outcome(monkeypatch, doctor_mod.SmokeOutcome(
+        returncode=1, stdout="",
+        stderr="Claude configuration file not found at: "
+               "~/.claude.json",
+        timed_out=False, duration_s=2.0,
+    ))
+
+    result = doctor_mod.probe_claude_smoke()
+
+    assert result.status == "MISS"
+    assert "configuration file not found" in result.hint.lower()
+
+
+def test_probe_claude_smoke_miss_on_empty_output(monkeypatch):
+    _stub_smoke_sidecars(monkeypatch)
+    _set_smoke_outcome(monkeypatch, doctor_mod.SmokeOutcome(
+        returncode=0, stdout="   \n", stderr="", timed_out=False,
+        duration_s=2.0,
+    ))
+
+    result = doctor_mod.probe_claude_smoke()
+
+    assert result.status == "MISS"
+
+
+def test_probe_claude_smoke_stops_sidecars_even_on_error(monkeypatch):
+    calls = []
+    _stub_smoke_sidecars(monkeypatch, calls)
+    _set_smoke_outcome(monkeypatch, raises=RuntimeError("boom"), calls=calls)
+
+    result = doctor_mod.probe_claude_smoke()
+
+    # Teardown happened despite the failure, and the probe degraded to a
+    # MISS (a doctor probe must never crash the report).
+    assert "stop" in calls
+    assert result.status == "MISS"
+
+
+def test_probe_claude_smoke_ensures_before_run_and_stops_after(monkeypatch):
+    calls = []
+    _stub_smoke_sidecars(monkeypatch, calls)
+    _set_smoke_outcome(monkeypatch, doctor_mod.SmokeOutcome(
+        returncode=0, stdout="OK\n", stderr="", timed_out=False,
+        duration_s=1.0,
+    ), calls=calls)
+
+    doctor_mod.probe_claude_smoke()
+
+    assert calls == ["ensure", "run", "stop"]
+
+
+def test_cmd_doctor_forwards_claude_smoke_flag(monkeypatch):
+    seen = {}
+
+    def fake_run_doctor(*_args, **kwargs):
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(doctor_mod, "run_doctor", fake_run_doctor)
+
+    from peers_ctl.cli import cmd_doctor
+    rc = cmd_doctor(claude_smoke=True)
+
+    assert rc == 0
+    assert seen.get("claude_smoke") is True
+
+
+def test_doctor_parser_accepts_claude_smoke_flag():
+    from peers_ctl.cli import build_parser
+    parser = build_parser()
+
+    args = parser.parse_args(["doctor", "--claude-smoke"])
+    assert args.claude_smoke is True
+
+    args2 = parser.parse_args(["doctor"])
+    assert args2.claude_smoke is False

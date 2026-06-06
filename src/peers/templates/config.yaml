@@ -30,9 +30,12 @@ peers:
 
   - name: codex
     tool: codex
-    # Optional semantic controls. Explicit argv flags still win.
-    # model: gpt-5.1-codex-max
-    # reasoning: xhigh             # minimal|low|medium|high|xhigh
+    # Default to the latest model at the highest reasoning effort. xhigh IS
+    # codex's max effort — there is no "pro"/"max" tier on the codex CLI (those
+    # are API/opencode tiers). Override per-project; an explicit argv -m /
+    # -c model=... still wins.
+    model: gpt-5.5
+    reasoning: xhigh             # minimal|low|medium|high|xhigh
     # provider: openai             # openai|openrouter
     # `--dangerously-bypass-approvals-and-sandbox` disables codex's
     # internal bubblewrap `workspace-write` sandbox. We rely on the

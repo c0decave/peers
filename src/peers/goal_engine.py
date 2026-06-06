@@ -8,12 +8,13 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from peers.goals import Goal, evaluate_pass_when
 
 _GOAL_OUTPUT_CAP_BYTES = 2 * 1024 * 1024
 _GOAL_TERM_GRACE_S = 1.0
+_GOAL_DIAGNOSTIC_TAIL_CHARS = 1000
 
 
 def _append_capped(
@@ -177,6 +178,22 @@ class GoalResult:
     extras: dict[str, Any] = field(default_factory=dict)
 
 
+def _failure_diagnostic(
+    reason: str,
+    proc: subprocess.CompletedProcess[str],
+) -> str:
+    parts = [reason, f"exit_code={proc.returncode}"]
+    if proc.stdout:
+        parts.append(
+            f"stdout-tail={proc.stdout[-_GOAL_DIAGNOSTIC_TAIL_CHARS:]!r}"
+        )
+    if proc.stderr:
+        parts.append(
+            f"stderr-tail={proc.stderr[-_GOAL_DIAGNOSTIC_TAIL_CHARS:]!r}"
+        )
+    return "; ".join(parts)
+
+
 class GoalEngine:
     def __init__(
         self,
@@ -189,21 +206,31 @@ class GoalEngine:
         self.timeout_s = timeout_s
         self._last: dict[str, GoalResult] = {}
 
-    def evaluate_hard_gates(self) -> dict[str, GoalResult]:
+    def evaluate_hard_gates(
+        self,
+        goal_ids: Iterable[str] | None = None,
+    ) -> dict[str, GoalResult]:
+        selected = set(goal_ids) if goal_ids is not None else None
         results: dict[str, GoalResult] = {}
         for g in self.goals:
             if g.type != "hard":
                 continue
+            if selected is not None and g.id not in selected:
+                continue
             results[g.id] = self._run_hard(g)
-        self._last = results
+        if selected is None:
+            self._last = results
+        else:
+            self._last = {**self._last, **results}
         return results
 
     def _run_hard(self, g: Goal) -> GoalResult:
         assert g.cmd is not None, f"hard goal {g.id} has no cmd"
         assert g.pass_when is not None, f"hard goal {g.id} has no pass_when"
         t0 = time.monotonic()
+        timeout_s = g.timeout_s if g.timeout_s is not None else self.timeout_s
         try:
-            proc = _run_goal_cmd(g.cmd, self.cwd, self.timeout_s)
+            proc = _run_goal_cmd(g.cmd, self.cwd, timeout_s)
         except subprocess.TimeoutExpired as e:
             dur = int((time.monotonic() - t0) * 1000)
             tail_out = (e.stdout or "")[-1000:] if isinstance(e.stdout, str) else ""
@@ -224,13 +251,15 @@ class GoalEngine:
         except Exception as e:
             return GoalResult(
                 g.id, "fail", dur,
-                diagnostic=f"pass_when error: {e}",
+                diagnostic=_failure_diagnostic(f"pass_when error: {e}", proc),
             )
         return GoalResult(
             g.id,
             "pass" if passed else "fail",
             dur,
-            diagnostic="" if passed else "pass_when returned False",
+            diagnostic="" if passed else _failure_diagnostic(
+                "pass_when returned False", proc
+            ),
         )
 
     def all_green(self) -> bool:

@@ -527,15 +527,30 @@ def _build_proxy_argv(project: Project) -> list[str]:
 
 def _build_auth_proxy_argv(project: Project, home: Path | None = None) -> list[str]:
     home = home or Path.home()
-    token_file = home / ".claude.json"
+    # claude-code relocated the OAuth access/refresh token from ~/.claude.json
+    # (which now holds only account metadata) to ~/.claude/.credentials.json
+    # (key `claudeAiOauth`). Prefer the relocated file when present; fall back
+    # to the legacy path for older clients. The proxy always reads it at the
+    # fixed in-container path /auth/.claude.json, so only the host source moves.
+    relocated = home / ".claude" / ".credentials.json"
+    token_file = relocated if relocated.is_file() else home / ".claude.json"
+    # Run as the invoking host uid (= the token-file owner). Under
+    # --userns=keep-id the default container user is NOT the token owner, and
+    # with cap-drop=ALL it lacks CAP_DAC_OVERRIDE, so it cannot read the
+    # mode-600 token (the long-standing "auth-proxy 502: Permission denied on
+    # /auth/.claude.json"). Running as the owner uid makes the read/refresh work
+    # at least privilege. The /auth tmpfs is mode 1733 (owner rwx, others wx,
+    # sticky) so that uid can traverse /auth and create the refresh temp file
+    # while the token keeps its own 0600 protection.
     argv = [
         PODMAN_CMD, "run", "-d", "--rm",
         "--name", _auth_proxy_container_name(project),
+        "--user", f"{os.getuid()}:{os.getgid()}",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
         "--read-only",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m,mode=1777",  # nosec B108
-        "--tmpfs", "/auth:rw,nosuid,nodev,size=4m,mode=700",  # nosec B108
+        "--tmpfs", "/auth:rw,nosuid,nodev,size=4m,mode=1733",  # nosec B108
         "--pids-limit=128",
         "-v", f"{token_file}:/auth/.claude.json",
     ]
@@ -710,15 +725,39 @@ def _build_container_argv(project: Project,
     `-d`, conmon owns the lifecycle from the start. Container ID is
     returned on podman's stdout; peers-ctl tracks the named container.
     """
-    home = Path.home()
-    auth_proxy = _auth_proxy_enabled(home)
     argv = [
         PODMAN_CMD, "run", "-d", "--rm",
         "--name", _container_name(project),
-        # NOTE: the user namespace is selected per network-mode below,
-        # NOT here. When the container joins a sidecar's netns it must
-        # share THAT sidecar's userns (so it owns the netns and can mount
-        # sysfs); only when it owns its own netns does it mint keep-id.
+    ]
+    # NOTE: the user namespace is selected per network-mode inside
+    # _peer_container_runtime_flags, NOT here. When the container joins a
+    # sidecar's netns it must share THAT sidecar's userns (so it owns the
+    # netns and can mount sysfs); only when it owns its own netns does it
+    # mint keep-id.
+    argv += _peer_container_runtime_flags(project)
+    argv += [CONTAINER_IMAGE, "run"]
+    if max_ticks is not None:
+        argv += ["--max-ticks", str(max_ticks)]
+    argv.extend(extra_args)
+    return argv
+
+
+def _peer_container_runtime_flags(project: Project) -> list[str]:
+    """The shared podman flags + mounts + auth/netns wiring for a peer
+    container — everything between ``podman run [-d] --rm --name N`` and
+    the image reference.
+
+    Extracted from :func:`_build_container_argv` so the ``peers-ctl
+    doctor --claude-smoke`` probe can launch a throwaway claude in a
+    container wired *exactly* like a real peer turn (same ``--read-only``
+    + tmpfs/``~/.claude`` mount layout that triggered the 2.1.145 config
+    hang, and the same auth-proxy / egress / userns mode). Behaviour-
+    preserving: ``_build_container_argv`` composes the identical argv it
+    did before, so the existing container-argv tests cover this helper.
+    """
+    home = Path.home()
+    auth_proxy = _auth_proxy_enabled(home)
+    flags = [
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
         # raise pids cgroup limit (podman default 2048). The
@@ -745,20 +784,35 @@ def _build_container_argv(project: Project,
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",  # nosec B108
         "--tmpfs", "~/.cache:rw,nosuid,nodev,size=256m",
         "--tmpfs", "~/.npm:rw,nosuid,nodev,size=128m",
+        # opencode writes XDG state to ~/.local/state/opencode; under the
+        # read-only rootfs that path needs a writable tmpfs (harmless for
+        # claude/codex runs that never touch it).
+        "--tmpfs", "~/.local/state:rw,nosuid,nodev,size=64m",
         "-v", f"{Path(project.path).resolve()}:/work",
         "-v", f"{home / '.claude'}:~/.claude",
         "-v", f"{home / '.codex'}:~/.codex",
     ]
+    # Optional `opencode` peer: mount its config (model defaults / provider
+    # setup) and credentials so it can authenticate inside --container, the
+    # same way ~/.claude and ~/.codex are mounted. Conditional because opencode
+    # is opt-in — a claude+codex run has neither dir and must not get an empty
+    # mount. Read-write so OAuth token refresh persists (parity with ~/.codex).
+    _opencode_config = home / ".config" / "opencode"
+    _opencode_data = home / ".local" / "share" / "opencode"
+    if _opencode_config.is_dir():
+        flags += ["-v", f"{_opencode_config}:~/.config/opencode"]
+    if _opencode_data.is_dir():
+        flags += ["-v", f"{_opencode_data}:~/.local/share/opencode"]
     # Legacy mode: claude reads its main config from ~/.claude.json.
     # In the hardened default, only the auth-proxy sidecar gets that
     # rw mount and the workspace receives ANTHROPIC_BASE_URL instead.
     if (not auth_proxy) and (home / ".claude.json").is_file():
-        argv += ["-v",
-                 f"{home / '.claude.json'}:~/.claude.json"]
+        flags += ["-v",
+                  f"{home / '.claude.json'}:~/.claude.json"]
     # Per-user git identity so peer commits have a sensible author.
     if (home / ".gitconfig").is_file():
-        argv += ["-v",
-                 f"{home / '.gitconfig'}:~/.gitconfig:ro"]
+        flags += ["-v",
+                  f"{home / '.gitconfig'}:~/.gitconfig:ro"]
     # Phase-2 hardening B2: route the peers container through the
     # egress-proxy sidecar by sharing its network namespace. The
     # sidecar allow-lists outbound HTTPS to LLM API hostnames; all
@@ -769,39 +823,35 @@ def _build_container_argv(project: Project,
     if EGRESS_PROXY_DISABLED and auth_proxy:
         # Joins the auth-proxy's netns → must share the auth-proxy's
         # userns too, so it owns the netns and can mount sysfs.
-        argv += [
+        flags += [
             f"--userns=container:{_auth_proxy_container_name(project)}",
             f"--network=container:{_auth_proxy_container_name(project)}",
         ]
     elif EGRESS_PROXY_DISABLED:
         # Owns its own netns (PODMAN_NETWORK or default slirp/pasta), so a
         # self-minted keep-id userns DOES own that netns — sysfs is fine.
-        argv += ["--userns=keep-id"]
+        flags += ["--userns=keep-id"]
         if PODMAN_NETWORK:
-            argv += [f"--network={PODMAN_NETWORK}"]
+            flags += [f"--network={PODMAN_NETWORK}"]
     else:
         # Full isolation: share BOTH the egress-proxy's userns and netns
         # (same owner) so the container owns the joined netns and can
         # mount sysfs. The shared userns is the proxy's keep-id mapping,
         # so /work FS-perm alignment is preserved.
-        argv += [
+        flags += [
             f"--userns=container:{_proxy_container_name(project)}",
             f"--network=container:{_proxy_container_name(project)}",
         ]
-        argv += [
+        flags += [
             "-e", f"HTTPS_PROXY={EGRESS_PROXY_URL}",
             "-e", f"HTTP_PROXY={EGRESS_PROXY_URL}",
             "-e", "NO_PROXY=localhost,127.0.0.1,::1",
         ]
     if auth_proxy:
-        argv += ["-e", f"ANTHROPIC_BASE_URL={AUTH_PROXY_URL}"]
+        flags += ["-e", f"ANTHROPIC_BASE_URL={AUTH_PROXY_URL}"]
     for env_key in _project_provider_env_keys(project):
-        argv += ["-e", env_key]
-    argv += [CONTAINER_IMAGE, "run"]
-    if max_ticks is not None:
-        argv += ["--max-ticks", str(max_ticks)]
-    argv.extend(extra_args)
-    return argv
+        flags += ["-e", env_key]
+    return flags
 
 
 _DURATION_RE = re.compile(r"^(?P<n>\d+)(?P<unit>[smhdw]?)$")

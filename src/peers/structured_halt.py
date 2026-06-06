@@ -143,6 +143,45 @@ def _verdict(tool: str, blob: str) -> tuple[str, str] | None:
     return (f"structured:{tool}:{klass}", blob[:200])
 
 
+# Transient, RETRYABLE server-side errors — a temporary 429/5xx/overloaded that
+# the server itself flags as "not your usage limit". Distinct from _HALT_VOCAB
+# (which is the operator-must-act class). A transient error must NOT halt the
+# run and must NOT count as a hard process-fail against peer health; the loop
+# backs off and retries the same peer. (v17 internal testing operator finding: a
+# transient 429 was misclassified process-fail -> degraded the peer -> the
+# turn manager then benched it for the rest of the run.)
+_TRANSIENT_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
+# Standard HTTP reason-phrases for the transient/retryable classes. Deliberately
+# NO bare status numbers (I1): a number like "503" can appear incidentally in an
+# unrelated structured error ("exited with code 503") and a false positive would
+# mask a real failure as a harmless retry. claude carries the clean numeric
+# `api_error_status` field for the numeric path; codex/opencode rate-limit
+# messages carry these phrases (e.g. "429 Too Many Requests", "Overloaded").
+_TRANSIENT_VOCAB = re.compile(
+    r"(rate[ _-]?limit"
+    r"|overloaded"
+    r"|temporarily (?:limiting|unavailable)"
+    r"|too many requests"
+    r"|service unavailable"
+    r"|bad gateway"
+    r"|gateway time-?out"
+    r"|try again (?:later|in|soon))",
+    re.IGNORECASE,
+)
+
+
+def _transient_verdict(
+    tool: str, blob: str, status: int | None = None,
+) -> tuple[str, str] | None:
+    # An unrecoverable auth/quota/usage-limit error is a HALT, never transient —
+    # let _verdict/classify_structured_halt own it.
+    if _HALT_VOCAB.search(blob):
+        return None
+    if status in _TRANSIENT_STATUS or _TRANSIENT_VOCAB.search(blob):
+        return (f"transient:{tool}:rate-limited", blob[:200])
+    return None
+
+
 def classify_structured_halt(
     tool: str,
     stdout: str,
@@ -178,6 +217,50 @@ def classify_structured_halt(
     if tool == "opencode":
         for blob in _opencode_error_blobs(stdout):
             verdict = _verdict("opencode", blob)
+            if verdict is not None:
+                return verdict
+        return None
+    return None
+
+
+def classify_structured_transient(
+    tool: str,
+    stdout: str,
+    stderr: str,
+    exit_code: int | None = None,
+) -> tuple[str, str] | None:
+    """Return ``(reason_label, snippet)`` if ``tool``'s STRUCTURED output
+    reports a TRANSIENT, retryable server error (HTTP 429/5xx, overloaded,
+    "temporarily limiting · not your usage limit"), else ``None``.
+
+    Read ONLY from the same structured status channel as
+    ``classify_structured_halt`` (claude's ``result`` envelope, codex/opencode
+    ``error`` events), so an echoed error line in the transcript cannot forge
+    it. An unrecoverable auth/quota/usage-limit error is NOT transient — it is a
+    halt and is owned by ``classify_structured_halt``; this function defers to
+    it via ``_transient_verdict``'s halt-vocab precedence check.
+    """
+    if tool == "claude":
+        env = _claude_result_envelope(stdout)
+        if env is None or env.get("is_error") is not True:
+            return None
+        status = env.get("api_error_status")
+        if not isinstance(status, int) or isinstance(status, bool):
+            status = None
+        parts = [
+            str(env[key]) for key in ("subtype", "result", "error", "message")
+            if isinstance(env.get(key), str)
+        ]
+        return _transient_verdict("claude", " ".join(parts), status)
+    if tool == "codex":
+        for blob in _codex_error_blobs(stdout):
+            verdict = _transient_verdict("codex", blob)
+            if verdict is not None:
+                return verdict
+        return None
+    if tool == "opencode":
+        for blob in _opencode_error_blobs(stdout):
+            verdict = _transient_verdict("opencode", blob)
             if verdict is not None:
                 return verdict
         return None

@@ -21,6 +21,7 @@ from peers.driver_helpers import (
     PHASE_IMPLEMENTATION,
     _hash_goals_yaml,
     _load_phase_prompt,
+    _record_goal_results,
     _resolve_peer_role,
     _resolve_phase,
     _should_checkpoint,
@@ -434,22 +435,27 @@ class DriverTickHooksMixin:
         record_tick_accounting(state, success, tick_dt, peer=peer)
 
     def _record_results(self, state: dict[str, Any],
-                        results: dict[str, GoalResult]) -> None:
-        for gid, r in results.items():
-            prev = state["goals_status"].get(gid, {}).get("state")
-            state["goals_status"][gid] = {
-                "state": r.state,
-                "diagnostic": r.diagnostic,
-                "duration_ms": r.duration_ms,
-            }
-            if r.state == "fail":
-                if prev == "fail":
-                    state["stuck_counter"][gid] = \
-                        state["stuck_counter"].get(gid, 0) + 1
-                else:
-                    state["stuck_counter"][gid] = 1
-            else:
-                state["stuck_counter"].pop(gid, None)
+                        results: dict[str, GoalResult], *,
+                        increment_repeat_failures: bool = True) -> None:
+        _record_goal_results(
+            state,
+            results,
+            increment_repeat_failures=increment_repeat_failures,
+        )
+
+    def _refresh_goals_after_tick(self, state: dict[str, Any],
+                                  goal_ids: Any) -> None:
+        ids = tuple(goal_ids)
+        if not ids:
+            return
+        results = self.engine.evaluate_hard_gates(goal_ids=ids)
+        self._record_results(
+            state,
+            results,
+            increment_repeat_failures=False,
+        )
+        self._reset_stuck_on_progress(state)
+        self._update_two_phase_counters(state, results)
 
     def _reset_stuck_on_progress(self, state: dict[str, Any]) -> None:
         """Wire `reset_stuck_on_progress` to the live PLAN.md + mode."""
@@ -590,7 +596,8 @@ class DriverTickHooksMixin:
         soft_seen = 0
         soft_ingested = 0
         for c in new_commits:
-            if c.trailers.get("Peer-Review-Of"):
+            if self._peer_review_trailer_is_soft_goal(
+                    c.trailers.get("Peer-Review-Of")):
                 soft_seen += 1
             if self._record_soft_review_from_commit(
                     state, c, reviewer=peer):

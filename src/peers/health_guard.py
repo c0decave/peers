@@ -26,7 +26,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from peers.structured_halt import classify_structured_halt
+from peers.structured_halt import (
+    classify_structured_halt,
+    classify_structured_transient,
+)
 
 
 _BUF_SOFT_CAP_BYTES = 2 * 1024 * 1024  # 2 MiB per stream (default)
@@ -921,6 +924,24 @@ class HealthGuard:
                 matched_source = "structured"
                 classification = "api-error"
                 halt_required = True
+
+        # Transient server rate-limit (429/5xx/overloaded) on the structured
+        # channel: NOT a halt, NOT a hard process-fail. Classify `rate-limited`
+        # so the loop backs off and retries the SAME peer without degrading it
+        # (v17 internal testing operator finding: a transient 429 misclassified as
+        # process-fail degraded the peer, then the turn manager benched it for
+        # the rest of the run). Only fires when nothing else already classified
+        # the run, so it never downgrades a real failure or a halt. (I5: this
+        # runs AFTER the regex error_patterns scan; a broad un-anchored operator
+        # error_pattern matching the JSON envelope line would classify
+        # `api-error` first and pre-empt this. The default patterns are
+        # ^...ERROR/FATAL-anchored and do not match an envelope line.)
+        if tool and not halt_required and classification is None:
+            transient = classify_structured_transient(tool, stdout, stderr, rc)
+            if transient is not None:
+                matched_pattern_re, matched_snippet = transient
+                matched_source = "structured-transient"
+                classification = "rate-limited"
 
         if config_error:
             stderr = (stderr + "\n" + config_error + "\n").lstrip()

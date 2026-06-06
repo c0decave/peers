@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
+from peers.goal_engine import GoalResult
 from peers.goals import _GOALS_YAML_MAX_BYTES
 from peers.safe_io import read_bytes_no_symlink
 
@@ -297,3 +299,31 @@ def _format_tick_status(*, success: bool, classification: str) -> str:
     if classification == "success":
         return "no-handoff"
     return classification
+
+
+def _record_goal_results(
+    state: dict[str, Any],
+    results: dict[str, GoalResult],
+    *,
+    increment_repeat_failures: bool = True,
+) -> None:
+    for gid, r in results.items():
+        goals_status = state["goals_status"]
+        stuck_counter = state["stuck_counter"]
+        prev = goals_status.get(gid, {}).get("state")
+        goals_status[gid] = {
+            "state": r.state,
+            "diagnostic": r.diagnostic,
+            "duration_ms": r.duration_ms,
+        }
+        if r.state == "fail":
+            if prev == "fail":
+                current = stuck_counter.get(gid, 0)
+                stuck_counter[gid] = (
+                    current + 1 if increment_repeat_failures
+                    else max(current, 1)
+                )
+            else:
+                stuck_counter[gid] = 1
+        else:
+            stuck_counter.pop(gid, None)

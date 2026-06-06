@@ -60,10 +60,17 @@ class TurnManager:
     # state['config']['max_retries'] = 2 or the constructor argument.
     DEFAULT_MAX_RETRIES = 1
 
+    # A degraded peer is benched while a healthy one exists, but after this
+    # many iterations since it was degraded it gets ONE recovery turn instead
+    # of being starved forever (v17 finding). 0 disables recovery.
+    DEFAULT_RECOVERY_INTERVAL = 8
+
     def __init__(self, state: dict[str, Any],
-                 max_retries: int = DEFAULT_MAX_RETRIES) -> None:
+                 max_retries: int = DEFAULT_MAX_RETRIES,
+                 recovery_interval: int = DEFAULT_RECOVERY_INTERVAL) -> None:
         self.state = state
         self.max_retries = max_retries
+        self.recovery_interval = recovery_interval
 
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> "TurnManager":
@@ -81,7 +88,14 @@ class TurnManager:
             mr = cls.DEFAULT_MAX_RETRIES
         if mr < 0:
             mr = cls.DEFAULT_MAX_RETRIES
-        return cls(state, max_retries=mr)
+        raw_ri = cfg.get("recovery_interval", cls.DEFAULT_RECOVERY_INTERVAL)
+        try:
+            ri = int(raw_ri)
+        except (TypeError, ValueError):
+            ri = cls.DEFAULT_RECOVERY_INTERVAL
+        if ri < 0:
+            ri = cls.DEFAULT_RECOVERY_INTERVAL
+        return cls(state, max_retries=mr, recovery_interval=ri)
 
     def current(self) -> str:
         """Active peer name.
@@ -106,9 +120,33 @@ class TurnManager:
         idx = self.state["turn_index"]
         peers = self.state.get("peers") or {}
         roles = self.state.get("peer_roles") or {}
+        iteration = self.state.get("iteration", 0)
+
+        def _recovery_due(name: str) -> bool:
+            # A degraded (NOT halted) peer earns a single recovery turn once
+            # `recovery_interval` iterations have elapsed since it was degraded
+            # (v17 anti-starvation). A failed recovery bumps degraded_at_iter,
+            # re-benching it for another interval; a success heals it.
+            if self.recovery_interval <= 0:
+                return False
+            p = peers.get(name, {})
+            if p.get("state") != "degraded":
+                return False
+            # Measure the cooldown from the last failed recovery attempt if one
+            # happened (recovery_cooldown_iter), else from first degradation
+            # (degraded_at_iter, which stays put for operator visibility).
+            since = p.get("recovery_cooldown_iter")
+            if not isinstance(since, int) or isinstance(since, bool):
+                since = p.get("degraded_at_iter")
+            if not isinstance(since, int) or isinstance(since, bool):
+                return False
+            return (iteration - since) >= self.recovery_interval
 
         def _eligible(name: str, *, allow_recovery: bool) -> bool:
-            if peers.get(name, {}).get("state") in ("degraded", "halted"):
+            st = peers.get(name, {}).get("state")
+            if st == "halted":
+                return False
+            if st == "degraded" and not _recovery_due(name):
                 return False
             if roles.get(name) == "recovery" and not allow_recovery:
                 return False
@@ -153,9 +191,17 @@ class TurnManager:
         n = len(self.state["peer_order"])
         self.state["turn_index"] = (self.state["turn_index"] + 1) % n
 
-    def advance(self, success: bool) -> None:
+    def advance(self, success: bool, rate_limited: bool = False) -> None:
         peer = self.current()
         peers = self.state["peers"]
+        if rate_limited:
+            # v17 finding: a transient server rate-limit is not the peer's
+            # fault. Hand the turn to the OTHER peer (whose tick is itself the
+            # backoff) without charging a consecutive-fail — the rate-limited
+            # peer retries when rotation returns to it.
+            peers[peer]["consecutive_fails"] = 0
+            self._rotate()
+            return
         if success:
             peers[peer]["consecutive_fails"] = 0
             self._rotate()
