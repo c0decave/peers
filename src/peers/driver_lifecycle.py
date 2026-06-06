@@ -98,6 +98,53 @@ class DriverLifecycleMixin:
                 file=sys.stderr,
             )
 
+    def _run_codemap_step(self) -> None:
+        """Substrate pre-tick structural CODEMAP. Writes .peers/CODEMAP.yaml
+        + .peers/codemap.md (public API + signatures) so peers know the
+        codebase's shape before tick 1. AST-only — no LLM, no budget cost.
+        Errors are logged, never fatal."""
+        try:
+            status = _driver_module()._run_codemap(self.repo, self.peer_dir)
+            print(f"peers: {status}", file=sys.stderr)
+        except Exception as e:
+            print(
+                f"peers: warning: codemap step failed: {e!r}; "
+                "continuing without codemap",
+                file=sys.stderr,
+            )
+
+    def _run_document_seed_step(self) -> None:
+        """`document`-mode only: seed the repo-root CODEMAP.yaml with the
+        structural map (correct id/kind/file/line/signature, empty summaries)
+        so the peers add summaries rather than invent structure. The three
+        structural gates start green on the seed; summaries-complete starts red
+        and drives the build. AST-only, idempotent (never clobbers an existing
+        CODEMAP.yaml), errors logged-not-fatal."""
+        try:
+            status = _driver_module()._seed_repo_codemap(self.repo)
+            print(f"peers: {status}", file=sys.stderr)
+        except Exception as e:
+            print(
+                f"peers: warning: document seed step failed: {e!r}; "
+                "continuing (peers can build CODEMAP.yaml themselves)",
+                file=sys.stderr,
+            )
+
+    def _run_document_architecture_seed_step(self) -> None:
+        """`document`-mode only: seed the repo-root ARCHITECTURE.md with the
+        narrative outline so the `architecture-grounded` gate starts red and
+        drives the human-docs build. AST-only, idempotent (never clobbers an
+        existing ARCHITECTURE.md), errors logged-not-fatal."""
+        try:
+            status = _driver_module()._seed_repo_architecture(self.repo)
+            print(f"peers: {status}", file=sys.stderr)
+        except Exception as e:
+            print(
+                f"peers: warning: document architecture seed step failed: "
+                f"{e!r}; continuing (peers can write ARCHITECTURE.md themselves)",
+                file=sys.stderr,
+            )
+
     def _verify_no_control_symlinks(self) -> None:
         """L1: refuse to operate on a .peers/ where any of the
         control files (or substrate-written log/report files) are

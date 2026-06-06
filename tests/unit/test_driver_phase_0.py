@@ -150,6 +150,23 @@ def test_detect_mode_name_audit_only(tmp_path: Path):
     assert _detect_mode_name(peer_dir) == ""
 
 
+def test_detect_mode_name_document_only(tmp_path: Path):
+    peer_dir = tmp_path / ".peers"
+    peer_dir.mkdir()
+    (peer_dir / "modes-applied.txt").write_text(
+        "2026-06-01T12:34:56+00:00  document        v1  sha256=abc\n"
+    )
+    assert _detect_mode_name(peer_dir) == "document"
+
+
+def test_document_mode_runs_in_implementation_phase_no_phase0(tmp_path: Path):
+    # document is NOT a Phase-0 mode — every tick is "implementation"
+    # (its task brief loads via prompts/implementation.md, not a Phase-0 prelude).
+    assert _resolve_phase("document", 0) == "implementation"
+    assert _resolve_phase("document", 2) == "implementation"
+    assert _resolve_phase("document", 99) == "implementation"
+
+
 # ---------- driver integration: state.json carries `phase` -----------
 
 def test_driver_record_phase_writes_state_field_audit_mode(tmp_path: Path):

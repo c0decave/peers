@@ -8,6 +8,7 @@ import sys
 from typing import Any
 
 from peers.anti_cheat_guard import AntiCheatGuard
+from peers.attest import attest_commits
 from peers.budget_accountant import (
     BudgetCheck,
     account_tokens_usd,
@@ -44,6 +45,30 @@ from peers.stuck_progress import (  # noqa: E402
 
 
 class DriverTickHooksMixin:
+    def _attest_tick_commits(
+        self, peer: str, head_before: str | None, head_after: str,
+    ) -> None:
+        """Attribute the tick's commits to ``peer`` via the substrate's
+        agent-unforgeable HEAD-delta.
+
+        Every commit in ``(head_before, head_after]`` was produced during this
+        peer's one-shot tick, so it is attributed to ``peer`` regardless of the
+        (forgeable) ``Peer:`` trailer. Recorded as ``refs/notes/peers-attest``
+        notes that the post-hoc ``checkoff_by_other_peer`` gate keys identity
+        off of. No-op when the tick produced no commits (e.g. a dry-run reset
+        left HEAD unchanged). Best-effort: a git error here must not crash the
+        loop — the gate fails closed when an expected attestation is absent.
+        """
+        try:
+            attest_commits(self.repo, peer, head_before, head_after)
+        except Exception as e:  # noqa: BLE001 — never let attestation crash a tick
+            # The gate fails closed when an expected attestation is absent, so
+            # a transient git error here is logged but non-fatal.
+            print(
+                f"peers: attestation skipped for {peer}: {e}",
+                file=sys.stderr, flush=True,
+            )
+
     def _record_phase(self, state: dict[str, Any]) -> None:
         """Stamp the upcoming tick's phase into state.json.
 

@@ -194,7 +194,12 @@ def _write_text_in_private_nested_dir_no_symlink(
                 raise OSError(
                     f"refusing to open hard-linked file: {display_path}"
                 )
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        # BUG-120 (v15 internal testing): NO O_TRUNC here. A hardlink raced in
+        # between the pre-stat and this open would otherwise be truncated
+        # before the nlink check below rejects it, clobbering the victim.
+        # Truncate only AFTER all the post-open checks pass (the same
+        # delayed-truncate pattern open_text_no_symlink uses).
+        flags = os.O_WRONLY | os.O_CREAT
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
         flags |= getattr(os, "O_CLOEXEC", 0)
@@ -210,6 +215,7 @@ def _write_text_in_private_nested_dir_no_symlink(
         if st.st_nlink != 1:
             raise OSError(f"refusing to open hard-linked file: {display_path}")
         _tighten_to_private(fd)
+        os.ftruncate(fd, 0)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = -1
             f.write(text)
@@ -366,3 +372,68 @@ def append_text_in_dir_no_symlink(parent: Path, filename: str, text: str) -> Non
     """Append to ``parent/filename`` without following parent or leaf symlinks."""
     with open_text_in_dir_no_symlink(parent, filename, "a") as f:
         f.write(text)
+
+
+def atomic_write_text_in_dir_no_symlink(path: Path, text: str) -> None:
+    """Atomically and durably write ``text`` to ``path`` without following a
+    symlinked PARENT or leaf.
+
+    Writes to ``<path>.tmp`` opened relative to a no-follow (dev/ino-
+    rechecked) parent ``dir_fd``, fsyncs it, ``os.replace()``s it into place
+    using ``src_dir_fd``/``dst_dir_fd``, then fsyncs the directory. Three
+    guarantees, all relative to the verified parent fd:
+
+    - BUG-118: a symlinked/swapped parent is refused (``_open_dir_fd_no_symlink``)
+      before any state bytes are written — the leaf no-follow guard alone
+      cannot stop the kernel resolving a symlinked parent.
+    - BUG-119: the temp open carries no ``O_TRUNC``; truncation is delayed
+      until after the nlink/swap checks, so a hardlink raced onto the temp
+      between the pre-stat and the open is rejected, not clobbered.
+    - BUG-114: the durability dir-fsync uses the same no-follow ``dir_fd`` and
+      cannot follow a symlinked parent into an attacker directory.
+
+    The parent directory must already exist. ``path``'s basename must be a
+    single path component.
+    """
+    parent = path.parent
+    name = path.name
+    _validate_single_path_component(name, "filename")
+    tmp_name = name + ".tmp"
+    display_tmp = parent / tmp_name
+    dir_fd = _open_dir_fd_no_symlink(parent)
+    fd = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(tmp_name, flags, _PRIVATE_FILE_MODE, dir_fd=dir_fd)
+        st = os.fstat(fd)
+        lst = os.stat(tmp_name, dir_fd=dir_fd, follow_symlinks=False)
+        if stat.S_ISLNK(lst.st_mode):
+            raise OSError(f"refusing to open symlink: {display_tmp}")
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"refusing to open non-regular file: {display_tmp}")
+        if (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino):
+            raise OSError(f"refusing swapped file: {display_tmp}")
+        if st.st_nlink != 1:
+            raise OSError(f"refusing to open hard-linked file: {display_tmp}")
+        _tighten_to_private(fd)
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        # Durability: the rename's metadata only hits disk after the parent
+        # dir is fsync'd. Some filesystems (FAT, NFS) don't support it — skip
+        # rather than fail, same as the leaf write above.
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(dir_fd)

@@ -78,6 +78,31 @@ def test_ensure_snapshot_noop_without_gate(tmp_path: Path) -> None:
     assert not (peer_dir / "passing-baseline.txt").exists()
 
 
+def test_needs_snapshot_with_empty_goal_list_edge(tmp_path: Path) -> None:
+    # edge: an empty goals list (zero-config substrate boot, or a goals
+    # file that loaded with no entries) must NOT decide we need a
+    # snapshot — the gate is absent, so no-op.
+    from peers.regression_baseline import needs_baseline_snapshot
+    peer_dir = tmp_path / ".peers"
+    peer_dir.mkdir()
+    assert needs_baseline_snapshot(peer_dir, []) is False
+
+
+def test_needs_snapshot_treats_zero_byte_baseline_as_present_edge(
+    tmp_path: Path,
+) -> None:
+    # edge: a zero-byte passing-baseline.txt (mid-run truncation, disk
+    # full at first snapshot write) is still a "file exists" signal —
+    # the gate decides not to re-snapshot. This pins the boundary so a
+    # later "consider zero-byte == missing" change is a deliberate
+    # decision, not an accident.
+    from peers.regression_baseline import needs_baseline_snapshot
+    peer_dir = tmp_path / ".peers"
+    peer_dir.mkdir()
+    (peer_dir / "passing-baseline.txt").write_bytes(b"")
+    assert needs_baseline_snapshot(peer_dir, ["no-prior-regression"]) is False
+
+
 def test_run_check_forwards_extra_args(tmp_path: Path) -> None:
     """cmd_run_check must forward check_args to the resolved script."""
     from peers.cli import cmd_run_check

@@ -38,12 +38,15 @@ VALID_PEER_ROLES = ("default", "recovery", "witness", "debater")
 # `tool` selects which token/USD parser to use in the driver and which
 # default invocation conventions apply. Two are recognised today;
 # anything else falls through to a no-op token parser.
-KNOWN_TOOLS = ("claude", "codex")
+KNOWN_TOOLS = ("claude", "codex", "opencode")
 
 VALID_PROVIDERS = ("anthropic", "openai", "openrouter")
 VALID_REASONING_BY_TOOL = {
     "claude": ("low", "medium", "high", "xhigh", "max"),
     "codex": ("minimal", "low", "medium", "high", "xhigh"),
+    # opencode's `--variant` is a provider-specific reasoning effort; accept
+    # the union of the shapes claude/codex use (opencode validates the rest).
+    "opencode": ("minimal", "low", "medium", "high", "xhigh", "max"),
 }
 VALID_PROVIDERS_BY_TOOL = {
     "claude": ("anthropic", "openrouter"),
@@ -169,6 +172,12 @@ def _validate_semantic_fields(
         raise ValueError(
             f"{loc}.tool {tool!r} has no model/reasoning/provider "
             "translation; use argv directly"
+        )
+    if tool == "opencode" and provider is not None:
+        raise ValueError(
+            f"{loc}.provider is not used for tool 'opencode' — encode the "
+            "provider in `model` as '<provider>/<model>' (e.g. "
+            f"'ollama/qwen2.5'). got {provider!r}"
         )
     if reasoning is not None:
         allowed_reasoning = VALID_REASONING_BY_TOOL[tool]

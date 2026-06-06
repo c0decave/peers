@@ -186,6 +186,21 @@ Falls du in einem bestehenden Projekt `.peers/goals.yaml` vor dem
 Start manuell änderst, aktualisiere auch dort `goals.sha256` wie im
 Einzelprojekt-Beispiel oben.
 
+### Automatische Hooks (Opt-out-Flags)
+
+Standardmäßig aktiv, abschaltbar per Flag:
+
+- **`recon`-Pre-Tick** (standardmäßig an): scannt das Repo einmal vor Tick 1 und schreibt `.peers/recon.md` (erkannte Sprachen, wichtige Docs, Entry-Point-Kandidaten, Top-Level-Baum). Kostenlos + schnell — kein LLM-Aufruf. Beseitigt die „blinder Tick 1"-Strafe. Abschalten: `peers-ctl start <name> --without-recon`.
+- **`codemap`-Pre-Tick** (standardmäßig an): erstellt aus dem AST eine strukturelle CODEMAP und schreibt `.peers/CODEMAP.yaml` (maschinenlesbar: jedes öffentliche Symbol mit `file:line` + Signatur) und `.peers/codemap.md` (kompaktes, größenbegrenztes Digest, das die Peers als Kontext lesen). Kostenlos + schnell — kein LLM-Aufruf. Gibt den Peers vor Tick 1 die Form der öffentlichen API, zusätzlich zu recons Datei-Ebene. Abschalten: `peers-ctl start <name> --no-codemap`.
+
+```sh
+peers-ctl start <name> --without-recon
+# Den substrate-only Pre-Tick-Recon-Schritt überspringen (kein LLM-Aufruf, kostenlos).
+
+peers-ctl start <name> --no-codemap
+# Den substrate-only Pre-Tick-CODEMAP-Schritt überspringen (kein LLM-Aufruf, kostenlos).
+```
+
 ### Container-Modus (`--container`)
 
 Wenn z.B. codex auf dem Host nicht installiert ist, aber im
@@ -270,6 +285,48 @@ der Egress-Proxy-Allowlist geöffnet.
 
 **Name-Validation:** `[A-Za-z0-9][A-Za-z0-9_-]{0,31}` — keine
 Path-Traversal-Zeichen, keine Shell-Metachars, keine tmux-Ambiguität.
+
+### opencode-Peers + lokale Modelle (ollama / vllm / llama.cpp)
+
+`opencode` ist ein First-Class-Tool neben `claude` und `codex`. Mit
+`--format json` bekommt das Substrate denselben strukturierten Kanal wie bei
+den anderen — Token-/USD-Abrechnung (aus `step-finish`-Events) und
+echo-immune Auth/Quota-Halt-Erkennung (aus `error`-Events):
+
+```yaml
+peers:
+  - name: opencode
+    tool: opencode
+    model: ollama/qwen2.5      # opencodes <provider>/<model> (KEIN separates provider:)
+    reasoning: high            # → --variant high
+    argv: ["opencode", "run", "--format", "json", "--dangerously-skip-permissions", "{PROMPT}"]
+    prompt_mode: argv-substitute
+```
+
+opencode ist auch der einfachste Weg zu **lokalen Modellen** — ein universeller
+Gateway: den Backend einmal in opencodes eigener Config einrichten
+(`opencode providers` bzw. `opencode.json`) — ollama, vllm, llama.cpp,
+LM Studio oder jeden OpenAI-kompatiblen `/v1`-Endpoint — dann `model` auf
+`<provider>/<model>` zeigen lassen:
+
+```yaml
+    model: ollama/qwen2.5            # lokal via ollama
+    model: openai-compatible/<name> # lokaler vllm-/llama.cpp-Server
+    model: anthropic/claude-...      # Cloud, über opencode
+```
+
+Das Substrate braucht **keinen** lokal-spezifischen Code; opencode löst den
+Provider auf. Hinweise:
+
+- `provider:` wird für opencode **nicht** genutzt — den Provider im `model`
+  kodieren (`provider/model`). Ein gesetztes `provider:` wird abgelehnt.
+- Billing ist für opencode **warn**, nie ein harter `max_usd`-Kill (lokal =
+  gratis, opencode-hosted = Abo, BYOK-Cloud = metered — der Tool-Name allein
+  sagt es nicht, also greift der konservative Default).
+- `codex` erreicht lokale Modelle nur via `--oss --local-provider ollama|lmstudio`
+  oder einen Custom-Provider mit der OpenAI-**Responses**-API
+  (`wire_api=responses`) — codex hat die chat-API fallengelassen, daher laufen
+  chat-only-Server (llama.cpp, vanilla-ollama) über opencode.
 
 ---
 

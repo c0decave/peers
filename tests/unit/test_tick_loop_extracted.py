@@ -174,6 +174,11 @@ class _Driver:
     def _detect_tampering(self, state: dict[str, Any]) -> None:
         self.events.append("tamper")
 
+    def _attest_tick_commits(
+        self, peer: str, head_before: str | None, head_after: str,
+    ) -> None:
+        self.events.append("attest")
+
     def _maybe_halt(self, state: dict[str, Any]) -> None:
         self.events.append("maybe_halt")
 
@@ -232,6 +237,7 @@ def test_tick_loop_delegates_one_successful_tick_then_exits():
         "tamper",
         "maybe_halt",
         "warnings:0",
+        "attest",
         "run_log:12:0.5",
         "save",
         "emit",
@@ -268,6 +274,9 @@ def test_tick_loop_forwards_healthguard_invocation_arguments():
         "error_patterns": ["ERR"],
         "halt_patterns": ["HALT"],
         "buf_cap_bytes": 1024,
+        # Option C: the peer's tool is forwarded so health_guard can classify
+        # a halt from its structured status channel (claude result envelope).
+        "tool": "claude",
         # The orchestrator always exposes the current peer name to the
         # peer subprocess (and thus its git hooks) for peer attribution.
         "extra_env": {"PEERS_PEER_NAME": "claude"},

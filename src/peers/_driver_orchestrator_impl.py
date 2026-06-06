@@ -55,6 +55,9 @@ from peers.health_guard import HealthGuard, RunResult as RunResult
 from peers.peer_spec import PeerSpec
 from peers.prompt_builder import build_prompt as build_prompt
 from peers.recon import run_recon as _run_recon  # noqa: F401
+from peers.codemap_gen import run_codemap as _run_codemap  # noqa: F401
+from peers.codemap_gen import seed_repo_codemap as _seed_repo_codemap  # noqa: F401
+from peers.codemap_gen import seed_repo_architecture as _seed_repo_architecture  # noqa: F401
 from peers.regression_baseline import ensure_baseline_snapshot
 from peers.safe_io import (
     _ensure_private_dir,
@@ -109,6 +112,7 @@ class OrchestratorDriver(
         goals_timeout_s: int = 120,
         verbose: bool = False,
         recon_enabled: bool = True,
+        codemap_enabled: bool = True,
         auto_skeptic_enabled: bool = True,
     ) -> None:
         if len(peer_specs) < 2:
@@ -156,6 +160,11 @@ class OrchestratorDriver(
         # via --without-recon for runs where the digest is hand-prepared
         # or unwanted.
         self.recon_enabled = bool(recon_enabled)
+        # AST-only structural CODEMAP pre-tick hook: writes
+        # .peers/CODEMAP.yaml + .peers/codemap.md (public API +
+        # signatures) before the loop starts. Substrate-only — no LLM,
+        # no token cost. Default on; disable via --no-codemap.
+        self.codemap_enabled = bool(codemap_enabled)
         # when convergence-reached is about to fire, run ONE
         # extra "skeptic re-audit" tick first. If that tick stays clean
         # → really terminal. If it files a new blocking bug → counter
@@ -250,6 +259,18 @@ class OrchestratorDriver(
 
             if self.recon_enabled:
                 self._run_recon_step()
+
+            # Recon runs first, then codemap — so codemap's digest sits
+            # alongside recon.md before tick 1.
+            if self.codemap_enabled:
+                self._run_codemap_step()
+
+            # document-mode only: seed the repo-root CODEMAP.yaml deliverable
+            # with the structural skeleton so peers add summaries, not invent
+            # structure. After codemap so .peers/CODEMAP.yaml exists too.
+            if self.mode_name == "document":
+                self._run_document_seed_step()
+                self._run_document_architecture_seed_step()
 
             try:
                 result = self._loop(state, tm, max_ticks, ticks)

@@ -64,12 +64,77 @@ def test_save_refuses_symlinked_temp_file(tmp_path: Path):
     assert bait.read_text() == "keep me"
 
 
+_VALID_STATE = {
+    "iteration": 1,
+    "peer_order": ["claude", "codex"],
+    "turn_index": 0,
+    "peers": {"claude": {"state": "healthy"},
+              "codex": {"state": "healthy"}},
+}
+
+
+def test_save_refuses_symlinked_parent_before_temp_write(tmp_path: Path):
+    """BUG-118 (v15 internal testing): save must refuse a symlinked PARENT before
+    writing any state bytes. The leaf no-follow guard only protects the final
+    path component; the kernel still resolves a symlinked parent, so without
+    this the state bytes land in the attacker's target dir (and only the
+    later durability fsync — BUG-114 — refused it). save now opens the parent
+    via a no-follow (dev/ino-rechecked) dir_fd and writes relative to it."""
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    link = tmp_path / "work"
+    link.symlink_to(evil, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        StateStore(link / "state.json").save(dict(_VALID_STATE))
+
+    assert not (evil / "state.json").exists()
+    assert not (evil / "state.json.tmp").exists()
+
+
+def test_save_refuses_late_hardlinked_temp_without_truncating(
+    tmp_path: Path, monkeypatch,
+):
+    """BUG-119 (v15 internal testing): regression-lock on the dir-fd save path —
+    the temp open must not truncate until after the nlink check, or a
+    hardlink raced onto state.json.tmp between the pre-stat and the open is
+    clobbered. (Latent on the previously leaf path, which already delayed
+    truncation; this locks the property into the rewritten save.)"""
+    path = tmp_path / "state.json"
+    bait = tmp_path / "bait"
+    bait.write_text("keep me")
+
+    real_open = os.open
+    raced = {"done": False}
+
+    def racing_open(p, flags, *args, **kwargs):
+        if (
+            not raced["done"]
+            and str(p).endswith("state.json.tmp")
+            and (flags & os.O_CREAT)
+        ):
+            raced["done"] = True
+            try:
+                os.link(bait, tmp_path / "state.json.tmp")
+            except OSError as e:
+                pytest.skip(f"hard links unavailable: {e}")
+        return real_open(p, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", racing_open)
+
+    with pytest.raises(OSError, match="hard-linked"):
+        StateStore(path).save(dict(_VALID_STATE))
+
+    assert raced["done"], "race hook never fired — test did not exercise path"
+    assert bait.read_text() == "keep me"
+
+
 def test_save_does_not_fsync_through_symlinked_parent(tmp_path: Path, monkeypatch):
-    """BUG-114: the durability dir-fsync after os.replace must not follow a
-    symlinked parent directory. If `.peers/` is swapped for a symlink to an
-    attacker-controlled dir, the post-write fsync must refuse it (O_NOFOLLOW)
-    instead of fsync'ing the attacker's directory. The data write already
-    guards its leaf; this closes the dir-fsync gap (defense in depth)."""
+    """BUG-114: if `.peers/` is swapped for a symlink to an
+    attacker dir, save must neither write state into it nor fsync it. Since
+    BUG-118 the parent is refused up front (O_NOFOLLOW + dev/ino recheck), so
+    save raises before any bytes are written — strictly stronger than the
+    original BUG-114 guarantee (which only refused the post-write dir-fsync)."""
     import stat as _stat
 
     evil = tmp_path / "evil"
@@ -93,18 +158,15 @@ def test_save_does_not_fsync_through_symlinked_parent(tmp_path: Path, monkeypatc
     monkeypatch.setattr(os, "fsync", spy_fsync)
 
     store = StateStore(link / "state.json")
-    store.save({
-        "iteration": 1,
-        "peer_order": ["claude", "codex"],
-        "turn_index": 0,
-        "peers": {"claude": {"state": "healthy"},
-                  "codex": {"state": "healthy"}},
-    })
+    with pytest.raises(OSError):
+        store.save(dict(_VALID_STATE))
 
     assert evil_id not in fsynced_dirs, (
         "durability dir-fsync followed the symlinked parent into the "
         "attacker directory"
     )
+    assert not (evil / "state.json").exists()
+    assert not (evil / "state.json.tmp").exists()
 
 
 def test_default_state_has_required_keys():
@@ -242,8 +304,10 @@ def test_save_fsyncs(tmp_path: Path, monkeypatch):
         calls.append(fd)
         real_fsync(fd)
 
-    import peers.state_store as ss
-    monkeypatch.setattr(ss.os, "fsync", spy_fsync)
+    # The durable write now lives in safe_io.atomic_write_text_in_dir_no_symlink;
+    # patch the shared os.fsync (same module object both modules reference) so
+    # the spy catches it regardless of which module issues the fsync.
+    monkeypatch.setattr(os, "fsync", spy_fsync)
     StateStore(tmp_path / "state.json").save(
         {"iteration": 1, "peer_order": ["claude", "codex"],
          "turn_index": 0, "peers": {"claude": {}, "codex": {}}}

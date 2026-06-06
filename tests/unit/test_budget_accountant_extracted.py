@@ -164,3 +164,60 @@ def test_read_operator_budget_overrides_absent_and_malformed(tmp_path):
 
     f.write_text("{not valid json")
     assert read_operator_budget_overrides(repo) == {}
+
+
+def test_parse_codex_tokens_from_json_usage():
+    """Option C (codex --json): tokens come from the `turn.completed` event's
+    `usage` (input+output), summed across turns — verified against codex-cli
+    0.133's JSONL schema."""
+    from peers.budget_accountant import _parse_codex_tokens
+    jsonl = (
+        '{"type":"turn.started"}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}\n'
+        '{"type":"turn.completed","usage":{"input_tokens":11035,'
+        '"output_tokens":23}}\n'
+    )
+    tok, usd = _parse_codex_tokens(jsonl)
+    assert tok == 11058
+    assert usd == 0.0
+
+
+def test_parse_codex_tokens_text_fallback_still_works():
+    """Plain `codex exec` (no --json) still scrapes `tokens used\\n<N>`."""
+    from peers.budget_accountant import _parse_codex_tokens
+    assert _parse_codex_tokens("tokens used\n999\n") == (999, 0.0)
+
+
+def test_parse_opencode_tokens_from_json_step_finish():
+    """opencode --format json: tokens+cost come from `step-finish` part
+    events (verified against opencode 1.15.13)."""
+    from peers.budget_accountant import _parse_opencode_tokens
+    jsonl = (
+        '{"type":"step_start","part":{"type":"step-start"}}\n'
+        '{"type":"tool_use","part":{"type":"tool","tool":"write"}}\n'
+        '{"type":"step_finish","part":{"type":"step-finish","tokens":'
+        '{"total":10546,"input":10457,"output":69,"reasoning":20,'
+        '"cache":{"write":0,"read":0}},"cost":0.0021}}\n'
+        '{"type":"text","part":{"type":"text","text":"done"}}\n'
+    )
+    tok, usd = _parse_opencode_tokens(jsonl)
+    assert tok == 10546
+    assert abs(usd - 0.0021) < 1e-9
+
+
+def test_parse_opencode_tokens_sums_multiple_steps():
+    from peers.budget_accountant import _parse_opencode_tokens
+    jsonl = (
+        '{"type":"step_finish","part":{"type":"step-finish",'
+        '"tokens":{"total":100},"cost":0.01}}\n'
+        '{"type":"step_finish","part":{"type":"step-finish",'
+        '"tokens":{"total":250},"cost":0.02}}\n'
+    )
+    tok, usd = _parse_opencode_tokens(jsonl)
+    assert tok == 350
+    assert abs(usd - 0.03) < 1e-9
+
+
+def test_parse_opencode_tokens_empty_returns_zero():
+    from peers.budget_accountant import _parse_opencode_tokens
+    assert _parse_opencode_tokens("not json\n{bad") == (0, 0.0)

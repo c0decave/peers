@@ -34,12 +34,11 @@ from __future__ import annotations
 import copy
 import fcntl
 import json
-import os
 from pathlib import Path
 from typing import Any, Iterable
 
 from peers.safe_io import (
-    _open_dir_fd_no_symlink,
+    atomic_write_text_in_dir_no_symlink,
     open_text_no_symlink,
     read_bytes_no_symlink,
 )
@@ -282,9 +281,14 @@ class StateStore:
                 )
             if not backup.exists():
                 try:
-                    with open_text_no_symlink(backup, "w") as f:
-                        f.write(json.dumps(loaded, indent=2,
-                                           sort_keys=True))
+                    # Same parent-no-follow durable write as save():
+                    # refuse a symlinked/swapped parent before writing the
+                    # backup, not just a symlinked leaf (the is_symlink check
+                    # above only covers the leaf).
+                    atomic_write_text_in_dir_no_symlink(
+                        backup,
+                        json.dumps(loaded, indent=2, sort_keys=True),
+                    )
                 except OSError as e:
                     # Refuse to migrate without a backup. Without it,
                     # a bad migration would have NO rollback path
@@ -321,7 +325,6 @@ class StateStore:
 
     def save(self, state: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         # Strip ephemeral marker keys from on-disk persistence.
         to_write = {k: v for k, v in state.items()
                     if not k.startswith("_")}
@@ -330,29 +333,14 @@ class StateStore:
         # state — otherwise the user can't run peers at all next
         # time without manually editing the file.
         _validate_state(to_write, self.path)
-        with open_text_no_symlink(tmp, "w") as f:
-            f.write(json.dumps(to_write, indent=2, sort_keys=True))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.path)
-        # Durability: rename is atomic but its metadata only hits disk
-        # after the parent directory is fsync'd. Without this, a crash
-        # between os.replace() and the next implicit dir-flush would
-        # leave the rename undone on power loss.
-        try:
-            # open the parent with O_NOFOLLOW (+ dev/ino recheck) so
-            # the durability fsync refuses a symlinked/swapped parent instead
-            # of following it into an attacker-controlled directory.
-            dir_fd = _open_dir_fd_no_symlink(self.path.parent)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            # Some filesystems (FAT, NFS) don't support dir-fsync, and a
-            # symlinked/swapped parent is refused above — in both cases the
-            # best-effort durability fsync is skipped rather than followed.
-            pass
+        # BUG-118/119/114: the whole tmp-write → atomic replace → dir-fsync
+        # runs relative to a no-follow (dev/ino-rechecked) parent dir_fd, so a
+        # symlinked/swapped `.peers/` parent is refused BEFORE any state bytes
+        # are written (not just at the durability fsync), and the temp open
+        # delays truncation past the nlink check.
+        atomic_write_text_in_dir_no_symlink(
+            self.path, json.dumps(to_write, indent=2, sort_keys=True),
+        )
 
 
 # --- helpers shared with TurnManager / driver -----------------------------

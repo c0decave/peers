@@ -1,0 +1,4 @@
+# src/peers/templates/modes/document/mode.yaml
+name: document
+version: 1
+description: "Build a verified machine-readable CODEMAP of the codebase, drift-gated against the real AST (grounded / signature-match / complete)."

@@ -1311,11 +1311,21 @@ def stop_project(store: Store, project: Project,
 
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
-        if not is_pid_alive(pid):
+        # Reap own-child zombies inline. is_pid_alive (kill(0)) keeps
+        # returning True for an exited-but-unreaped child, which would
+        # otherwise spin the whole grace_s wall-clock on a process
+        # that died milliseconds after SIGTERM. ECHILD means the
+        # process isn't ours (e.g. fresh peers-ctl reading the PID
+        # from the registry); is_pid_alive stays authoritative there.
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
+        if not _alive_via_pgid_or_pid(pid, pgid):
             break
         time.sleep(0.2)
 
-    if is_pid_alive(pid):
+    if _alive_via_pgid_or_pid(pid, pgid):
         _signal(pid, pgid, signal.SIGKILL)
         # Brief sleep to let the kernel reap.
         time.sleep(0.2)
@@ -1341,6 +1351,106 @@ def _safe_getpgid(pid: int) -> int | None:
         return os.getpgid(pid)
     except (ProcessLookupError, PermissionError):
         return None
+
+
+def _valid_pgid(pgid: int | None) -> bool:
+    return isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 0
+
+
+def _alive_via_pgid_or_pid(pid: int, pgid: int | None) -> bool:
+    """Liveness dispatch shared by stop_project's grace loop and
+    post-grace recheck. Uses the process-group probe when pgid is a
+    real positive int; falls back to single-PID kill(0) otherwise.
+
+    BUG-138: the dispatch must mirror `_valid_pgid` so that a leaked
+    pgid of 0 / negative / bool does not take the group-check branch
+    and trust the False that `_process_group_has_live_members` now
+    returns for any invalid pgid. Without this, an invalid
+    pgid would prematurely conclude the process is dead and skip the
+    SIGKILL escalation even though the actual PID is still alive.
+    """
+    # Review W2: OR in the direct PID probe. The group scan adds detection
+    # of surviving group children, but if the target re-setpgid's
+    # out of the captured pgid the scan finds no members for the stale group
+    # and would wrongly declare a still-alive leader dead, skipping SIGKILL.
+    # The inline zombie reap in stop_project's grace loop runs before this,
+    # so is_pid_alive(pid) does not reintroduce BUG-134 (the zombie is reaped
+    # → kill(0) → ProcessLookupError → False).
+    if _valid_pgid(pgid):
+        return _process_group_has_live_members(pgid) or is_pid_alive(pid)
+    return is_pid_alive(pid)
+
+
+def _process_group_alive(pgid: int | None) -> bool:
+    # reject pgid<=0 — killpg(0, sig) targets the CALLER's
+    # process group, so escalating to SIGKILL on a leaked 0 would
+    # broadcast SIGKILL to peers-ctl itself and any sibling
+    # processes sharing its pgrp.
+    if not _valid_pgid(pgid):
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _process_group_has_live_members(pgid: int | None) -> bool:
+    """True when pgid has at least one non-zombie member.
+
+    ``killpg(pgid, 0)`` reports success for zombie-only groups. That is
+    useful for permissions probing but wrong for the stop grace loop:
+    zombies cannot consume CPU, hold locks, or receive SIGKILL, and waiting
+    for PID 1 to reap them recreates BUG-134's wasted grace window.
+    """
+    # same caller-pgrp hazard as _process_group_alive; kernel
+    # threads have pgid==0 in /proc, so a leaked 0 would also match many
+    # entries here and falsely report liveness.
+    if not _valid_pgid(pgid):
+        return False
+    proc_dir = Path("/proc")
+    try:
+        entries = tuple(proc_dir.iterdir())
+    except OSError:
+        return _process_group_alive(pgid)
+
+    saw_member = False
+    # Review W1: a permission-unreadable /proc entry might be a LIVE group
+    # member we can't classify. If any exists, we must not let a visible
+    # zombie sibling's `saw_member` short-circuit us into "dead" — fall back
+    # to the killpg probe (conservative: biases toward alive → SIGKILL).
+    # FileNotFoundError means the process exited (not a member) → skip.
+    saw_unreadable = False
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            data = (entry / "stat").read_bytes()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            saw_unreadable = True
+            continue
+        rparen = data.rfind(b")")
+        if rparen < 0:
+            continue
+        rest = data[rparen + 1:].split()
+        if len(rest) < 3:
+            continue
+        try:
+            member_pgid = int(rest[2])
+        except ValueError:
+            continue
+        if member_pgid != pgid:
+            continue
+        saw_member = True
+        if rest[0] != b"Z":
+            return True
+    if saw_member and not saw_unreadable:
+        return False
+    return _process_group_alive(pgid)
 
 
 def _has_missing_starttime_sentinel(project: Project) -> bool:
@@ -1418,7 +1528,7 @@ def _signal(pid: int, pgid: int | None, sig: int) -> None:
     registry thinks we own this PID but the kernel disagrees, so we
     surface it on stderr.
     """
-    if pgid is not None:
+    if _valid_pgid(pgid):
         try:
             os.killpg(pgid, sig)
             return

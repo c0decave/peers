@@ -616,7 +616,8 @@ def test_cli_without_recon_flag_propagates(monkeypatch) -> None:
     captured: dict = {}
 
     def fake_cmd_run(target, max_ticks, dry_run=False, max_usd=None,
-                     verbose=False, without_recon=False, without_post_convergence_skeptic=False):
+                     verbose=False, without_recon=False, no_codemap=False,
+                     without_post_convergence_skeptic=False):
         captured["without_recon"] = without_recon
         return 0
 
@@ -637,7 +638,8 @@ def test_cli_without_recon_default_false(monkeypatch) -> None:
     captured: dict = {}
 
     def fake_cmd_run(target, max_ticks, dry_run=False, max_usd=None,
-                     verbose=False, without_recon=False, without_post_convergence_skeptic=False):
+                     verbose=False, without_recon=False, no_codemap=False,
+                     without_post_convergence_skeptic=False):
         captured["without_recon"] = without_recon
         return 0
 

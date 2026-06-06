@@ -24,6 +24,8 @@ from pathlib import Path
 
 import yaml
 
+from peers.safe_io import read_text_no_symlink
+
 DEFAULT_N = 3
 
 
@@ -34,7 +36,10 @@ def main(root: str = ".") -> int:
         print("convergence_reached: no state.json yet (no ticks ran)")
         return 1
     try:
-        state = json.loads(state_path.read_text())
+        # BUG-102/103: read via safe_io — refuse a symlinked state.json
+        # (CWE-59) and decode with replacement so non-UTF-8 bytes fail the
+        # gate via JSONDecodeError instead of an uncaught UnicodeDecodeError.
+        state = json.loads(read_text_no_symlink(state_path))
     except (OSError, json.JSONDecodeError) as e:
         print(f"convergence_reached FAIL: state.json unreadable: {e}")
         return 1

@@ -43,6 +43,70 @@ class MemoryTokenStore:
         return True
 
 
+def test_forward_request_handles_empty_request_body_edge() -> None:
+    # edge: zero-length body must still forward with the bearer attached
+    # and not raise. urllib.request.Request rejects `data=b""` (would
+    # send Content-Length: 0 GET), so the server-side helper has to
+    # normalise empty bytes to None before constructing the request.
+    captured = {}
+
+    def opener(request, *, timeout):
+        captured["body"] = request.data
+        return FakeResponse(204, b"", {})
+
+    response = forward_request(
+        "GET", "/v1/messages", {}, b"", MemoryTokenStore(),
+        opener=opener, timeout=5.0,
+    )
+    assert response.status == 204
+    assert captured["body"] is None  # b"" must NOT be forwarded as a body
+
+
+def test_forward_request_strips_duplicate_authorization_header_edge() -> None:
+    # edge: a client may pass its own (stale) `Authorization` AND a
+    # lowercased `authorization`. Both are dropped before the bearer
+    # is injected; the outgoing request must carry exactly the
+    # token_store's bearer.
+    captured = {}
+
+    def opener(request, *, timeout):
+        captured["auth"] = request.get_header("Authorization")
+        return FakeResponse(200, b"{}", {})
+
+    forward_request(
+        "POST", "/v1/messages",
+        {"Authorization": "Bearer stale-1", "authorization": "Bearer stale-2"},
+        b"{}", MemoryTokenStore(),
+        opener=opener, timeout=5.0,
+    )
+    assert captured["auth"] == "Bearer old-token"
+
+
+def test_refresh_claude_config_handles_unicode_in_token_url_edge(
+    tmp_path: Path,
+) -> None:
+    # edge: an IDN-style hostname (punycoded loopback variants) MUST be
+    # rejected — the parsed.hostname check normalizes case but unicode
+    # lookalikes are not the literal "localhost"/"127.0.0.1" we accept.
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh-secret",
+            # NOTE: U+FF11 (FULLWIDTH DIGIT ONE) — visually 127.0.0.1
+            "tokenUrl": "http://１２７.0.0.1/token",
+        }
+    }), encoding="utf-8")
+
+    import pytest as _pytest
+
+    def opener(request, *, timeout):  # pragma: no cover - must not fire
+        raise AssertionError("unicode lookalike must not connect")
+
+    with _pytest.raises(oauth_refresh.OAuthRefreshError):
+        refresh_claude_config(token_file, opener=opener)
+
+
 def test_forward_request_injects_bearer_and_strips_host_auth() -> None:
     captured = {}
 

@@ -79,6 +79,39 @@ def test_mixed_real_and_partial_still_degrades_at_threshold() -> None:
     assert state["peers"]["claude"]["state"] == "degraded"
 
 
+def test_recent_fails_bounded_to_window_max_edge() -> None:
+    # edge: the rolling recent_fails counter cannot grow without bound —
+    # a long string of fails must still cap at the window size used by
+    # the degradation threshold (so a peer doesn't permanently degrade
+    # because of ancient noise). Walk past the window and confirm the
+    # recent_runs queue is bounded (max 5 entries).
+    drv = _Driver()
+    state = _bare_state()
+    for _ in range(20):
+        state["peers"]["claude"]["last_tick_productive_no_handoff"] = False
+        drv._update_peer_health(state, "claude", success=False)
+    # The rolling window must NOT track 20 entries — there is an
+    # explicit maxlen so very old fails fall out of the moving average.
+    assert len(state["peers"]["claude"]["recent_runs"]) <= 5
+
+
+def test_empty_recent_runs_after_success_streak_edge() -> None:
+    # edge: a peer that goes through DEGRADED and then recovers must
+    # eventually clear its recent_runs of all the old fail records.
+    # Walk 5 successes after the recovery and confirm the moving
+    # average is 0.0 — pinning the "bounded forgiveness" contract.
+    drv = _Driver()
+    state = _bare_state()
+    for _ in range(3):
+        state["peers"]["claude"]["last_tick_productive_no_handoff"] = False
+        drv._update_peer_health(state, "claude", success=False)
+    for _ in range(5):
+        state["peers"]["claude"]["last_tick_productive_no_handoff"] = False
+        drv._update_peer_health(state, "claude", success=True)
+    assert state["peers"]["claude"]["recent_fails"] == 0.0
+    assert state["peers"]["claude"]["state"] == "healthy"
+
+
 def test_success_clears_degraded_after_recovery() -> None:
     drv = _Driver()
     state = _bare_state()

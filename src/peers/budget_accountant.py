@@ -22,8 +22,42 @@ _CONFIGURABLE_BUDGET_LIMITS = (
 OPERATOR_BUDGET_OVERRIDE_FILE = "budget-overrides.json"
 
 
+def _parse_codex_json_usage(text: str) -> int | None:
+    """Sum input+output tokens across `turn.completed` events of a codex
+    --json (JSONL) stream. Returns None if no such event is present (so the
+    caller can fall back to the legacy text scrape). Verified against
+    codex-cli 0.133: `{"type":"turn.completed","usage":{"input_tokens":N,
+    "output_tokens":M}}`."""
+    total: int | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{") or "turn.completed" not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "turn.completed":
+            continue
+        usage = obj.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        s = 0
+        for key in ("input_tokens", "output_tokens"):
+            v = usage.get(key)
+            if isinstance(v, int):
+                s += v
+        total = (total or 0) + s
+    return total
+
+
 def _parse_codex_tokens(text: str) -> tuple[int, float]:
-    """Codex CLI emits `tokens used\n<N>` near the end."""
+    """Tokens for a codex run. Prefers the `turn.completed.usage` events of a
+    `--json` stream (Option C); falls back to the legacy `tokens used\n<N>`
+    text scrape for plain `codex exec`."""
+    json_tok = _parse_codex_json_usage(text)
+    if json_tok is not None:
+        return json_tok, 0.0
     m = re.search(r"tokens used\s*\n\s*([\d,]+)", text)
     if not m:
         return 0, 0.0
@@ -130,9 +164,46 @@ def _parse_claude_json_envelope(text: str) -> tuple[int, float]:
     return 0, 0.0
 
 
+def _parse_opencode_tokens(text: str) -> tuple[int, float]:
+    """Tokens + USD for an opencode `--format json` run: sum the `step-finish`
+    part events' `tokens.total` and `cost` across all steps (verified against
+    opencode 1.15.13: `{"type":"step_finish","part":{"type":"step-finish",
+    "tokens":{"total":N,...},"cost":C}}`)."""
+    total_tok = 0
+    total_usd = 0.0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{") or "step-finish" not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        part = obj.get("part")
+        if not isinstance(part, dict) or part.get("type") != "step-finish":
+            continue
+        tokens = part.get("tokens")
+        if isinstance(tokens, dict):
+            tot = tokens.get("total")
+            if isinstance(tot, int):
+                total_tok += tot
+            else:
+                for key in ("input", "output"):
+                    v = tokens.get(key)
+                    if isinstance(v, int):
+                        total_tok += v
+        cost = part.get("cost")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            total_usd += float(cost)
+    return total_tok, total_usd
+
+
 _TOKEN_PARSERS = {
     "claude": _parse_claude_tokens,
     "codex": _parse_codex_tokens,
+    "opencode": _parse_opencode_tokens,
 }
 
 

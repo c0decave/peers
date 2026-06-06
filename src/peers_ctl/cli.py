@@ -1642,6 +1642,7 @@ def cmd_start(name: str, max_ticks: int | None = None,
               container: bool = False,
               config_dir: Path | None = None,
               without_recon: bool = False,
+              no_codemap: bool = False,
               without_post_convergence_skeptic: bool = False,
               checkpoint: bool = False) -> int:
     store = _store(config_dir)
@@ -1673,6 +1674,8 @@ def cmd_start(name: str, max_ticks: int | None = None,
     extras: list[str] = []
     if without_recon:
         extras.append("--without-recon")
+    if no_codemap:
+        extras.append("--no-codemap")
     if without_post_convergence_skeptic:
         extras.append("--without-post-convergence-skeptic")
     extra_args: tuple[str, ...] = tuple(extras)
@@ -1931,7 +1934,12 @@ def _add_help_man_subparser(sub, name: str, help_text: str | None = None,
     return p
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the top-level `peers-ctl` argument parser.
+
+    Extracted from main() so the CLI surface is importable/testable
+    without invoking dispatch.
+    """
     from peers_ctl import __version__ as _peers_ctl_version
     parser = argparse.ArgumentParser(
         prog="peers-ctl",
@@ -2195,6 +2203,11 @@ def main(argv: Sequence[str] | None = None) -> int:
              "or explicitly unwanted.",
     )
     p_start.add_argument(
+        "--no-codemap", action="store_true",
+        help="skip the pre-tick structural CODEMAP step (AST-only, "
+             "no LLM call).",
+    )
+    p_start.add_argument(
         "--without-post-convergence-skeptic", action="store_true",
         help="skip the auto-skeptic re-audit tick that fires when "
              "convergence-reached is about to declare terminal "
@@ -2297,6 +2310,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "show", help="show a mode's mode.yaml + goals.yaml + checks/")
     p_modes_show.add_argument("name")
 
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     # Dispatch --help-man before any normal cmd handling.
@@ -2363,6 +2381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                          container=args.container,
                          config_dir=cd,
                          without_recon=args.without_recon,
+                         no_codemap=args.no_codemap,
                          without_post_convergence_skeptic=(
                              args.without_post_convergence_skeptic
                          ),

@@ -25,6 +25,12 @@ def _commit_as(tmp_path: Path, email: str, name: str, files: list[str], message:
     return _git(tmp_path, "rev-parse", "HEAD").stdout.strip()
 
 
+def _attest(tmp_path: Path, sha: str, peer: str):
+    """Simulate the substrate writing its tick-HEAD-delta attribution as a
+    ``refs/notes/peers-attest`` note (value = peer name) on ``sha``."""
+    _git(tmp_path, "notes", "--ref=peers-attest", "add", "-f", "-m", peer, sha)
+
+
 def _write_plan(tmp_path: Path, body: str):
     (tmp_path / "PLAN.md").write_text(f"""# F
 ## Meta
@@ -175,3 +181,114 @@ def test_no_plan_md_fails(tmp_path, capsys):
     assert rc == 1
     out = capsys.readouterr().out
     assert "PLAN.md" in out
+
+
+def test_shared_identity_body_peer_spoof_does_not_mask_trailer(tmp_path, capsys):
+    """BUG-140 regression: implementer cannot bypass the gate by smuggling a
+    fake ``Peer: <other>`` line into the implementation commit body above the
+    real bottom ``Peer: <self>`` trailer. Only the final trailer block's last
+    Peer trailer should be honored — mirroring BUG-139's hook fix."""
+    _init_git(tmp_path)
+    src = tmp_path / "src" / "auth.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def auth(): pass")
+    _write_plan(tmp_path, "- [ ] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    _commit_as(
+        tmp_path,
+        _SHARED,
+        "dash",
+        ["src/auth.py", "PLAN.md"],
+        # Early fake `Peer: codex` line in prose; real `Peer: claude` trailer
+        # at the bottom. A correct parser must attribute impl to claude.
+        "step-1 impl\n\nSee Peer: codex notes below.\nPeer: codex\nrationale.\n\nPeer: claude",
+    )
+    _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    _commit_as(
+        tmp_path,
+        _SHARED,
+        "dash",
+        ["PLAN.md"],
+        "step-1 self-checkoff\n\nPeer: claude",
+    )
+    # claude implemented AND checked off (same trailer); gate must fail.
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 1, "BUG-140: body Peer spoof allowed self-checkoff through gate"
+    assert "peer:claude" in capsys.readouterr().out
+
+
+def test_bug142_substrate_note_overrides_forged_impl_trailer(tmp_path, capsys):
+    """BUG-142: a peer cannot forge attribution by stamping its OWN impl commit
+    with the other peer's name as the only/final ``Peer:`` trailer.
+
+    claude implements src/auth.py but writes ``Peer: codex`` as the sole final
+    trailer (attributing the work to codex), then self-checkoffs as
+    ``Peer: claude``. The trailer-only gate is fooled (impl=codex != checkoff=
+    claude -> PASS). The substrate's tick-HEAD-delta note attributes the impl
+    commit to the peer that actually produced it (claude), which the gate must
+    honour over the forged trailer -> REJECT.
+    """
+    _init_git(tmp_path)
+    src = tmp_path / "src" / "auth.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def auth(): pass")
+    _write_plan(tmp_path, "- [ ] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    impl_sha = _commit_as(
+        tmp_path,
+        _SHARED,
+        "dash",
+        ["src/auth.py", "PLAN.md"],
+        # Forged: claude attributes its own impl to codex as the ONLY trailer.
+        "step-1 impl\n\nPeer: codex",
+    )
+    # Substrate observed this commit during claude's tick -> attests claude.
+    _attest(tmp_path, impl_sha, "claude")
+
+    _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    checkoff_sha = _commit_as(
+        tmp_path,
+        _SHARED,
+        "dash",
+        ["PLAN.md"],
+        "step-1 self-checkoff\n\nPeer: claude",
+    )
+    _attest(tmp_path, checkoff_sha, "claude")
+
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 1, (
+        "BUG-142: forged Peer trailer on the impl commit allowed self-checkoff; "
+        "the substrate note attributing the impl to claude must override it"
+    )
+    assert "peer:claude" in capsys.readouterr().out
+
+
+def test_shared_identity_missing_impl_peer_trailer_fails_closed(tmp_path, capsys):
+    """BUG-141 regression: a commit without a final ``Peer:`` trailer should
+    not be treated as a distinct principal from a peer-trailered checkoff when
+    both commits share the same git author email."""
+    _init_git(tmp_path)
+    src = tmp_path / "src" / "auth.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def auth(): pass")
+    _write_plan(tmp_path, "- [ ] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    _commit_as(
+        tmp_path,
+        _SHARED,
+        "dash",
+        ["src/auth.py", "PLAN.md"],
+        "step-1 impl without final peer trailer",
+    )
+    _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    _commit_as(
+        tmp_path,
+        _SHARED,
+        "dash",
+        ["PLAN.md"],
+        "step-1 self-checkoff\n\nPeer: claude",
+    )
+
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 1, (
+        "BUG-141: mixed email fallback vs peer identity allowed "
+        "same-author self-checkoff through the post-hoc gate"
+    )
+    assert "email:dash@localhost.local" in capsys.readouterr().out

@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from peers.structured_halt import classify_structured_halt
+
 
 _BUF_SOFT_CAP_BYTES = 2 * 1024 * 1024  # 2 MiB per stream (default)
 _BUF_KEEP_HEAD_LINES = 100
@@ -161,6 +163,92 @@ def _search_pattern(pat: re.Pattern, text: str) -> re.Match | None:
             signal.setitimer(
                 signal.ITIMER_REAL, previous_timer[0], previous_timer[1]
             )
+
+
+# Halt-class matches stop the WHOLE run and demand operator action, so a
+# false positive is expensive (it wedges the loop — see the v15 internal testing,
+# 2026-06-04). A peer routinely echoes repo/tool content that contains
+# error-shaped text: `git log --oneline` subjects, reproduce-test source,
+# bug-report JSON, diffs. The halt patterns already drop QUOTED echoes via
+# their `[^"]` prefix, but unquoted echoes (a commit subject, a markdown
+# bullet) slip through.
+#
+# The discriminator is INTENTIONALLY ANCHORED to the LINE START (all `.match`,
+# no `.search`): an echoed line carries its tell as a *prefix* — a git
+# short-hash, a diff/markdown marker, a leading file:line citation, a
+# `- [peer] …` review bullet, a JSON field key. A genuine CLI error line
+# starts with the error itself (`ERROR: …`, a timestamp, a level), so it is
+# NOT classified as echo even when it mentions a file:line or a BUG-NNN
+# mid-message (review finding C2). Erring toward NOT-echo keeps real
+# auth/quota halts firing — the safe direction, since codex has no structured
+# backstop. (Residual: a real error beginning with a bare 7-40 hex token +
+# space is rare enough to accept as the git-log shape.)
+_ECHO_LINE_PREFIX = re.compile(
+    r"""^(?:
+        [0-9a-f]{7,40}\                       # git short-hash + space (git log --oneline)
+      | (?:diff\ |index\ |@@\ |\+\+\+\ |---\ ) # unified-diff structural lines
+      | \+                                     # unified-diff added line (a real error never starts with +)
+      | \s*[#>]\                               # markdown heading / blockquote
+      | \s*\d+[.)]\                            # markdown numbered list item
+      | \s*[-*]\ +\[[^\]]+\]                   # markdown bullet + [tag] (peers review/handoff echo)
+      | \s*"[^"]+"\s*:                          # JSON field key (bug-report body)
+      | \s*[\w./-]+\.(?:py|md|ya?ml|txt|rs|js|ts|sh|toml|json|c|cc|cpp|h):\d+  # LEADING file:line citation
+    )""",
+    re.VERBOSE,
+)
+
+
+def _is_echoed_repo_content(line: str) -> bool:
+    """True iff `line` *starts with* a shape only echoed repo/tool content
+    has (git-log hash, diff/markdown marker, leading file:line citation,
+    `- [peer]` review bullet, JSON field). Anchored at the line start so a
+    genuine CLI error line — which leads with the error, not a citation — is
+    never classified as echo (review finding C2)."""
+    return bool(_ECHO_LINE_PREFIX.match(line))
+
+
+def _matched_line(text: str, match: "re.Match") -> str:
+    """The full line of `text` containing `match` (newline-delimited)."""
+    start = text.rfind("\n", 0, match.start()) + 1
+    end = text.find("\n", match.end())
+    return text[start:] if end == -1 else text[start:end]
+
+
+def _first_actionable_match(
+    text: str,
+    patterns: "Sequence[re.Pattern]",
+    halt_pattern_strs: "frozenset[str] | set[str]",
+) -> "re.Match | None":
+    """Return the first match that should ACT (classify api-error / halt).
+    A halt-pattern match whose line is echoed repo/tool content is skipped
+    and scanning continues — mirroring the `[^"]` prefix that already drops
+    quoted file dumps. Non-halt (error_patterns) matches always act.
+    Preserves the SIGALRM-guarded search and the halt-before-error priority
+    of `patterns` (halt patterns come first in the combined list)."""
+    for pat in patterns:
+        is_halt = pat.pattern in halt_pattern_strs
+        offset = 0
+        while offset < len(text):
+            m = _search_pattern(pat, text[offset:])
+            if m is None:
+                break
+            if is_halt and _is_echoed_repo_content(
+                _matched_line(text[offset:], m)
+            ):
+                # Skip the ENTIRE echoed line, not just this match. Advancing
+                # only past `m.end()` would re-anchor `(?m)^` mid-line, and the
+                # post-offset remainder loses the echo prefix — so a second
+                # halt-keyword hit on the same echoed line would forge a halt
+                # (review finding C1). Resume at the next line start; `offset`
+                # therefore always sits at a line boundary, keeping `^` and
+                # `_matched_line` line-aligned.
+                nl = text.find("\n", offset + m.end())
+                if nl == -1:
+                    break
+                offset = nl + 1
+                continue
+            return m
+    return None
 
 
 @dataclass
@@ -389,19 +477,21 @@ class _StreamCollector:
         with self.lock:
             return "".join(self.buf)
 
-    def scan_new(self, patterns: Sequence[re.Pattern]) -> re.Match | None:
-        """Search the unscanned portion of buf for any pattern.
-        Advances cursor whether or not a match is found."""
+    def scan_new(
+        self,
+        patterns: Sequence[re.Pattern],
+        halt_pattern_strs: "frozenset[str] | set[str]" = frozenset(),
+    ) -> re.Match | None:
+        """Search the unscanned portion of buf for the first ACTIONABLE
+        pattern match. Advances cursor whether or not a match is found.
+        A halt-pattern match on echoed repo/tool content is skipped (see
+        `_first_actionable_match`)."""
         with self.lock:
             new_text = "".join(self._scan_buf)
             self._scan_buf = []
             self._scan_size = 0
             self._scan_cursor = len(self.buf)
-        for pat in patterns:
-            m = _search_pattern(pat, new_text)
-            if m is not None:
-                return m
-        return None
+        return _first_actionable_match(new_text, patterns, halt_pattern_strs)
 
 
 class HealthGuard:
@@ -536,6 +626,7 @@ class HealthGuard:
         poll_interval_s: float = 0.25,
         buf_cap_bytes: int = _BUF_SOFT_CAP_BYTES,
         extra_env: dict[str, str] | None = None,
+        tool: str | None = None,
     ) -> RunResult:
         if prompt_mode == "argv-substitute":
             effective_argv = [a.replace("{PROMPT}", prompt) for a in argv]
@@ -665,9 +756,13 @@ class HealthGuard:
                     # halt_patterns are at the front of `combined_patterns`
                     # so a line matching both classes binds to halt.
                     try:
-                        match = stdout_col.scan_new(combined_patterns)
+                        match = stdout_col.scan_new(
+                            combined_patterns, halt_pattern_strs
+                        )
                         if match is None:
-                            match = stderr_col.scan_new(combined_patterns)
+                            match = stderr_col.scan_new(
+                                combined_patterns, halt_pattern_strs
+                            )
                     except _PatternSearchTimeout as e:
                         classification = "process-fail"
                         matched_pattern_re = e.pattern
@@ -782,37 +877,50 @@ class HealthGuard:
         # this path either.
         if classification is None and combined_patterns:
             for col_text in (stdout, stderr):
-                hit = None
                 # halt_patterns are at the front of `combined_patterns`
-                # — same priority order as the in-loop scan.
-                for pat in combined_patterns:
-                    try:
-                        hit = _search_pattern(pat, col_text)
-                    except _PatternSearchTimeout as e:
-                        classification = "process-fail"
-                        matched_pattern_re = e.pattern
-                        matched_snippet = (
-                            "health.error_patterns regex timed out after "
-                            f"{_PATTERN_SEARCH_TIMEOUT_S:.2f}s"
-                        )
-                        matched_source = "post-join"
-                        config_error = (
-                            "healthguard: error pattern timed out; "
-                            f"pattern={e.pattern!r}. Tighten or remove "
-                            "this regex."
-                        )
-                        hit = None
-                        break
-                    if hit is not None:
-                        classification = "api-error"
-                        matched_pattern_re = pat.pattern
-                        matched_snippet = hit.group(0)[:200]
-                        matched_source = "post-join"
-                        if pat.pattern in halt_pattern_strs:
-                            halt_required = True
-                        break
-                if classification is not None:
+                # — same priority order as the in-loop scan. Echoed-content
+                # halt matches are skipped (mirrors the in-loop scan_new).
+                try:
+                    hit = _first_actionable_match(
+                        col_text, combined_patterns, halt_pattern_strs
+                    )
+                except _PatternSearchTimeout as e:
+                    classification = "process-fail"
+                    matched_pattern_re = e.pattern
+                    matched_snippet = (
+                        "health.error_patterns regex timed out after "
+                        f"{_PATTERN_SEARCH_TIMEOUT_S:.2f}s"
+                    )
+                    matched_source = "post-join"
+                    config_error = (
+                        "healthguard: error pattern timed out; "
+                        f"pattern={e.pattern!r}. Tighten or remove "
+                        "this regex."
+                    )
                     break
+                if hit is not None:
+                    classification = "api-error"
+                    matched_pattern_re = hit.re.pattern
+                    matched_snippet = hit.group(0)[:200]
+                    matched_source = "post-join"
+                    if hit.re.pattern in halt_pattern_strs:
+                        halt_required = True
+                    break
+
+        # Option C (v15 internal testing follow-up): structured halt classification.
+        # When the peer tool exposes a structured status channel (claude's
+        # stream-json result envelope), an unrecoverable auth/quota/usage-limit
+        # error reported THERE halts the run — a signal a peer echoing repo
+        # content cannot forge (echoes are text events, not the result
+        # envelope). Additive: it only asserts a halt the regex path missed,
+        # never downgrades an existing one.
+        if tool and not halt_required:
+            structured = classify_structured_halt(tool, stdout, stderr, rc)
+            if structured is not None:
+                matched_pattern_re, matched_snippet = structured
+                matched_source = "structured"
+                classification = "api-error"
+                halt_required = True
 
         if config_error:
             stderr = (stderr + "\n" + config_error + "\n").lstrip()

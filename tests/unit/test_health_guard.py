@@ -301,6 +301,223 @@ def test_phase2_halt_patterns_skip_file_dump(tmp_path):
     assert r.halt_required is False
 
 
+# The v15 internal testing (2026-06-04) wedged on a SELF-REFERENTIAL halt: the
+# peers found+fixed a halt-pattern bug (BUG-121/122), but the act of
+# recording the finding left the literal `ERROR ... quota-exhausted` shape
+# in git history (commit subjects), reproduce-tests, and bug-report JSON.
+# Every later tick that echoed `git log --oneline` re-emitted that line; the
+# unquoted `[^"]*?` prefix happily traversed it, so the quota halt_pattern
+# matched the peer's OWN echo and killed it as `peer-unavailable`. The fix:
+# a halt match whose line is recognizably echoed repo/tool content (git
+# short-hash prefix, BUG-NNN / file.py:NN citation, diff/markdown markers)
+# is a non-match, exactly as the quoted `[^"]` exclusion already treats
+# file dumps. Real CLI error lines carry none of those markers and still halt.
+
+_QUOTA_HALT_PAT = (
+    r"(?m)^[^\"\n]*?\b(ERROR|FATAL)\b[^\"\n]*?\bquota[ _-]?exhausted\b"
+)
+
+
+def test_phase2_halt_skips_git_log_echo_of_bug_subject(tmp_path):
+    """v15 regression: a peer echoing a `git log --oneline` line whose
+    commit subject literally describes the quota-exhausted shape must NOT
+    halt the run. The line is unquoted (so `[^"]*?` does not save it) but
+    carries a git short-hash prefix + a BUG-NNN citation — unmistakably
+    echoed repo content, not a freshly-emitted CLI error."""
+    hg = HealthGuard(cwd=tmp_path)
+    script = tmp_path / "fake_git_log.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo '481e64d BUG-122: docs/plans line carries verbatim ERROR + "
+        "quota-exhausted shape'\n"
+        "sleep 0.3\n"
+        "exit 0\n"
+    )
+    script.chmod(0o755)
+    r = hg.invoke(
+        [str(script)], prompt="ignored",
+        idle_timeout_s=10, absolute_max_runtime_s=10,
+        halt_patterns=[_QUOTA_HALT_PAT],
+    )
+    assert r.classification == "success"
+    assert r.halt_required is False
+
+
+def test_phase2_real_quota_error_still_halts(tmp_path):
+    """Regression-lock for the echo-guard: a GENUINE CLI quota error line
+    (no git-hash / BUG / diff / file:line markers) must still halt. The
+    echo-guard only suppresses recognizable echoes, never real errors."""
+    hg = HealthGuard(cwd=tmp_path)
+    script = tmp_path / "fake_real_quota.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo 'ERROR: quota exhausted — please top up your plan' 1>&2\n"
+        "sleep 0.3\n"
+        "exit 1\n"
+    )
+    script.chmod(0o755)
+    r = hg.invoke(
+        [str(script)], prompt="ignored",
+        idle_timeout_s=10, absolute_max_runtime_s=10,
+        halt_patterns=[_QUOTA_HALT_PAT],
+    )
+    assert r.classification == "api-error"
+    assert r.halt_required is True
+
+
+def test_is_echoed_repo_content_recognizes_echoes_rejects_real_errors():
+    """Unit: the echo discriminator flags lines that can only be echoed
+    repo/tool content, and passes (does NOT flag) genuine CLI error lines."""
+    import peers.health_guard as hg_mod
+    f = hg_mod._is_echoed_repo_content
+
+    # Echoed content — must be flagged True.
+    assert f("481e64d BUG-122: docs/plans line carries verbatim ERROR + "
+             "quota-exhausted shape")                       # git short-hash
+    assert f("  - [claude] BUG-122: ERROR + quota-exhausted")  # md bullet + BUG
+    assert f("tests/unit/test_health_guard.py:236:    ERROR ... quota "
+             "exhausted")                                   # file:line citation
+    assert f("+        ERROR auth: quota exhausted")        # unified-diff add
+    assert f("#  ERROR quota-exhausted halt-class")         # md heading
+
+    # Genuine CLI error lines — must NOT be flagged (real halts).
+    assert not f("ERROR: quota exhausted — please top up your plan")
+    assert not f("2026-05-25T00:00:00Z ERROR auth: authentication failed")
+    assert not f("FATAL: invalid api key")
+    # C2 (review): a real error citing a file:line or BUG ref mid-message, or
+    # carrying a leading bullet WITHOUT a bracketed peer tag, must NOT be
+    # suppressed — these were false-negatived by the `.search()`/bare-bullet
+    # forms and would swallow a real auth/quota halt.
+    assert not f("ERROR authentication failed at auth.py:42")
+    assert not f("ERROR quota exhausted (see BUG-1)")
+    assert not f("- ERROR: authentication failed")
+
+
+def test_first_actionable_match_skips_whole_echoed_line_with_two_hits():
+    """C1 (review): a single echoed line that hits the halt vocabulary TWICE
+    must be skipped ENTIRELY. The old loop advanced past only the first match,
+    re-anchoring `(?m)^` mid-line; the post-offset remainder lost the echo
+    prefix and forged a halt. Advancing past the whole line fixes it."""
+    import re
+    import peers.health_guard as hg_mod
+    pat = re.compile(
+        r"(?m)^[^\"\n]*?\b(ERROR|FATAL)\b[^\"\n]*?"
+        r"\bauthentication[ _-]?(failed|error)\b"
+    )
+    # git-log echo (hex prefix) quoting two auth-error phrases on one line.
+    line = ("abcdef0 ERROR authentication failed; also ERROR "
+            "authentication error tail")
+    assert hg_mod._first_actionable_match(line, [pat], {pat.pattern}) is None
+    # A real auth error on its OWN line after an echoed line still fires.
+    echoed_line1 = "1234abc BUG-9: ERROR authentication failed in a subject"
+    text = echoed_line1 + "\nERROR authentication failed for OAuth token\n"
+    assert hg_mod._first_actionable_match(text, [pat], {pat.pattern}) is not None
+    # The echoed first line ALONE is a non-match — proving the match above
+    # came from the real second line, not line 1.
+    assert hg_mod._first_actionable_match(
+        echoed_line1, [pat], {pat.pattern}
+    ) is None
+
+
+def test_invoke_structured_halt_from_claude_result_envelope(tmp_path):
+    """Option C (v15 internal testing follow-up): a claude stream-json result
+    envelope with is_error + a usage-limit message halts via the STRUCTURED
+    channel (matched_error_source=structured), independent of halt_patterns.
+    This is the echo-immune signal — it reads only the result envelope."""
+    hg = HealthGuard(cwd=tmp_path)
+    script = tmp_path / "fake_claude.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo '{\"type\":\"assistant\",\"message\":{\"content\":"
+        "[{\"type\":\"text\",\"text\":\"working\"}]}}'\n"
+        "echo '{\"type\":\"result\",\"subtype\":\"error_during_execution\","
+        "\"is_error\":true,\"result\":\"You have hit your usage limit. "
+        "Visit settings to purchase more.\"}'\n"
+        "exit 1\n"
+    )
+    script.chmod(0o755)
+    r = hg.invoke(
+        [str(script)], prompt="ignored",
+        idle_timeout_s=10, absolute_max_runtime_s=10, tool="claude",
+    )
+    assert r.halt_required is True
+    assert r.matched_error_source == "structured"
+    assert r.matched_error_pattern.startswith("structured:claude:")
+    assert "usage limit" in r.matched_error_snippet
+
+
+def test_invoke_structured_ignores_echoed_error_in_claude_text_event(tmp_path):
+    """Option C echo immunity end-to-end: a claude run whose assistant/text
+    event echoes a git-log subject containing ERROR + quota-exhausted, but
+    whose result envelope is a clean success, must NOT halt. The structured
+    classifier looks only at the result envelope, never the transcript."""
+    hg = HealthGuard(cwd=tmp_path)
+    script = tmp_path / "fake_claude_echo.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":"
+        "\"text\",\"text\":\"481e64d BUG-122 ERROR + quota-exhausted\"}]}}'\n"
+        "echo '{\"type\":\"result\",\"subtype\":\"success\","
+        "\"is_error\":false,\"result\":\"reviewed git log\"}'\n"
+        "exit 0\n"
+    )
+    script.chmod(0o755)
+    r = hg.invoke(
+        [str(script)], prompt="ignored",
+        idle_timeout_s=10, absolute_max_runtime_s=10, tool="claude",
+    )
+    assert r.halt_required is False
+    assert r.classification == "success"
+
+
+def test_invoke_structured_halt_from_codex_json_turn_failed(tmp_path):
+    """Option C (codex --json): a `turn.failed` event carrying a usage-limit
+    error halts via the structured channel (source=structured), independent
+    of halt_patterns and immune to an echoed error in an agent_message."""
+    hg = HealthGuard(cwd=tmp_path)
+    script = tmp_path / "fake_codex.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo '{\"type\":\"item.completed\",\"item\":{\"type\":"
+        "\"agent_message\",\"text\":\"git log: deadbeef quota exhausted\"}}'\n"
+        "echo '{\"type\":\"turn.failed\",\"error\":{\"message\":"
+        "\"you have hit your usage limit\"}}'\n"
+        "exit 1\n"
+    )
+    script.chmod(0o755)
+    r = hg.invoke(
+        [str(script)], prompt="ignored",
+        idle_timeout_s=10, absolute_max_runtime_s=10, tool="codex",
+    )
+    assert r.halt_required is True
+    assert r.matched_error_source == "structured"
+    assert r.matched_error_pattern.startswith("structured:codex:")
+
+
+def test_invoke_structured_halt_from_opencode_error_event(tmp_path):
+    """Option C (opencode --format json): a top-level `error` event with a
+    usage-limit message halts via the structured channel; an echoed error in
+    a `text` part does not."""
+    hg = HealthGuard(cwd=tmp_path)
+    script = tmp_path / "fake_opencode.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo '{\"type\":\"text\",\"part\":{\"type\":\"text\","
+        "\"text\":\"logs: ERROR you have hit your usage limit\"}}'\n"
+        "echo '{\"type\":\"error\",\"error\":{\"name\":\"UsageLimitError\","
+        "\"data\":{\"message\":\"You have hit your usage limit.\"}}}'\n"
+        "exit 1\n"
+    )
+    script.chmod(0o755)
+    r = hg.invoke(
+        [str(script)], prompt="ignored",
+        idle_timeout_s=10, absolute_max_runtime_s=10, tool="opencode",
+    )
+    assert r.halt_required is True
+    assert r.matched_error_source == "structured"
+    assert r.matched_error_pattern.startswith("structured:opencode:")
+
+
 def test_phase2_no_halt_patterns_keeps_legacy_behavior(tmp_path):
     """legacy/default: invoke() called WITHOUT halt_patterns
     behaves exactly as before. halt_required is always False."""
@@ -756,7 +973,7 @@ def test_error_pattern_seen_only_after_reader_drain_classifies_as_api_error(
     `success`; post-fix it classifies as `api-error`."""
     import peers.health_guard as hg_mod
 
-    def blind_scan(_self, _patterns):
+    def blind_scan(_self, _patterns, _halt=frozenset()):
         return None
 
     monkeypatch.setattr(hg_mod._StreamCollector, "scan_new", blind_scan)
@@ -800,7 +1017,7 @@ def test_post_join_rescan_records_matched_error_source_post_join(
     that scan_buf sizing or the race window needs investigation."""
     import peers.health_guard as hg_mod
 
-    def blind_scan(_self, _patterns):
+    def blind_scan(_self, _patterns, _halt=frozenset()):
         return None
 
     monkeypatch.setattr(hg_mod._StreamCollector, "scan_new", blind_scan)
@@ -855,7 +1072,7 @@ def test_post_join_rescan_honors_pattern_timeout(
     regex can't bypass either scan path."""
     import peers.health_guard as hg_mod
 
-    def blind_scan(_self, _patterns):
+    def blind_scan(_self, _patterns, _halt=frozenset()):
         return None
 
     monkeypatch.setattr(hg_mod._StreamCollector, "scan_new", blind_scan)

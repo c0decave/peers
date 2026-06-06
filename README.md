@@ -71,6 +71,7 @@ peers-ctl new myfeature --container --modes=implement --plan ./PLAN.md
 
 **Automatic hooks** (opt-out flags):
 - **`recon` pre-tick** (default on): substrate scans the repo once before tick 1 and writes `.peers/recon.md` (detected languages, key docs, entry-point candidates, top-level tree). Free + fast — no LLM call. Eliminates the "blind tick 1" penalty. Opt out: `peers-ctl start <name> --without-recon`.
+- **`codemap` pre-tick** (default on): substrate builds a structural CODEMAP from the AST and writes `.peers/CODEMAP.yaml` (machine-readable: every public symbol, its `file:line` and signature) plus `.peers/codemap.md` (a compact, byte-capped digest peers read as context). Free + fast — no LLM call. Primes peers with the codebase's public-API shape before tick 1, on top of recon's file-level view. Opt out: `peers-ctl start <name> --no-codemap`.
 - **`auto-skeptic` post-convergence** (default on): when `consecutive_clean_ticks >= N` would fire `convergence-reached`, the orchestrator runs ONE extra tick with a critical re-audit prompt. If the skeptic-tick stays clean → really terminal. If it surfaces a new blocking bug → counter resets, loop continues. Opt out: `peers-ctl start <name> --without-post-convergence-skeptic`.
 
 `peers-ctl new`:
@@ -320,6 +321,9 @@ peers -C /path/to/target watch             # follow runs.jsonl
 peers-ctl start <name> --without-recon
 # Skip the substrate-only pre-tick recon step (no LLM call, free).
 # Only opt out if .peers/recon.md was hand-prepared.
+
+peers-ctl start <name> --no-codemap
+# Skip the substrate-only pre-tick structural CODEMAP step (no LLM call, free).
 
 peers-ctl start <name> --without-post-convergence-skeptic
 # Skip the auto-skeptic re-audit tick that fires when consecutive_clean_
@@ -595,6 +599,49 @@ For OpenRouter, export `OPENROUTER_API_KEY` before `peers run`,
 early if the key is missing. Container mode passes the key name through
 and opens only `openrouter.ai` in the egress proxy allow-list for projects
 that opt in.
+
+### opencode peers + local models (ollama / vllm / llama.cpp)
+
+`opencode` is a first-class tool alongside `claude` and `codex`. Run it with
+`--format json` so the substrate gets the same structured channel it uses for
+the others — token + USD accounting (from `step-finish` events) and
+echo-immune auth/quota halt detection (from `error` events):
+
+```yaml
+peers:
+  - name: opencode
+    tool: opencode
+    model: ollama/qwen2.5      # opencode's <provider>/<model> (NOT a separate provider:)
+    reasoning: high            # → --variant high
+    argv: ["opencode", "run", "--format", "json", "--dangerously-skip-permissions", "{PROMPT}"]
+    prompt_mode: argv-substitute
+```
+
+opencode is also the simplest path to **local models**. It is a universal
+gateway: configure the backend once in opencode's own config
+(`opencode providers`, or an `opencode.json` custom provider) — ollama, vllm,
+llama.cpp, LM Studio, or any OpenAI-compatible `/v1` endpoint — then point a
+peer's `model` at `<provider>/<model>`:
+
+```yaml
+    model: ollama/qwen2.5            # local via ollama
+    model: openai-compatible/<name> # local vllm / llama.cpp server
+    model: anthropic/claude-...      # cloud, routed through opencode
+```
+
+The substrate needs no local-model-specific config; opencode resolves the
+provider. Notes:
+
+- `provider:` is **not** used for opencode — encode the provider in `model`
+  (`provider/model`). Setting `provider:` on an opencode peer is rejected.
+- Billing for opencode is treated as **warn**, never a hard `max_usd` kill
+  (local = free, opencode-hosted = subscription, BYOK cloud = metered — the
+  tool name alone can't tell which, so the conservative default applies).
+- `codex` can also reach local models, but only `ollama`/`lmstudio` via
+  `codex exec --oss --local-provider …`, or a custom provider that speaks the
+  OpenAI **Responses** API (`wire_api=responses`) — codex dropped chat-API
+  support, so chat-only servers (llama.cpp, vanilla ollama OpenAI-compat) go
+  through opencode instead.
 
 ## Reviewer modes (soft goals)
 

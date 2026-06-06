@@ -49,6 +49,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from peers.attest import attested_peer
 from peers_ctl.plan_parser import PlanValidationError, parse_plan
 
 
@@ -128,37 +129,104 @@ def _find_checkoff_commit(project_root: Path, step_id: str) -> str | None:
 # user), under which an email comparison cannot tell the two peers apart and
 # the gate would silently pass. We key on the trailer and fall back to the
 # author email only when no trailer is present (legacy / hand-made commits).
-_PEER_TRAILER_RE = re.compile(r"^Peer:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
+_PEER_TRAILER_RE = re.compile(r"^Peer:[ \t]*(\S+)[ \t]*$")
+_TRAILER_LINE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:[ \t]*.*$")
 
 
-def _commit_identity(project_root: Path, sha: str) -> str:
-    """Return a peer-identity token for ``sha``.
+def _peer_identity_from_trailers(body: str) -> str:
+    """Return the final trailer-block ``Peer:`` identity, if present.
 
-    Prefers the ``Peer: <name>`` trailer; falls back to ``email:<author>``
-    so the two namespaces never collide.
+    BUG-140: the prior implementation used ``re.search`` over the full body
+    and returned the FIRST ``Peer:`` line, letting an implementer spoof
+    attribution by smuggling a fake ``Peer: <other>`` line into the prose
+    above a real bottom ``Peer: <self>`` trailer. Mirrors the BUG-139 fix in
+    ``pre-commit-reviewer-checkoff`` so both layers agree on identity.
     """
-    proc = subprocess.run(
-        ["git", "-C", str(project_root), "log", "-1", "--format=%B", sha],
-        capture_output=True, text=True,
-    )
-    if proc.returncode == 0:
-        m = _PEER_TRAILER_RE.search(proc.stdout)
+    lines = [line.rstrip("\r") for line in body.rstrip().splitlines()]
+    for line in reversed(lines):
+        if line.strip() == "":
+            break
+        m = _PEER_TRAILER_RE.match(line)
         if m:
             return f"peer:{m.group(1).lower()}"
+        if not _TRAILER_LINE_RE.match(line):
+            break
+    return ""
+
+
+CommitIdentity = tuple[str, str]
+
+
+def _commit_identity(project_root: Path, sha: str) -> CommitIdentity:
+    """Return ``(peer_identity, email_identity)`` for ``sha``.
+
+    Identity resolution priority:
+
+    1. The substrate-written ``peers-attest`` git note — agent-unforgeable,
+       derived from the tick HEAD-delta. This OVERRIDES the commit's ``Peer:``
+       trailer, so a peer cannot reattribute its own implementation by stamping
+       the other peer's name on its commit.
+    2. The ``Peer:`` trailer — for legacy / not-yet-attested commits (e.g.
+       history imported before this fix, or made outside the loop).
+    3. The author email — last-resort fallback so mixed peer/email histories
+       can fail closed when they share one git author identity.
+    """
+    note = attested_peer(project_root, sha)
+    if note:
+        peer_id = f"peer:{note.lower()}"
+    else:
+        peer_id = ""
+        proc = subprocess.run(
+            ["git", "-C", str(project_root), "log", "-1", "--format=%B", sha],
+            capture_output=True, text=True,
+        )
+        if proc.returncode == 0:
+            peer_id = _peer_identity_from_trailers(proc.stdout)
     proc = subprocess.run(
         ["git", "-C", str(project_root), "log", "-1", "--format=%ae", sha],
         capture_output=True, text=True,
     )
     ae = proc.stdout.strip() if proc.returncode == 0 else ""
-    return f"email:{ae}" if ae else ""
+    email_id = f"email:{ae}" if ae else ""
+    return (peer_id, email_id)
 
 
-def _last_impl_identity(project_root: Path, checkoff_sha: str, path: str) -> str:
+def _identity_known(identity: CommitIdentity) -> bool:
+    return bool(identity[0] or identity[1])
+
+
+def _identity_matches(impl: CommitIdentity, checkoff: CommitIdentity) -> bool:
+    """True when the two commit identities prove the same principal.
+
+    If both commits carry peer trailers, compare only peer identities; this
+    preserves the shared-git-author case where claude and codex commit under
+    one email. If either side lacks a peer trailer, fall back to matching
+    author email so malformed/legacy trailer histories with the same shared
+    email do not pass as "reviewed by another peer" without evidence.
+    """
+    impl_peer, impl_email = impl
+    checkoff_peer, checkoff_email = checkoff
+    if impl_peer and checkoff_peer:
+        return impl_peer == checkoff_peer
+    return bool(impl_email and checkoff_email and impl_email == checkoff_email)
+
+
+def _identity_label(identity: CommitIdentity) -> str:
+    peer_id, email_id = identity
+    if peer_id and email_id:
+        return f"{peer_id}/{email_id}"
+    return peer_id or email_id or "<unknown>"
+
+
+def _last_impl_identity(
+    project_root: Path, checkoff_sha: str, path: str
+) -> CommitIdentity:
     """Peer identity of the most recent commit modifying ``path`` strictly
     before ``checkoff_sha``.
 
-    Returns ``""`` if no such commit exists (file was never touched before
-    the checkoff — a different failure that ``plan-step-traceable`` catches).
+    Returns an empty identity if no such commit exists (file was never touched
+    before the checkoff — a different failure that ``plan-step-traceable``
+    catches).
     """
     proc = subprocess.run(
         ["git", "-C", str(project_root), "log", "-1", "--format=%H",
@@ -167,7 +235,7 @@ def _last_impl_identity(project_root: Path, checkoff_sha: str, path: str) -> str
     )
     impl_sha = proc.stdout.strip() if proc.returncode == 0 else ""
     if not impl_sha:
-        return ""
+        return ("", "")
     return _commit_identity(project_root, impl_sha)
 
 
@@ -208,18 +276,20 @@ def main(project_dir: str = ".") -> int:
             # PLAN.md being tracked. We cannot enforce here; defer.
             continue
         checkoff_id = _commit_identity(project_root, checkoff_sha)
-        if not checkoff_id:
+        if not _identity_known(checkoff_id):
             continue
         for tf in step.touches:
             impl_id = _last_impl_identity(project_root, checkoff_sha, tf)
-            if not impl_id:
+            if not _identity_known(impl_id):
                 # File was new in checkoff commit, or untracked before:
                 # plan-step-traceable handles that class of failure.
                 continue
-            if impl_id == checkoff_id:
+            if _identity_matches(impl_id, checkoff_id):
                 violations.append(
-                    f"  {step.id}: checkoff by {checkoff_id} matches "
-                    f"implementation author {impl_id} for {tf}"
+                    f"  {step.id}: checkoff by "
+                    f"{_identity_label(checkoff_id)} matches "
+                    f"implementation author {_identity_label(impl_id)} "
+                    f"for {tf}"
                 )
 
     if violations:

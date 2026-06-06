@@ -10,6 +10,7 @@ Coverage:
 from __future__ import annotations
 
 import os
+import signal
 import shutil
 import subprocess
 import time
@@ -572,6 +573,272 @@ def test_start_and_stop_project(tmp_path: Path, monkeypatch):
         time.sleep(0.1)
     assert not is_pid_alive(pid), \
         f"pid {pid} still alive after stop_project + reap"
+
+
+def test_stop_project_returns_promptly_when_child_dies_immediately(
+    tmp_path: Path, monkeypatch,
+):
+    """BUG-134: stop_project must not waste the full grace_s polling a
+    zombie. The peers stub here exits within ~5ms of SIGTERM (sh+sleep
+    under killpg), so a 2s grace budget must NOT translate into 2s of
+    wall-clock — we expect ≤1s, leaving the first 1s as the fix's
+    correct-behavior window and the next 1s as the bug's waste window.
+    """
+    cfg = tmp_path / "ctl"
+    s = Store(cfg)
+    target = _stub_target(tmp_path)
+    stub = _peers_stub(tmp_path, sleep_s=30)
+    monkeypatch.setenv("PEERS_CTL_PEERS_BIN", str(stub))
+    import importlib
+    import peers_ctl.runner as runner_mod
+    importlib.reload(runner_mod)
+
+    proj = Project(name="snake", path=str(target))
+    s.add(proj)
+    pid = runner_mod.start_project(s, s.get("snake"))
+    assert pid > 0
+    assert is_pid_alive(pid)
+
+    t0 = time.monotonic()
+    runner_mod.stop_project(s, s.get("snake"), grace_s=2.0)
+    elapsed = time.monotonic() - t0
+    # Without the zombie-reap fix, the loop polls is_pid_alive every
+    # 200 ms for the full 2 s grace because kill(0) keeps reporting
+    # the unreaped child as alive. With the fix, waitpid(WNOHANG)
+    # promptly reaps the dead sh inside the poll loop and we exit
+    # within one polling interval.
+    assert elapsed < 1.0, (
+        f"stop_project took {elapsed:.3f}s — zombie child wrongly "
+        "kept the grace loop alive past the early-exit window."
+    )
+
+    p_after = s.get("snake")
+    assert p_after.state == "stopped"
+    assert p_after.pid is None
+
+
+def test_stop_project_escalates_to_kill_process_group_after_leader_exits(
+    tmp_path: Path, monkeypatch,
+):
+    """BUG-135: a fast-exiting leader must not let TERM-ignoring group
+    members survive after stop_project marks the project stopped."""
+    cfg = tmp_path / "ctl"
+    s = Store(cfg)
+    target = _stub_target(tmp_path)
+    pidfile = tmp_path / "grandchild.pid"
+    child_code = (
+        "import os, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    stub = tmp_path / "peers_spawn_ignorer.py"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import signal, subprocess, sys, time\n"
+        f"child_code = {child_code!r}\n"
+        "subprocess.Popen([sys.executable, '-c', child_code])\n"
+        "def term(_sig, _frame):\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, term)\n"
+        "while True:\n"
+        "    time.sleep(1)\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("PEERS_CTL_PEERS_BIN", str(stub))
+
+    import importlib
+    import peers_ctl.runner as runner_mod
+    importlib.reload(runner_mod)
+
+    s.add(Project(name="snake", path=str(target)))
+    pid = runner_mod.start_project(s, s.get("snake"))
+    assert pid > 0
+    for _ in range(50):
+        if pidfile.exists():
+            break
+        time.sleep(0.1)
+    assert pidfile.exists(), "grandchild did not publish its pid"
+    child_pid = int(pidfile.read_text())
+
+    try:
+        assert is_pid_alive(child_pid)
+        runner_mod.stop_project(s, s.get("snake"), grace_s=0.3)
+        for _ in range(40):
+            if not is_pid_alive(child_pid):
+                break
+            time.sleep(0.05)
+        assert not is_pid_alive(child_pid), (
+            "TERM-ignoring process-group child survived stop_project"
+        )
+    finally:
+        if is_pid_alive(child_pid):
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_process_group_helpers_reject_nonpositive_pgid():
+    """BUG-136: pgid<=0 must not reach killpg/proc-scan paths.
+
+    `os.killpg(0, 0)` targets the CALLER's pgrp, which would let a
+    leaked 0 escalate to SIGKILL on peers-ctl itself. And /proc lists
+    kernel threads with pgid==0, so the scan path would falsely report
+    liveness for a pgid==0 caller. Both helpers must short-circuit
+    before issuing any syscall.
+    """
+    import peers_ctl.runner as runner_mod
+
+    # Sad path: explicit zero is the dangerous value.
+    assert runner_mod._process_group_alive(0) is False
+    assert runner_mod._process_group_has_live_members(0) is False
+    # Edge: negative pgid (defensive — should never occur).
+    assert runner_mod._process_group_alive(-1) is False
+    assert runner_mod._process_group_has_live_members(-1) is False
+    # Edge: None continues to be rejected.
+    assert runner_mod._process_group_alive(None) is False
+    assert runner_mod._process_group_has_live_members(None) is False
+    # Edge: bool is an int subclass but not a real pgid.
+    assert runner_mod._process_group_alive(True) is False
+    assert runner_mod._process_group_has_live_members(True) is False
+    # Happy path: caller's own pgid is positive and reports alive.
+    own_pgid = os.getpgid(0)
+    assert own_pgid > 0
+    assert runner_mod._process_group_alive(own_pgid) is True
+    assert runner_mod._process_group_has_live_members(own_pgid) is True
+
+
+def test_signal_uses_positive_process_group(monkeypatch):
+    import peers_ctl.runner as runner_mod
+
+    calls: list[tuple[str, int, int]] = []
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        calls.append(("killpg", pgid, sig))
+
+    def fake_kill(pid: int, sig: int) -> None:
+        calls.append(("kill", pid, sig))
+
+    monkeypatch.setattr(runner_mod.os, "killpg", fake_killpg)
+    monkeypatch.setattr(runner_mod.os, "kill", fake_kill)
+
+    runner_mod._signal(999999, 12345, signal.SIGTERM)
+
+    assert calls == [("killpg", 12345, signal.SIGTERM)]
+
+
+def test_signal_rejects_nonpositive_pgid_and_falls_back_to_pid(monkeypatch):
+    import peers_ctl.runner as runner_mod
+
+    calls: list[tuple[str, int, int]] = []
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        calls.append(("killpg", pgid, sig))
+
+    def fake_kill(pid: int, sig: int) -> None:
+        calls.append(("kill", pid, sig))
+
+    monkeypatch.setattr(runner_mod.os, "killpg", fake_killpg)
+    monkeypatch.setattr(runner_mod.os, "kill", fake_kill)
+
+    runner_mod._signal(999990, 0, signal.SIGTERM)
+    runner_mod._signal(999991, -1, signal.SIGKILL)
+    runner_mod._signal(999992, None, signal.SIGTERM)
+    runner_mod._signal(999993, True, signal.SIGKILL)
+
+    assert calls == [
+        ("kill", 999990, signal.SIGTERM),
+        ("kill", 999991, signal.SIGKILL),
+        ("kill", 999992, signal.SIGTERM),
+        ("kill", 999993, signal.SIGKILL),
+    ]
+
+
+def test_alive_via_pgid_or_pid_catches_leader_outside_captured_group(monkeypatch):
+    """Review W2: if the target re-setpgid's out of the captured pgid, the
+    /proc group scan finds no members for the stale pgid → it must NOT be
+    declared dead while the leader PID is still alive (else SIGKILL
+    escalation is skipped on a live process — a regression vs the old
+    is_pid_alive path). _alive_via_pgid_or_pid ORs in is_pid_alive(pid)."""
+    import peers_ctl.runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod, "_process_group_has_live_members", lambda p: False
+    )
+    monkeypatch.setattr(runner_mod, "is_pid_alive", lambda p: True)
+
+    assert runner_mod._alive_via_pgid_or_pid(4242, 4242) is True
+
+
+def test_alive_via_pgid_or_pid_uses_valid_pgid_discriminator(monkeypatch):
+    """BUG-138: stop_project's liveness dispatch must check
+    `_valid_pgid` so a leaked invalid pgid (0, negative, bool) falls
+    back to `is_pid_alive(pid)` instead of trusting a False from
+    `_process_group_has_live_members` (which short-circuits for any
+    invalid pgid per BUG-136). Without this, an invalid pgid would
+    prematurely conclude the process is dead and skip SIGKILL
+    escalation while the actual PID may still be alive.
+    """
+    import peers_ctl.runner as runner_mod
+
+    pid = os.getpid()
+    own_pgid = os.getpgid(0)
+    assert own_pgid > 0
+
+    # Happy: valid positive pgid → process-group probe is used.
+    pg_calls: list[int | None] = []
+    is_alive_calls: list[int] = []
+    original_pg = runner_mod._process_group_has_live_members
+    original_alive = runner_mod.is_pid_alive
+
+    def fake_pg(p):
+        pg_calls.append(p)
+        return original_pg(p)
+
+    def fake_is_alive(p):
+        is_alive_calls.append(p)
+        return original_alive(p)
+
+    monkeypatch.setattr(runner_mod, "_process_group_has_live_members", fake_pg)
+    monkeypatch.setattr(runner_mod, "is_pid_alive", fake_is_alive)
+
+    assert runner_mod._alive_via_pgid_or_pid(pid, own_pgid) is True
+    assert pg_calls == [own_pgid]
+    assert is_alive_calls == []
+
+    # Edge: None pgid → falls back to is_pid_alive(pid).
+    pg_calls.clear()
+    is_alive_calls.clear()
+    assert runner_mod._alive_via_pgid_or_pid(pid, None) is True
+    assert pg_calls == []
+    assert is_alive_calls == [pid]
+
+    # Sad: invalid pgid (0, -1, bool True) must fall back to
+    # is_pid_alive(pid) — NOT call _process_group_has_live_members
+    # (which would silently return False and falsely report dead).
+    for bad_pgid in (0, -1, True):
+        pg_calls.clear()
+        is_alive_calls.clear()
+        assert runner_mod._alive_via_pgid_or_pid(pid, bad_pgid) is True, (
+            f"dispatch with pgid={bad_pgid!r} did not fall back to "
+            "is_pid_alive — the bug allows premature dead detection."
+        )
+        assert pg_calls == [], (
+            f"dispatch with pgid={bad_pgid!r} consulted "
+            f"_process_group_has_live_members ({pg_calls!r}); "
+            "BUG-138 dispatch asymmetry not fixed."
+        )
+        assert is_alive_calls == [pid]
+
+    # Sad: clearly-dead PID + invalid pgid → still returns False
+    # (the fallback is honest, not optimistic).
+    dead_pid = 2**31 - 1
+    pg_calls.clear()
+    is_alive_calls.clear()
+    assert runner_mod._alive_via_pgid_or_pid(dead_pid, 0) is False
+    assert pg_calls == []
+    assert is_alive_calls == [dead_pid]
 
 
 def test_start_rejects_already_running(tmp_path: Path):

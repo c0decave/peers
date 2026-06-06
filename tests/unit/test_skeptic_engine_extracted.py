@@ -49,6 +49,25 @@ def test_skeptic_engine_counts_phase_b_only_when_skeptic_gates_green():
     assert state["convergence_phase"] == "complete"
 
 
+def test_skeptic_engine_handles_empty_results_dict_edge():
+    # edge: zero gates evaluated (e.g. first tick of a brand-new project
+    # before any goal has been wired) must NOT crash and must NOT credit
+    # a hard-green tick — `all(...) if results else False` is the guard.
+    state: dict = {}
+    SkepticEngine("implement").update_two_phase_counters(state, {})
+    assert state["consecutive_hard_green_ticks"] == 0
+    assert state["convergence_phase"] == "A"
+
+
+def test_resolve_convergence_state_skips_unknown_phase_label_edge():
+    # edge: a corrupt state.json may store an unknown phase label
+    # ("X", ""). The resolver must fall back to "A" rather than
+    # propagate the unknown phase or raise. (Greenfield/migration
+    # boundary — pin the recovery semantics.)
+    assert _resolve_convergence_state("implement", "X", 5, 5, 2, 0) == "A"
+    assert _resolve_convergence_state("implement", "", 0, 5, 2, 0) == "A"
+
+
 def test_skeptic_engine_resets_phase_b_when_gate_fails():
     state = {
         "convergence_phase": "B",

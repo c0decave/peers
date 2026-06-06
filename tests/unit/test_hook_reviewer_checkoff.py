@@ -152,6 +152,36 @@ def test_checkoff_by_same_peer_rejected(tmp_path):
     assert sha2 == ""  # rejected
 
 
+def test_ambient_peer_env_does_not_mask_explicit_author_identity(
+    tmp_path, monkeypatch
+):
+    _setup_repo_with_hook(tmp_path)
+    monkeypatch.setenv("PEERS_PEER_NAME", "codex")
+
+    src = tmp_path / "src" / "auth.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def auth(): pass")
+    _write_plan(tmp_path, "- [ ] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    assert _commit_as(
+        tmp_path,
+        "claude@p.local",
+        "claude",
+        ["src/auth.py", "PLAN.md"],
+        "step-1 impl",
+    )
+
+    _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    sha = _commit_as(
+        tmp_path,
+        "claude@p.local",
+        "claude",
+        ["PLAN.md"],
+        "step-1 self-review",
+    )
+
+    assert sha == ""
+
+
 def test_checkoff_no_touches_allowed_with_warning(tmp_path):
     _setup_repo_with_hook(tmp_path)
     _write_plan(tmp_path, "- [ ] [STEP-1] trivial\n")
@@ -248,6 +278,64 @@ def test_shared_identity_self_checkoff_rejected(tmp_path):
     _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
     sha = _commit_peer(tmp_path, "claude", ["PLAN.md"], "self-checkoff")
     assert sha == ""  # REJECTED despite shared git author
+
+
+def test_shared_identity_body_peer_spoof_does_not_mask_trailer(tmp_path):
+    _setup_repo_with_hook(tmp_path)
+    src = tmp_path / "src" / "auth.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def auth(): pass")
+    _write_plan(tmp_path, "- [ ] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    assert _commit_peer(
+        tmp_path,
+        "claude",
+        ["src/auth.py", "PLAN.md"],
+        "impl\n\nPeer: codex",
+    )
+
+    _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    sha = _commit_peer(tmp_path, "claude", ["PLAN.md"], "self-checkoff")
+
+    assert sha == ""
+
+
+def _attest(tmp_path: Path, sha: str, peer: str) -> None:
+    """Simulate the substrate writing its tick-HEAD-delta attribution as a
+    ``refs/notes/peers-attest`` note on ``sha``."""
+    _git(tmp_path, "notes", "--ref=peers-attest", "add", "-f", "-m", peer, sha)
+
+
+def test_bug142_substrate_note_overrides_forged_impl_trailer(tmp_path):
+    """BUG-142: claude implements but forges ``Peer: codex`` as the only trailer
+    on its own impl commit, then self-checkoffs. The substrate's note attributes
+    the impl commit to the peer that produced it (claude); the hook must honour
+    that over the forged trailer and REJECT the self-checkoff."""
+    _setup_repo_with_hook(tmp_path)
+    src = tmp_path / "src" / "auth.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def auth(): pass")
+    _write_plan(tmp_path, "- [ ] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    # claude commits but forges `Peer: codex` as the SOLE/final trailer (under
+    # PEERS_PEER_NAME=claude), attributing its own work to codex.
+    _git(tmp_path, "config", "user.email", "dash@localhost.local")
+    _git(tmp_path, "config", "user.name", "dash")
+    _git(tmp_path, "add", "src/auth.py", "PLAN.md")
+    env = {**os.environ, "PEERS_PEER_NAME": "claude"}
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-q", "-m",
+         "impl\n\nPeer: codex"],
+        capture_output=True, text=True, env=env,
+    ).returncode == 0
+    impl_sha = _git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+    # Substrate observed the impl commit during claude's tick.
+    _attest(tmp_path, impl_sha, "claude")
+
+    _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
+    sha = _commit_peer(tmp_path, "claude", ["PLAN.md"], "self-checkoff")
+    assert sha == "", (
+        "BUG-142: forged Peer trailer on impl let claude self-checkoff; the "
+        "substrate note attributing the impl to claude must override it"
+    )
 
 
 def test_shared_identity_other_checkoff_allowed(tmp_path):

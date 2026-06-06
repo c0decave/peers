@@ -355,3 +355,71 @@ def test_phase2_thorough_goals_yaml_carries_all_peers_healthy(tmp_path: Path):
     )
     ids = [g["id"] for g in goals["goals"]]
     assert "all-peers-healthy" in ids
+
+
+# --- BUG-102 / BUG-103 (v15 internal testing): the two thorough-mode state-reading
+# gates must read state.json via safe_io no-symlink (refuse a symlinked
+# state.json — CWE-59) and fail CLOSED on non-UTF-8 bytes instead of crashing
+# with an uncaught UnicodeDecodeError (CWE-755). ------------------------------
+
+_CONVERGENCE_SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "src/peers/templates/modes/thorough/checks/convergence_reached.py"
+)
+
+
+def _run_convergence(root: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(_CONVERGENCE_SCRIPT), str(root)],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_all_peers_healthy_refuses_symlinked_state(tmp_path: Path):
+    """BUG-102: a swapped .peers/state.json symlink must not redirect the
+    gate's read — refuse (fail closed) rather than follow it."""
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    real = tmp_path / "real_state.json"
+    real.write_text(json.dumps(
+        {"peers": {"claude": {"state": "healthy"}}, "exit_events": []}
+    ))
+    (pd / "state.json").symlink_to(real)
+    r = _run_gate(tmp_path)
+    assert r.returncode == 1, r.stdout
+    assert "unreadable" in r.stdout
+
+
+def test_all_peers_healthy_fails_closed_on_non_utf8_state(tmp_path: Path):
+    """BUG-103: a non-UTF-8 state.json fails the gate cleanly (return 1 +
+    diagnostic), not via an uncaught UnicodeDecodeError traceback."""
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    (pd / "state.json").write_bytes(b"\xff\xfe\x00 not utf-8 \x81\x82")
+    r = _run_gate(tmp_path)
+    assert r.returncode == 1
+    assert "unreadable" in r.stdout
+    assert "Traceback" not in r.stderr
+
+
+def test_convergence_reached_refuses_symlinked_state(tmp_path: Path):
+    """BUG-102: the convergence gate must not follow a symlinked state.json."""
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    real = tmp_path / "real_state.json"
+    real.write_text(json.dumps({"consecutive_clean_ticks": 5}))
+    (pd / "state.json").symlink_to(real)
+    r = _run_convergence(tmp_path)
+    assert r.returncode == 1, r.stdout
+    assert "unreadable" in r.stdout
+
+
+def test_convergence_reached_fails_closed_on_non_utf8_state(tmp_path: Path):
+    """BUG-103: a non-UTF-8 state.json fails the convergence gate cleanly."""
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    (pd / "state.json").write_bytes(b"\xff\xfe\x00 not utf-8 \x81\x82")
+    r = _run_convergence(tmp_path)
+    assert r.returncode == 1
+    assert "unreadable" in r.stdout
+    assert "Traceback" not in r.stderr

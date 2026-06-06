@@ -50,6 +50,34 @@ def test_write_then_verify_clean(tmp_path):
     verify_contracts(plan_dir)
 
 
+def test_write_frozen_contracts_handles_empty_plan_md_edge(tmp_path):
+    # edge: an empty PLAN.md body is a legitimate boundary — the SHA is
+    # of empty bytes, the file is still 0444, and verify_contracts must
+    # treat it as clean.
+    plan_dir = _plan_dir(tmp_path)
+    write_frozen_contracts(
+        plan_dir, acceptance="true", e2e=None, plan_md_content="",
+    )
+    plan_orig = plan_dir / "PLAN.original.md"
+    assert plan_orig.read_bytes() == b""
+    assert (plan_orig.stat().st_mode & 0o777) == 0o444
+    verify_contracts(plan_dir)
+
+
+def test_write_frozen_contracts_handles_unicode_plan_content_edge(tmp_path):
+    # edge: a PLAN.md with unicode characters must round-trip through the
+    # frozen layout and through verify_contracts unchanged (utf-8 encode
+    # vs. read bytes must agree on the sha256).
+    plan_dir = _plan_dir(tmp_path)
+    body = "# Feature\n\n## Meta\nacceptance: pytest\n\n— Übersicht 🚀\n"
+    write_frozen_contracts(
+        plan_dir, acceptance="true", e2e=None, plan_md_content=body,
+    )
+    verify_contracts(plan_dir)
+    plan_orig = plan_dir / "PLAN.original.md"
+    assert plan_orig.read_text(encoding="utf-8") == body
+
+
 def test_write_without_e2e(tmp_path):
     plan_dir = _plan_dir(tmp_path)
     _make(plan_dir, e2e=None)

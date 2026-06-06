@@ -42,13 +42,41 @@ peers:
     # read-only and silently blocks `git commit`, producing
     # `no-handoff head=no-new-commit` ticks and DEGRADED state
     # even when codex produced valid fixes.
-    argv: ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "{PROMPT}"]
+    #
+    # `--json` (Option C, v15 internal testing follow-up): codex emits its turn as a
+    # JSONL event stream. The substrate keys peer-unavailable halts off the
+    # structured `error`/`turn.failed` events (echo-immune — the agent's own
+    # text, where a `git log` echo would land, is a separate `agent_message`
+    # event, so it cannot forge a quota/auth halt), and reads token usage from
+    # the `turn.completed.usage` event. Trade-off: codex's raw output in logs
+    # is JSONL rather than free text.
+    argv: ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "{PROMPT}"]
     prompt_mode: argv-substitute
 
   # Example 3-peer setup (uncomment + adjust to enable):
   # - name: claude-2
   #   tool: claude
   #   argv: ["claude", "-p", "--dangerously-skip-permissions", "{PROMPT}"]
+  #   prompt_mode: argv-substitute
+
+  # opencode as a first-class peer (universal model gateway). `--format json`
+  # gives the substrate the same structured channel as claude/codex: token +
+  # cost accounting from `step-finish` events and echo-immune auth/quota halt
+  # detection from `error` events. `--dangerously-skip-permissions` makes it
+  # autonomous (auto-approves tool use), same role as claude's flag.
+  #
+  # `model` is opencode's `<provider>/<model>` string (do NOT set `provider:`
+  # separately). This is how you run LOCAL models: configure the provider once
+  # in opencode's own config (`opencode providers` / opencode.json — ollama,
+  # vllm, llama.cpp, lmstudio, any OpenAI-compatible endpoint), then:
+  #   model: ollama/qwen2.5          # local via ollama
+  #   model: openai-compatible/<m>   # local vllm / llama.cpp server
+  #   model: anthropic/claude-...    # cloud, via opencode
+  # reasoning: high                  # → --variant high (provider-specific)
+  # - name: opencode
+  #   tool: opencode
+  #   model: ollama/qwen2.5
+  #   argv: ["opencode", "run", "--format", "json", "--dangerously-skip-permissions", "{PROMPT}"]
   #   prompt_mode: argv-substitute
 
 budget:
@@ -94,7 +122,10 @@ health:
   # 503: service unavailable`); a YAML quoted-list echo (`    -
   # "API error 5[0-9][0-9]"`) does not.
   #
-  # (?im) = case-insensitive + multi-line (^ matches every line start).
+  # (?m) = multi-line (^ matches every line start). CASE-SENSITIVE by
+  # design (BUG-121, v15 internal testing 2026-06-04): real claude/codex halt
+  # lines emit uppercase ERROR/FATAL, while lowercase prose narrating an
+  # incident ("the error was that quota exhausted") must not halt the run.
   #
   # `[^"\n]*?` (not `.*`) sits between line-start and the ERROR/FATAL
   # keyword. This blocks two follow-up traps: (a) peer runs `grep
@@ -103,9 +134,9 @@ health:
   # bare `.*` would scan across line boundaries. Strict single-line,
   # quote-free prefix is required.
   error_patterns:
-    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\brate.?limit\\b"
-    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bAPI[ _-]?error\\b[^\"\\n]*?\\b5[0-9][0-9]\\b"
-    - "(?im)^Error:\\s*rate[_-]?limit"
+    - "(?m)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\brate.?limit\\b"
+    - "(?m)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bAPI[ _-]?error\\b[^\"\\n]*?\\b5[0-9][0-9]\\b"
+    - "(?m)^Error:\\s*rate[_-]?limit"
 
   # halt_patterns trigger an IMMEDIATE `peer-unavailable:<peer>`
   # exit_event instead of the silent degrade-after-3 path. Intended
@@ -119,11 +150,11 @@ health:
   # that yaml to stderr would otherwise false-positive. ERROR/FATAL
   # anchoring + `[^"\n]*?` line-bounded prefix closes that variant.
   halt_patterns:
-    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bauthentication[ _-]?(failed|error)\\b"
-    - "(?im)^Error:\\s*authentication[_-]?(error|failed)"
-    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\b(invalid|missing|expired)[ _-]?api[ _-]?key\\b"
-    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bquota[ _-]?exhausted\\b"
-    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\busage[ _-]?limit[ _-]?(reached|exceeded|exhausted)\\b"
+    - "(?m)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bauthentication[ _-]?(failed|error)\\b"
+    - "(?m)^Error:\\s*authentication[_-]?(error|failed)"
+    - "(?m)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\b(invalid|missing|expired)[ _-]?api[ _-]?key\\b"
+    - "(?m)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bquota[ _-]?exhausted\\b"
+    - "(?m)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\busage[ _-]?limit[ _-]?(reached|exceeded|exhausted)\\b"
     # ChatGPT/codex emit "ERROR: You've hit your usage limit. Visit
     # https://chatgpt.com/codex/settings/usage ..." — the phrase is
     # "hit your usage limit" with NO reached/exceeded/exhausted
@@ -133,7 +164,7 @@ health:
     # other peer could have finished solo (v14 internal testing finding).
     # ERROR/FATAL-anchored + line-bounded so it can't self-match the
     # substrate's own goal text.
-    - "(?im)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bhit your usage limit\\b"
+    - "(?m)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bhit your usage limit\\b"
 
 # Hard-goal commands (pytest, ruff, custom checks) run with a
 # per-command wall-clock timeout. Default 120 s suffices for small

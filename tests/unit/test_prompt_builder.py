@@ -71,3 +71,13 @@ def test_prompt_does_not_include_unused_code_analyz0r_block():
                      goals=[], results={},
                      inbox=[], stuck=False)
     assert "code-analyz0r" not in p.lower()
+
+
+def test_prompt_points_at_context_files():
+    p = build_prompt(peer="claude", other="codex", goals=[], results={},
+                     inbox=[], stuck=False)
+    assert "PROJECT CONTEXT" in p
+    assert ".peers/recon.md" in p
+    assert ".peers/codemap.md" in p
+    # LLM01 hygiene: the untrusted-data framing must not be silently dropped.
+    assert "untrusted project data" in p

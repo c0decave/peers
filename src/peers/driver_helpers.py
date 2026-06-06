@@ -239,12 +239,16 @@ def _load_phase_prompt(mode_name: str, phase: str) -> str | None:
 def _detect_mode_name(peer_dir: Path) -> str:
     """Best-effort lookup of the active mode from `.peers/modes-applied.txt`.
 
-    Returns "implement" only when implement-mode is the SOLE active mode
-    (v1 of implement-mode is documented as standalone — not composable
-    with audit/security/thorough). Returns "" on missing file, parse
-    failure, or composed mode-stacks containing implement alongside
-    others. The empty string flows through `_resolve_phase` as
-    "implementation" — i.e. Phase 0 is silently skipped in those cases.
+    Returns "implement" or "document" only when that mode is the SOLE active
+    mode (both are documented as standalone v1 modes — not composable with
+    audit/security/thorough). Returns "" on missing file, parse failure, or
+    composed mode-stacks. The empty string flows through `_resolve_phase` as
+    "implementation".
+
+    Note: only `implement` gets the Phase-0 prelude (recon→alignment→
+    architecture); `document` resolves to "implementation" on every tick like
+    any other mode, but is named here so its substrate seed step can gate on it
+    and its `prompts/implementation.md` task brief auto-loads each tick.
 
     Format (one mode per line, written by `peers init --modes`):
         2026-05-26T12:34:56+00:00  implement     v1  sha256=...
@@ -263,6 +267,8 @@ def _detect_mode_name(peer_dir: Path) -> str:
             names.append(parts[1])
     if names == ["implement"]:
         return "implement"
+    if names == ["document"]:
+        return "document"
     if "hunt-open-ended" in names:
         return "hunt-open-ended"
     return ""

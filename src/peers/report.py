@@ -41,11 +41,20 @@ def summarise_stream_json_log(text: str) -> StreamSummary:
                     summary.text_emissions += 1
         elif ev.get("type") == "result":
             cost = ev.get("total_cost_usd")
+            # bool is an int subclass — exclude it so a malformed
+            # `total_cost_usd: true` / `num_turns: false` is rejected, not
+            # silently coerced to 1.0 / False.
             summary.total_cost_usd = (
-                float(cost) if isinstance(cost, (int, float)) else None
+                float(cost)
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                else None
             )
             turns = ev.get("num_turns")
-            summary.num_turns = turns if isinstance(turns, int) else None
+            summary.num_turns = (
+                turns
+                if isinstance(turns, int) and not isinstance(turns, bool)
+                else None
+            )
             is_error = ev.get("is_error")
             summary.is_error = is_error if isinstance(is_error, bool) else None
     return summary

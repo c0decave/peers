@@ -1585,6 +1585,7 @@ def cmd_run(target: Path, max_ticks: int | None,
             max_usd: float | None = None,
             verbose: bool = False,
             without_recon: bool = False,
+            no_codemap: bool = False,
             without_post_convergence_skeptic: bool = False) -> int:
     target = Path(target)
     peer_dir = target / ".peers"
@@ -1654,6 +1655,7 @@ def cmd_run(target: Path, max_ticks: int | None,
         goals_timeout_s=int(goals_cfg.get("timeout_s", 120)),
         verbose=verbose,
         recon_enabled=not without_recon,
+        codemap_enabled=not no_codemap,
         auto_skeptic_enabled=not without_post_convergence_skeptic,
     )
     result = driver.run(max_ticks=max_ticks)
@@ -1768,6 +1770,36 @@ def cmd_run_check(
     return r.returncode
 
 
+def cmd_agents_doc(target: Path, check: bool = False) -> int:
+    """(Re)generate `<target>/AGENTS.md` from `<target>/CODEMAP.yaml` — a
+    deterministic, no-LLM render of the verified CODEMAP. With `--check`, report
+    whether AGENTS.md is in sync without writing (exit 1 if missing/drifted)."""
+    from peers.codemap import CodeMapError, parse_codemap
+    from peers.codemap_gen import (
+        AGENTS_FILE,
+        check_agents_sync,
+        render_agents_md,
+    )
+    from peers.safe_io import write_text_no_symlink
+
+    target = Path(target)
+    try:
+        cm = parse_codemap(target / "CODEMAP.yaml")
+    except CodeMapError as e:
+        print(f"agents-doc: {e}", file=sys.stderr)
+        return 1
+    if check:
+        violations = check_agents_sync(target, cm)
+        if violations:
+            print(violations[0])
+            return 1
+        print(f"agents-doc: AGENTS.md in sync ({len(cm.entries)} entries)")
+        return 0
+    write_text_no_symlink(target / AGENTS_FILE, render_agents_md(cm))
+    print(f"agents-doc: wrote {AGENTS_FILE} ({len(cm.entries)} entries)")
+    return 0
+
+
 def _print_available_checks(modes: dict, proj_checks: Path) -> None:
     """Helper: print sorted, deduped list of available check names to
     stderr. Used when resolution fails so the operator knows what's
@@ -1817,7 +1849,12 @@ def _add_help_man_subparser(sub, name: str, help_text: str | None = None,
     return p
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the top-level `peers` argument parser.
+
+    Extracted from main() so the CLI surface is importable/testable
+    without invoking dispatch.
+    """
     from peers import __version__ as _peers_version
     parser = argparse.ArgumentParser(
         prog="peers",
@@ -1928,6 +1965,13 @@ def main(argv: Sequence[str] | None = None) -> int:
              "explicitly unwanted.",
     )
     p_run.add_argument(
+        "--no-codemap", action="store_true",
+        help="skip the substrate pre-tick structural CODEMAP step that "
+             "writes .peers/CODEMAP.yaml + .peers/codemap.md (public API + "
+             "signatures, AST-only, no LLM call). On by default; it primes "
+             "peers with the codebase's shape before tick 1.",
+    )
+    p_run.add_argument(
         "--without-post-convergence-skeptic", action="store_true",
         help="skip the auto-skeptic re-audit tick that fires when "
              "convergence-reached is about to declare terminal "
@@ -1967,6 +2011,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "the current project state, without involving any peer. "
             "Writes .peers/VERIFY.md; exit 0 iff every check passed."
         ),
+    )
+
+    p_agents = _add_help_man_subparser(
+        sub, "agents-doc",
+        help_text=(
+            "(re)generate AGENTS.md from CODEMAP.yaml — a deterministic, "
+            "no-LLM render of the verified CODEMAP (module-organized "
+            "reference). `--check` reports whether AGENTS.md is in sync "
+            "without writing. Used by document mode's agents-in-sync gate."
+        ),
+    )
+    p_agents.add_argument(
+        "--check", action="store_true",
+        help="report whether AGENTS.md is in sync with CODEMAP.yaml; do not write",
     )
 
     p_tick = _add_help_man_subparser(
@@ -2027,6 +2085,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     tmux_sub.add_parser("down", help="kill the peers tmux session")
     tmux_sub.add_parser("attach", help="attach to the peers tmux session")
 
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     # Dispatch --help-man BEFORE any normal cmd handling so it works
@@ -2066,6 +2129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_run(args.target, args.max_ticks, args.dry_run,
                        args.max_usd, verbose=args.verbose,
                        without_recon=args.without_recon,
+                       no_codemap=args.no_codemap,
                        without_post_convergence_skeptic=(
                            args.without_post_convergence_skeptic
                        ))
@@ -2077,6 +2141,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_info(args.target)
     if args.cmd == "verify":
         return cmd_verify(args.target)
+    if args.cmd == "agents-doc":
+        return cmd_agents_doc(args.target, check=args.check)
     if args.cmd == "tick":
         return cmd_run(args.target, max_ticks=1, dry_run=args.dry_run)
     if args.cmd == "watch":

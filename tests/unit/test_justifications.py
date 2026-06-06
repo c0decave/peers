@@ -90,3 +90,34 @@ def test_verify_log_chain_missing_file_ok(tmp_path):
     plan_dir = tmp_path / ".peers"
     plan_dir.mkdir()
     verify_log_chain(plan_dir)  # no exception
+
+
+def test_append_justification_rejects_oversized_negative_line_edge(tmp_path):
+    # edge: the line_number=0 boundary and negative values both reject
+    # at append-time. line_number=1 is the smallest accepted value;
+    # confirm both halves of the boundary so the contract is pinned.
+    plan_dir = tmp_path / ".peers"
+    plan_dir.mkdir()
+    with pytest.raises(JustificationError, match="positive int"):
+        append_justification(plan_dir, "src/x.py", 0, "shortcut", "rev")
+    with pytest.raises(JustificationError, match="positive int"):
+        append_justification(plan_dir, "src/x.py", -5, "shortcut", "rev")
+    # Smallest accepted boundary IS line 1.
+    append_justification(plan_dir, "src/x.py", 1, "shortcut", "rev")
+    signed, _ = is_justified(plan_dir, "src/x.py", 1)
+    assert signed is True
+
+
+def test_is_justified_skips_malformed_lines_in_otherwise_valid_log_edge(tmp_path):
+    # edge: a malformed-but-non-empty line in the middle of the log
+    # must NOT abort the query — `is_justified` is a best-effort lookup
+    # and the gate caller verifies the chain separately.
+    plan_dir = tmp_path / ".peers"
+    plan_dir.mkdir()
+    append_justification(plan_dir, "src/a.py", 7, "ok", "rev")
+    log_path = plan_dir / "justifications.log"
+    # Inject one obviously-malformed line (missing reviewer/reason).
+    log_path.write_text(log_path.read_text() + "deadbeefdeadbeef bogus\n")
+    signed, signer = is_justified(plan_dir, "src/a.py", 7)
+    assert signed is True
+    assert signer == "rev"

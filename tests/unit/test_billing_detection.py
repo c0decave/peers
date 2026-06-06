@@ -205,3 +205,24 @@ def test_resolve_none_treated_as_auto(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-x")
     mode, _ = resolve_max_usd_mode(None, ["claude"], home=tmp_path)
     assert mode == "hard"
+
+
+# ---------------- opencode (Option C / first-class peer) -------------------
+
+def test_opencode_billing_is_unknown_and_resolves_to_warn(tmp_path: Path):
+    """opencode's per-call billing depends on the model (local=free, opencode
+    zen=subscription, BYOK cloud=metered) and cannot be inferred from the tool
+    name, so detection is "unknown" → resolve_max_usd_mode defaults to "warn".
+    Locks the contract: a future change must not silently hard-kill an
+    opencode run on max_usd (mirrors the OAuth/subscription policy)."""
+    assert detect_billing_mode("opencode", home=tmp_path) == "unknown"
+    mode, _reason = resolve_max_usd_mode("auto", ["opencode"], home=tmp_path)
+    assert mode == "warn"
+
+
+def test_opencode_mixed_with_api_peer_still_hard(tmp_path: Path, monkeypatch):
+    """If another peer is genuinely API-billed, the run still hard-caps —
+    opencode's "unknown" does not weaken a real per-token risk."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    mode, _ = resolve_max_usd_mode("auto", ["opencode", "claude"], home=tmp_path)
+    assert mode == "hard"

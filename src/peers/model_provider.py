@@ -271,7 +271,26 @@ def _build_codex_argv(
     return _insert_codex_config(argv, additions), {}
 
 
+def _build_opencode_argv(
+    argv: tuple[str, ...],
+    model: str | None,
+    reasoning: str | None,
+    provider: str | None,
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    # opencode encodes the provider in `model` as `<provider>/<model>` and
+    # takes the reasoning effort via `--variant`. No env/provider plumbing
+    # (opencode resolves providers from its own config). An explicit -m /
+    # --variant already in the argv wins.
+    additions: list[str] = []
+    if model and not _has_switch(argv, "-m") and not _has_switch(argv, "--model"):
+        additions += ["-m", model]
+    if reasoning and not _has_switch(argv, "--variant"):
+        additions += ["--variant", reasoning]
+    return _insert_before_prompt(argv, additions), {}
+
+
 _TOOL_TRANSLATORS: dict[str, _Translator] = {
     "claude": _build_claude_argv,
     "codex": _build_codex_argv,
+    "opencode": _build_opencode_argv,
 }

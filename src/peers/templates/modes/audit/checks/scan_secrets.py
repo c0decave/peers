@@ -12,7 +12,12 @@ from peers.safe_io import read_bytes_no_symlink
 
 PATTERNS = [
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS access key id"),
-    (re.compile(r"-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----"), "private key"),
+    # BUG-130 (+review I1): match any `BEGIN [<words> ]PRIVATE KEY[ BLOCK]`
+    # banner — plain PKCS#8 (`BEGIN PRIVATE KEY`, default `openssl genpkey`),
+    # ENCRYPTED PKCS#8, RSA/EC/DSA/OPENSSH, and PGP key blocks — not just the
+    # four prefixed variants the original pattern covered.
+    (re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
+     "private key"),
     (re.compile(r"(?i)password\s*[:=]\s*['\"][^'\"]{6,}"), "password"),
     (re.compile(r"(?i)api[_-]?key\s*[:=]\s*['\"][a-z0-9_\-]{16,}"), "API key"),
     (re.compile(r"ghp_[A-Za-z0-9]{30,}"), "GitHub PAT"),

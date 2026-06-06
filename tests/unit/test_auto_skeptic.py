@@ -212,6 +212,7 @@ def test_cli_without_post_convergence_skeptic_flag_propagates(
 
     def fake_cmd_run(target, max_ticks, dry_run=False, max_usd=None,
                      verbose=False, without_recon=False,
+                     no_codemap=False,
                      without_post_convergence_skeptic=False):
         captured["wpcs"] = without_post_convergence_skeptic
         return 0
@@ -234,6 +235,7 @@ def test_cli_default_skeptic_enabled(monkeypatch) -> None:
 
     def fake_cmd_run(target, max_ticks, dry_run=False, max_usd=None,
                      verbose=False, without_recon=False,
+                     no_codemap=False,
                      without_post_convergence_skeptic=False):
         captured["wpcs"] = without_post_convergence_skeptic
         return 0

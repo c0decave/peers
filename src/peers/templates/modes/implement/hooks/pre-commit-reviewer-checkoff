@@ -1,10 +1,18 @@
 #!/bin/sh
-# Pre-commit hook: enforce reviewer-only checkoffs for implement-mode.
+# Pre-commit hook: early warning for reviewer-only checkoffs (implement-mode).
 #
 # Rejects commits where the same peer that implemented a step's
 # `touches:` files is also marking the step `[x]` in PLAN.md.
 #
-# Schicht 2 anti-cheat: forces the OTHER peer to checkoff after review.
+# SCOPE: this hook is a cheap EARLY WARNING, not the security
+# boundary. It runs inside the agent's own `git commit`, so the *current*
+# committer identity it sees (PEERS_PEER_NAME, git author) is agent-influenced
+# and best-effort. The authoritative check is the post-hoc
+# `checkoff_by_other_peer` gate, which the orchestrator runs between ticks
+# (no live agent) and which keys identity off the substrate-written
+# `peers-attest` git note (the tick HEAD-delta attribution the agent cannot
+# forge). For the IMPLEMENTATION side this hook DOES consult that note, so a
+# forged `Peer:` trailer on an already-attested impl commit is caught here too.
 set -e
 
 # 1. Did this commit touch PLAN.md?
@@ -85,27 +93,65 @@ current_email = subprocess.run(
     ["git", "config", "user.email"],
     capture_output=True, text=True,
 ).stdout.strip()
-current_id = f"peer:{_peer_env.lower()}" if _peer_env else f"email:{current_email}"
+current_ids = set()
+if _peer_env:
+    current_ids.add(f"peer:{_peer_env.lower()}")
+if current_email:
+    current_ids.add(f"email:{current_email}")
 
-_peer_trailer_re = re.compile(r"^Peer:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
+_peer_trailer_re = re.compile(r"^Peer:[ \t]*(\S+)[ \t]*$")
+_trailer_line_re = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:[ \t]*.*$")
+
+
+def _peer_identity_from_trailers(body):
+    """Return the final trailer-block Peer identity, if present."""
+    lines = [line.rstrip("\r") for line in body.rstrip().splitlines()]
+    for line in reversed(lines):
+        if line.strip() == "":
+            break
+        m = _peer_trailer_re.match(line)
+        if m:
+            return f"peer:{m.group(1).lower()}"
+        if not _trailer_line_re.match(line):
+            break
+    return ""
+
+
+def _attested_peer(sha):
+    """Substrate-attested peer for ``sha`` from the ``peers-attest`` git note,
+    or "" when none. BUG-142: this note is the agent-unforgeable identity
+    (derived from the tick HEAD-delta by the orchestrator), so it OVERRIDES the
+    agent-authored ``Peer:`` trailer on the implementation commit."""
+    r = subprocess.run(
+        ["git", "notes", "--ref=peers-attest", "show", sha],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip()
 
 
 def _impl_identity(path):
-    """Peer identity (Peer: trailer, else email:<author>) of the last commit
-    that modified ``path``."""
+    """Peer identity of the last commit that modified ``path``.
+
+    Priority: substrate ``peers-attest`` note (authoritative) > ``Peer:``
+    trailer > email:<author>."""
     sha = subprocess.run(
         ["git", "log", "-1", "--format=%H", "--", path],
         capture_output=True, text=True,
     ).stdout.strip()
     if not sha:
         return ""
+    note = _attested_peer(sha)
+    if note:
+        return f"peer:{note.lower()}"
     body = subprocess.run(
         ["git", "log", "-1", "--format=%B", sha],
         capture_output=True, text=True,
     ).stdout
-    m = _peer_trailer_re.search(body)
-    if m:
-        return f"peer:{m.group(1).lower()}"
+    peer_id = _peer_identity_from_trailers(body)
+    if peer_id:
+        return peer_id
     ae = subprocess.run(
         ["git", "log", "-1", "--format=%ae", sha],
         capture_output=True, text=True,
@@ -139,15 +185,16 @@ for sid in sorted(checkoffs):
         if not impl_id:
             # File new in this commit or not yet tracked — can't enforce
             continue
-        if impl_id == current_id:
-            violations.append((sid, tf, impl_id, current_id))
+        if impl_id in current_ids:
+            violations.append((sid, tf, impl_id, current_ids))
 
 if violations:
     print("REJECTED: reviewer-only-checkoff violation", file=sys.stderr)
-    for sid, tf, la, ce in violations:
+    for sid, tf, la, identities in violations:
         print(f"  {sid}: file {tf} was last modified by {la}", file=sys.stderr)
         print(
-            f"         current committer is {ce} — cannot checkoff own work",
+            "         current committer matches "
+            f"{', '.join(sorted(identities))} — cannot checkoff own work",
             file=sys.stderr,
         )
     print(

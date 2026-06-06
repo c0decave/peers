@@ -272,7 +272,8 @@ def test_main_run_accepts_max_usd(tmp_path: Path, monkeypatch):
     calls: list[tuple[Path, int | None, bool, float | None]] = []
 
     def fake_cmd_run(target, max_ticks, dry_run=False, max_usd=None,
-                     verbose=False, without_recon=False, without_post_convergence_skeptic=False):
+                     verbose=False, without_recon=False, no_codemap=False,
+                     without_post_convergence_skeptic=False):
         calls.append((target, max_ticks, dry_run, max_usd))
         return 0
 

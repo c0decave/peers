@@ -190,6 +190,7 @@ _REQUIRED_DRIVER_ATTRS = (
     "_update_peer_health",
     "_dirty_worktree",
     "_detect_tampering",
+    "_attest_tick_commits",
     "_maybe_halt",
     "_append_warnings_history",
     "_append_run_log",
@@ -310,6 +311,10 @@ class TickLoop:
             "error_patterns": driver.error_patterns,
             "halt_patterns": driver.halt_patterns,
             "buf_cap_bytes": driver.buf_cap_bytes,
+            # Option C: lets health_guard classify a halt from the tool's
+            # structured status channel (claude stream-json result envelope),
+            # not just the echo-prone free-text halt_patterns.
+            "tool": spec.tool,
         }
         if extra_env:
             invoke_kwargs["extra_env"] = extra_env
@@ -380,6 +385,12 @@ class TickLoop:
         new_warnings = list(state.get("warnings", []))
         driver._append_warnings_history(state, new_warnings)
         head_after_sha = driver.comm.head_sha()
+        # attribute this tick's commits to the running peer by the
+        # observed HEAD-delta (agent-unforgeable), before any later goal check
+        # reads the attestation. No live agent runs here.
+        driver._attest_tick_commits(
+            peer, driver._head_before_invoke, head_after_sha,
+        )
         driver._append_run_log(
             state, peer, run, success,
             tokens_this_tick=tokens_this_tick,

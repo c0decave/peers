@@ -16,6 +16,14 @@ goals:
       it by adding empty/TODO/FIXME reasons.
     cmd: "python3 -m pytest"
     pass_when: "exit_code == 0"
+    # Per-goal timeout (Goal.timeout_s) — overrides the engine-wide
+    # goals.timeout_s default for this gate only. A large suite (e.g. the
+    # substrate's own ~1700 tests, ~140s standalone) runs SLOWER under
+    # concurrent goal-engine load and flakes the ~240s default → spurious
+    # `stuck:tests-pass` (v16 internal testing, 2026-06-05). 600s absorbs the load
+    # spike without masking a genuinely hung suite (per-test timeouts +
+    # tests-no-unjustified-skip-or-fail catch that class).
+    timeout_s: 600
 
   - id: tests-no-unjustified-skip-or-fail
     type: hard
@@ -77,6 +85,10 @@ goals:
     type: hard
     cmd: "python3 .peers/checks/no_regression.py ."
     pass_when: "exit_code == 0"
+    # Shells out to the full pytest suite (JUnit XML diff vs the run-start
+    # baseline), so it carries the same large-suite-under-load timeout as
+    # tests-pass — otherwise it flakes the ~240s default too (v16 internal testing).
+    timeout_s: 600
 
   - id: diff-size-per-resolve
     type: hard

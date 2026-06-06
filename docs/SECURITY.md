@@ -97,6 +97,15 @@ For paid-customer or shared-host deployments: read the **Known Gaps** section be
 - **HealthGuard** idle (30 min) + absolute (4 h) timeouts. Idle-timer measured per-output-line.
 - **In-container zombie reaper** — peers is PID 1; SIGCHLD is otherwise ignored.
 
+### Reviewer-checkoff identity (implement-mode anti-cheat)
+
+implement-mode requires the *other* peer to mark a step `[x]` after review. The peer that implemented a step must not check off its own work.
+
+- **Substrate attestation, not the `Peer:` trailer.** The `Peer: <name>` trailer is agent-authored free text written by the peer's own `git commit`; on its own it is **not** a trustworthy identity. BUG-142 reproduced a self-checkoff end-to-end by stamping the *other* peer's name as the sole trailer on one's own implementation commit, then self-approving.
+- **Fix:** the orchestrator attributes every commit in a tick's HEAD-delta `(head_before, head_after]` to the peer that actually ran (it observes the boundary in `tick_loop._finalize_tick`) and records it as a `refs/notes/peers-attest` git note. The reviewer-checkoff pre-commit hook and the post-hoc `checkoff_by_other_peer` gate key identity off that note — priority **note > trailer > author-email**, fail-closed.
+- **Why this needs no secret:** each peer is a one-shot CLI per tick (`health.invoke` runs it to process exit; the BUG-134–138 process-group teardown guarantees no child survives), so **no peer process is alive** when the orchestrator writes the note (post-tick) or when the goal engine reads it (between ticks). A note the agent forges *during* its tick is overwritten from the observed HEAD-delta. The agent controls a commit's content but not *when* it appears relative to the tick boundary.
+- **Residual (documented):** an attacker with host-level shell access *while no orchestrator is running* could tamper with historical notes — a host-compromise threat model, not the in-loop peer. Fully closing it would require moving the attestation anchor outside the container (uid separation or a host-side signer).
+
 ## Required outbound domains
 
 These are the hostnames the egress proxy must allow for the peers

@@ -55,6 +55,75 @@ def test_load_peer_specs_rejects_invalid_reasoning_for_tool() -> None:
         }))
 
 
+def test_load_peer_specs_accepts_opencode_model_and_variant() -> None:
+    """opencode is a first-class tool: `model` is opencode's `provider/model`
+    string (validated by opencode, not peers) and `reasoning` maps to
+    `--variant`. No separate `provider:` field — it lives in the model."""
+    specs = load_peer_specs(_cfg({
+        "name": "opencode",
+        "tool": "opencode",
+        "argv": ["opencode", "run", "{PROMPT}"],
+        "prompt_mode": "argv-substitute",
+        "model": "ollama/qwen2.5",
+        "reasoning": "HIGH",
+    }))
+
+    assert specs[0].tool == "opencode"
+    assert specs[0].model == "ollama/qwen2.5"
+    assert specs[0].reasoning == "high"
+    assert specs[0].provider is None
+
+
+def test_load_peer_specs_rejects_provider_field_for_opencode() -> None:
+    """opencode encodes the provider in `model` (provider/model); a separate
+    `provider:` field is rejected with a guiding message."""
+    with pytest.raises(ValueError, match="opencode"):
+        load_peer_specs(_cfg({
+            "name": "opencode",
+            "tool": "opencode",
+            "argv": ["opencode", "run", "{PROMPT}"],
+            "model": "ollama/qwen2.5",
+            "provider": "ollama",
+        }))
+
+
+def test_build_peer_argv_translates_opencode_model_and_variant() -> None:
+    spec = PeerSpec(
+        name="opencode",
+        tool="opencode",
+        argv=("opencode", "run", "--format", "json",
+              "--dangerously-skip-permissions", "{PROMPT}"),
+        prompt_mode="argv-substitute",
+        model="ollama/qwen2.5",
+        reasoning="high",
+    )
+
+    argv, env = build_peer_argv(spec)
+
+    assert env == {}
+    assert argv[-1] == "{PROMPT}"
+    # `-m <model>` and `--variant <reasoning>` injected before the prompt.
+    assert argv[argv.index("-m") + 1] == "ollama/qwen2.5"
+    assert argv[argv.index("--variant") + 1] == "high"
+
+
+def test_build_peer_argv_respects_explicit_opencode_model() -> None:
+    """An explicit -m in the argv wins; the builder does not add a second."""
+    spec = PeerSpec(
+        name="opencode",
+        tool="opencode",
+        argv=("opencode", "run", "-m", "anthropic/claude-x", "{PROMPT}"),
+        prompt_mode="argv-substitute",
+        model="ollama/qwen2.5",
+    )
+
+    argv, env = build_peer_argv(spec)
+
+    assert argv.count("-m") == 1
+    assert "anthropic/claude-x" in argv
+    assert "ollama/qwen2.5" not in argv
+
+
 def test_load_peer_specs_rejects_implausible_provider_for_tool() -> None:
     with pytest.raises(ValueError, match="provider"):
         load_peer_specs(_cfg({

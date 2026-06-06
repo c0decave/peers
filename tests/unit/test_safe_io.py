@@ -315,6 +315,47 @@ def test_write_text_in_private_nested_dir_refuses_symlinked_parent(
     assert not (outside / "peers" / "tick.log").exists()
 
 
+def test_write_text_in_private_nested_dir_refuses_late_hardlink_without_truncating(
+    tmp_path: Path, monkeypatch,
+):
+    """BUG-120 (v15 internal testing): the nested-dir writer opened the leaf with
+    O_TRUNC *before* the post-open nlink check, so a hardlink raced in
+    between the pre-stat and the open got truncated before being rejected —
+    clobbering the linked victim. The open must not truncate until after the
+    nlink/swap checks pass (the pattern open_text_no_symlink already uses)."""
+    bait = tmp_path / "bait.txt"
+    bait.write_text("keep me")
+    target = tmp_path / "log" / "peers" / "tick.log"
+
+    real_open = os.open
+    raced = {"done": False}
+
+    def racing_open(path, flags, *args, **kwargs):
+        # Slip a hardlink (bait -> the leaf) in just before the helper's
+        # real create-open, simulating a TOCTOU race the pre-stat missed.
+        if (
+            not raced["done"]
+            and str(path).endswith("tick.log")
+            and (flags & os.O_CREAT)
+        ):
+            raced["done"] = True
+            try:
+                os.link(bait, target)
+            except OSError as e:
+                pytest.skip(f"hard links unavailable: {e}")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", racing_open)
+
+    with pytest.raises(OSError, match="hard-linked"):
+        _write_text_in_private_nested_dir_no_symlink(
+            tmp_path, ("log", "peers"), "tick.log", "clobber\n",
+        )
+
+    assert raced["done"], "race hook never fired — test did not exercise the path"
+    assert bait.read_text() == "keep me"
+
+
 def test_existing_owner_only_file_stays_private(tmp_path: Path):
     # If the file is already private (0o600), the helper should not
     # widen it. We avoid 0o400 here because O_WRONLY needs write bits.

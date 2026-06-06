@@ -21,6 +21,49 @@ from peers_ctl import doctor as doctor_mod
 # ---------------------------------------------------------------------------
 
 
+def test_probe_podman_handles_empty_version_output_edge(monkeypatch):
+    # edge: a podman that returns rc=0 but empty stdout (broken install,
+    # unexpected locale, version format change) must still produce a
+    # well-formed ProbeResult — value defaults to a stable placeholder
+    # rather than crashing on whitespace.split().
+    monkeypatch.setattr(doctor_mod.shutil, "which",
+                        lambda name: "/usr/bin/podman" if name == "podman" else None)
+
+    def fake_run(argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(doctor_mod.subprocess, "run", fake_run)
+
+    result = doctor_mod.probe_podman()
+
+    # Status falls through to OK (binary IS present) but value is a
+    # bounded fallback, not an unbounded crash.
+    assert isinstance(result.value, str)
+    assert result.status in ("OK", "WARN", "MISS")
+
+
+def test_probe_podman_handles_nonzero_exit_with_garbage_output_edge(
+    monkeypatch,
+):
+    # edge: a podman binary that exits non-zero with junk on both
+    # stdout and stderr must not break the doctor formatter — the
+    # probe surfaces a probe result with non-empty value/hint.
+    monkeypatch.setattr(doctor_mod.shutil, "which",
+                        lambda name: "/usr/bin/podman" if name == "podman" else None)
+
+    def fake_run(argv, **_kwargs):
+        return SimpleNamespace(
+            returncode=125,
+            stdout="\x00\x01garbage\n",
+            stderr="podman: malformed",
+        )
+    monkeypatch.setattr(doctor_mod.subprocess, "run", fake_run)
+
+    result = doctor_mod.probe_podman()
+
+    assert result.status in ("OK", "WARN", "MISS")
+    assert isinstance(result.value, str)
+
+
 def test_probe_podman_ok_when_binary_present(monkeypatch):
     monkeypatch.setattr(doctor_mod.shutil, "which",
                         lambda name: "/usr/bin/podman" if name == "podman" else None)

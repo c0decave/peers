@@ -1,0 +1,114 @@
+# src/peers/templates/modes/document/goals.yaml
+#
+# document mode — build a verified, drift-gated CODEMAP.yaml at the repo root
+# (one entry per public symbol, each with a truthful one-line `summary`).
+#
+# Self-contained, like audit: a `--modes=document` project uses THIS as its
+# goals.yaml. The substrate seeds CODEMAP.yaml with the correct structure
+# (id/kind/file/line/signature, empty summaries) before tick 1, so the peers
+# ADD summaries rather than invent structure. The four CODEMAP gates make the
+# result provably code-anchored; `summaries-complete` is the gate that drives
+# the build (a seeded map fails it on every entry until documented). Checks run
+# through `run-check` so they resolve from the mode template whether or not they
+# were copied into the project's `.peers/checks/`.
+
+goals:
+  - id: self-review-on-handoff
+    type: hard
+    description: "Every handoff commit includes a self-review."
+    cmd: "python3 -m peers.cli run-check verify_self_review"
+    pass_when: "exit_code == 0"
+
+  - id: codemap-grounded
+    type: hard
+    description: |
+      Every CODEMAP entry resolves to a real symbol of the stated kind at
+      its file (the anti-fabrication core). A hallucinated or wrong-file
+      entry fails this gate. Editing id/kind/file/line of a seeded entry
+      trips this — only `summary` should change.
+    cmd: "python3 -m peers.cli run-check grounded"
+    pass_when: "exit_code == 0"
+
+  - id: codemap-signature-match
+    type: hard
+    description: |
+      Each documented function/method signature matches the real AST
+      signature (parameter names, in order). A renamed/extra/missing
+      parameter fails this gate. Do not edit seeded signatures.
+    cmd: "python3 -m peers.cli run-check signature_match"
+    pass_when: "exit_code == 0"
+
+  - id: codemap-complete
+    type: hard
+    description: |
+      Every public symbol under src/ appears in the CODEMAP — no
+      undocumented public surface and no dropped entries.
+    cmd: "python3 -m peers.cli run-check complete"
+    pass_when: "exit_code == 0"
+
+  - id: codemap-summaries-complete
+    type: hard
+    description: |
+      Every CODEMAP entry carries a SUBSTANTIVE `summary` — not empty,
+      whitespace, a placeholder (TODO/TBD/…), or trivially short. This is
+      the build-driving gate: the seeded structural CODEMAP has no
+      summaries, so it fails until every public symbol is documented.
+    cmd: "python3 -m peers.cli run-check summaries_complete"
+    pass_when: "exit_code == 0"
+
+  - id: agents-in-sync
+    type: hard
+    description: |
+      AGENTS.md (the agent-facing guide) is a deterministic render of the
+      verified CODEMAP and must stay byte-identical to it. Generate/refresh it
+      with `peers agents-doc` once the CODEMAP is complete; this gate fails if
+      AGENTS.md is missing or has drifted. No LLM authoring — it is derived.
+    cmd: "python3 -m peers.cli run-check agents_in_sync"
+    pass_when: "exit_code == 0"
+
+  - id: architecture-grounded
+    type: hard
+    description: |
+      ARCHITECTURE.md (the human architecture guide) is anchored to the
+      CODEMAP: every [[id]] anchor resolves to a real entry, every public
+      top-level subsystem is anchored at least once, and no seed placeholder
+      remains. Drift (a renamed/removed symbol) trips this once the CODEMAP is
+      reseeded. Accuracy of the prose itself is `architecture-cross-review`.
+    cmd: "python3 -m peers.cli run-check architecture_grounded"
+    pass_when: "exit_code == 0"
+
+  - id: summaries-cross-review
+    type: soft
+    description: |
+      Each peer reviews the OTHER peer's CODEMAP summaries for ACCURACY
+      against the real code — the whole point of document mode. A
+      plausible-but-wrong summary is worse than an empty one.
+    prompt: |
+      Open CODEMAP.yaml. For each entry the OTHER peer summarized, read the
+      real symbol at its `file:line` and verify the summary is:
+        - truthful (matches what the code actually does),
+        - specific to THIS symbol (not a tautology true of any function),
+        - not a restatement of the name/signature, and free of weasel words.
+      Reject any that fail. Reply with the soft-review JSON:
+      {"pass": bool, "notes": "<short>", "issues": ["<entry-id>: <why>", ...]}.
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 1
+
+  - id: architecture-cross-review
+    type: soft
+    description: |
+      Each peer reviews the OTHER peer's ARCHITECTURE.md prose for ACCURACY
+      against the real code — anchors resolving is not the same as the
+      narrative being true.
+    prompt: |
+      Open ARCHITECTURE.md. For each claim the OTHER peer wrote, read the real
+      code at the anchored `[[id]]` symbols and verify the prose is:
+        - truthful (matches what the code actually does / how it fits together),
+        - specific (not hand-wavy boilerplate true of any codebase), and
+        - that no subsystem is misdescribed or its role overstated.
+      Reject any that fail. Reply with the soft-review JSON:
+      {"pass": bool, "notes": "<short>", "issues": ["<section/claim>: <why>", ...]}.
+    reviewer: other
+    consensus_needed: 2
+    review_interval: 1
