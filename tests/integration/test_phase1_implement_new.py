@@ -19,10 +19,20 @@ def _peers_ctl(*args: str, env: dict[str, str] | None = None, cwd: Path | None =
     return subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(cwd) if cwd else None)
 
 
+_SRC = Path(__file__).resolve().parents[2] / "src"
+
+
 def _make_env(projects_root: Path, config_home: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["PEERS_PROJECTS_ROOT"] = str(projects_root)
     env["XDG_CONFIG_HOME"] = str(config_home)
+    # make the subprocess pick up the in-tree contracts module
+    # (chain-bound state suffix) so verify_contracts called from the test
+    # harness agrees with what the CLI wrote on disk.
+    env["PYTHONPATH"] = (
+        f"{_SRC}{os.pathsep}{env['PYTHONPATH']}"
+        if env.get("PYTHONPATH") else str(_SRC)
+    )
     return env
 
 
@@ -151,20 +161,25 @@ def test_hashchain_extends_across_multiple_amendments(tmp_path):
 
     log_text = (projects / "myfeature" / ".peers" / "contracts.log").read_text()
     lines = [line for line in log_text.splitlines() if line.strip()]
-    assert len(lines) == 3
+    # init seed + three amends.
+    assert len(lines) == 4
 
-    # Each line: <16-hex-prefix> <iso8601> amend acceptance: ... | reason: ...
+    # Each line: <16-hex-prefix> <iso8601> <event>[: <body>] | state: <hash>
     seen_prefixes = []
     for entry in lines:
         prefix, rest = entry.split(" ", 1)
         assert len(prefix) == 16
         int(prefix, 16)  # valid hex
         seen_prefixes.append(prefix)
-        assert "amend acceptance:" in rest
-        assert "reason:" in rest
+        assert "| state:" in rest
+    # Init entry is event=init, amend entries carry the amend payload.
+    assert "init |" in lines[0]
+    for amend_line in lines[1:]:
+        assert "amend acceptance:" in amend_line
+        assert "reason:" in amend_line
 
     # Prefixes are deterministic, distinct
-    assert len(set(seen_prefixes)) == 3
+    assert len(set(seen_prefixes)) == 4
 
 
 def test_tampering_after_amend_detected(tmp_path):

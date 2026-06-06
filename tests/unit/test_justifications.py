@@ -121,3 +121,78 @@ def test_is_justified_skips_malformed_lines_in_otherwise_valid_log_edge(tmp_path
     signed, signer = is_justified(plan_dir, "src/a.py", 7)
     assert signed is True
     assert signer == "rev"
+
+
+def test_is_justified_refuses_symlinked_log_BUG_197(tmp_path):
+    """BUG-197: `is_justified` must not read attacker-controlled content
+    via a symlinked ``.peers/justifications.log``.
+
+    A same-UID project peer can replace the log file with a symlink to
+    any same-user readable file (e.g. a benign-looking forged entry
+    they wrote into a world-readable tempfile) and currently
+    ``is_justified`` would read external content as gate truth.
+
+    Fail-closed behavior is acceptable as either ``(False, None)`` or
+    a :class:`JustificationError` — both refuse the forged sign-off.
+    """
+    plan_dir = tmp_path / ".peers"
+    plan_dir.mkdir()
+    # External attacker-controlled "log" that asserts src/a.py:42 is
+    # blessed by codex. If the gate follows the symlink, it accepts
+    # this forged claim.
+    forged = tmp_path / "forged.log"
+    forged.write_text(
+        "deadbeefdeadbeef src/a.py:42 codex@evil.test fake-signoff\n",
+    )
+    (plan_dir / "justifications.log").symlink_to(forged)
+
+    try:
+        signed, signer = is_justified(plan_dir, "src/a.py", 42)
+    except (JustificationError, OSError):
+        return  # raising is the strictest fail-closed behavior
+    assert signed is False, (
+        f"followed symlink and accepted forged sign-off from {signer}"
+    )
+
+
+def test_verify_log_chain_refuses_symlinked_log_BUG_197(tmp_path):
+    """BUG-197: chain verification must not be tricked by reading a
+    symlinked log. Otherwise the chain could appear "clean" because
+    the attacker authored a self-consistent external file."""
+    plan_dir = tmp_path / ".peers"
+    plan_dir.mkdir()
+    forged = tmp_path / "forged.log"
+    forged.write_text("")  # empty = trivially "valid" by current impl
+    (plan_dir / "justifications.log").symlink_to(forged)
+
+    with pytest.raises(JustificationError):
+        verify_log_chain(plan_dir)
+
+
+def test_append_justification_refuses_symlinked_log_BUG_197(tmp_path):
+    """BUG-197: append must not follow a symlinked log and write into
+    a same-user writable file outside the plan_dir."""
+    plan_dir = tmp_path / ".peers"
+    plan_dir.mkdir()
+    victim = tmp_path / "victim.log"
+    victim.write_text("untouched\n")
+    (plan_dir / "justifications.log").symlink_to(victim)
+
+    with pytest.raises((JustificationError, OSError)):
+        append_justification(plan_dir, "src/a.py", 1, "x", "rev")
+    assert victim.read_text() == "untouched\n", (
+        "append followed symlink and appended to external victim"
+    )
+
+
+def test_justifications_happy_after_BUG_197_fix(tmp_path):
+    """Sanity: with no symlink trickery, append → is_justified →
+    verify_log_chain still round-trips post-fix. Guards against an
+    over-eager hardening from breaking the no-symlink happy path."""
+    plan_dir = tmp_path / ".peers"
+    plan_dir.mkdir()
+    append_justification(plan_dir, "src/x.py", 9, "fix later", "rev")
+    signed, signer = is_justified(plan_dir, "src/x.py", 9)
+    assert signed is True
+    assert signer == "rev"
+    verify_log_chain(plan_dir)

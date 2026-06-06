@@ -54,6 +54,63 @@ def test_json_dsl_rejects_file_over_size_cap(tmp_path: Path):
         evaluate_pass_when("json('huge.json').blob == 'x'", ctx)
 
 
+def test_json_dsl_rejects_leaf_symlink(tmp_path: Path):
+    """Happy path for BUG-185 leaf protection: a symlink at the leaf is
+    refused, even when the target sits inside the same tree."""
+    inside = tmp_path / "good.json"
+    inside.write_text('{"x": 1}')
+    link = tmp_path / "linked.json"
+    link.symlink_to(inside)
+    ctx = {"exit_code": 0, "stdout": "", "stderr": "", "cwd": tmp_path}
+
+    with pytest.raises(OSError):
+        evaluate_pass_when("json('linked.json').x == 1", ctx)
+
+
+def test_json_dsl_rejects_symlinked_ancestor(tmp_path: Path):
+    """BUG-185: even when the leaf is not itself a symlink, the read must
+    refuse to follow a symlinked ANCESTOR. Build a real file inside
+    ``inner/data.json`` and rig a symlinked sibling ``via -> inner`` so
+    the resolved path is technically still inside cwd, then verify
+    ``json('via/data.json')`` is rejected — the goals DSL must not let
+    pass_when reach files via an ancestor swap that a future race could
+    reroute outside the project root."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    (inner / "data.json").write_text('{"v": 7}')
+    (tmp_path / "via").symlink_to(inner)
+    ctx = {"exit_code": 0, "stdout": "", "stderr": "", "cwd": tmp_path}
+
+    # Direct access through the real path still works.
+    assert evaluate_pass_when("json('inner/data.json').v == 7", ctx) is True
+    # Access via the symlinked ancestor is refused.
+    with pytest.raises(OSError):
+        evaluate_pass_when("json('via/data.json').v == 7", ctx)
+
+
+def test_json_dsl_rejects_parent_traversal(tmp_path: Path):
+    """BUG-185 sad path: paths containing ``..`` are refused even before
+    we touch the filesystem."""
+    ctx = {"exit_code": 0, "stdout": "", "stderr": "", "cwd": tmp_path}
+    with pytest.raises(ValueError, match="parent components"):
+        evaluate_pass_when("json('../escape.json').x == 1", ctx)
+
+
+def test_json_dsl_rejects_empty_path(tmp_path: Path):
+    """BUG-185 edge: an empty relative path is rejected up front."""
+    ctx = {"exit_code": 0, "stdout": "", "stderr": "", "cwd": tmp_path}
+    with pytest.raises(ValueError):
+        evaluate_pass_when("json('').x == 1", ctx)
+
+
+def test_json_dsl_rejects_absolute_path(tmp_path: Path):
+    """BUG-185 sad path: an absolute path was already refused; keep the
+    guard in place."""
+    ctx = {"exit_code": 0, "stdout": "", "stderr": "", "cwd": tmp_path}
+    with pytest.raises(ValueError, match="relative path"):
+        evaluate_pass_when("json('/etc/passwd').x == 1", ctx)
+
+
 def test_load_goals_parses_yaml(tmp_path: Path):
     yaml = """
 goals:

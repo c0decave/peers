@@ -21,8 +21,26 @@ import sys
 from pathlib import Path
 
 
+# Locate this worktree's src/ so `python -m peers_ctl` in the subprocess
+# picks up the in-tree code (BUG-178: contracts module gained a
+# chain-bound state suffix and seed entry — verify_contracts called from
+# the test harness must agree with what the CLI wrote on disk).
+_SRC = Path(__file__).resolve().parents[2] / "src"
+
+
 def _peers_ctl_cmd() -> list[str]:
     return [sys.executable, "-m", "peers_ctl"]
+
+
+def _subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = (
+        f"{_SRC}{os.pathsep}{env['PYTHONPATH']}"
+        if env.get("PYTHONPATH") else str(_SRC)
+    )
+    if extra:
+        env.update(extra)
+    return env
 
 
 def _make_implement_project(tmp_path: Path, name: str = "myfeature") -> Path:
@@ -40,9 +58,10 @@ def _make_implement_project(tmp_path: Path, name: str = "myfeature") -> Path:
         "  - touches: src/thing.py\n"
     )
     projects = tmp_path / "projects"
-    env = os.environ.copy()
-    env["PEERS_PROJECTS_ROOT"] = str(projects)
-    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
+    env = _subprocess_env({
+        "PEERS_PROJECTS_ROOT": str(projects),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+    })
     res = subprocess.run(
         _peers_ctl_cmd() + [
             "new", name, "--modes=implement", "--plan", str(plan),
@@ -55,13 +74,15 @@ def _make_implement_project(tmp_path: Path, name: str = "myfeature") -> Path:
 
 def test_amend_updates_acceptance_and_logs(tmp_path, monkeypatch):
     proj = _make_implement_project(tmp_path)
-    monkeypatch.setenv("PEERS_PROJECTS_ROOT", str(tmp_path / "projects"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    env = _subprocess_env({
+        "PEERS_PROJECTS_ROOT": str(tmp_path / "projects"),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+    })
     res = subprocess.run(
         _peers_ctl_cmd() + ["amend", "myfeature",
                             "--acceptance", "pytest tests/new_path",
                             "--reason", "moved test directory"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     assert res.returncode == 0, f"stderr={res.stderr}"
     # verify acceptance.sh contains the new command
@@ -74,13 +95,15 @@ def test_amend_updates_acceptance_and_logs(tmp_path, monkeypatch):
 
 
 def test_amend_unknown_project_fails(tmp_path, monkeypatch):
-    monkeypatch.setenv("PEERS_PROJECTS_ROOT", str(tmp_path / "projects"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    env = _subprocess_env({
+        "PEERS_PROJECTS_ROOT": str(tmp_path / "projects"),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+    })
     res = subprocess.run(
         _peers_ctl_cmd() + ["amend", "no-such-project",
                             "--acceptance", "x",
                             "--reason", "y"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     assert res.returncode != 0
     assert ("no such project" in res.stderr.lower()
@@ -92,13 +115,15 @@ def test_amend_non_implement_project_fails(tmp_path, monkeypatch):
     proj = tmp_path / "projects" / "auditonly"
     (proj / ".peers").mkdir(parents=True)
     # no contracts.sha here
-    monkeypatch.setenv("PEERS_PROJECTS_ROOT", str(tmp_path / "projects"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    env = _subprocess_env({
+        "PEERS_PROJECTS_ROOT": str(tmp_path / "projects"),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+    })
     res = subprocess.run(
         _peers_ctl_cmd() + ["amend", "auditonly",
                             "--acceptance", "x",
                             "--reason", "y"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     assert res.returncode != 0
     assert ("implement" in res.stderr.lower()
@@ -107,18 +132,20 @@ def test_amend_non_implement_project_fails(tmp_path, monkeypatch):
 
 def test_amend_missing_required_flags_fails(tmp_path, monkeypatch):
     _make_implement_project(tmp_path)
-    monkeypatch.setenv("PEERS_PROJECTS_ROOT", str(tmp_path / "projects"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    env = _subprocess_env({
+        "PEERS_PROJECTS_ROOT": str(tmp_path / "projects"),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+    })
     # missing --reason
     res = subprocess.run(
         _peers_ctl_cmd() + ["amend", "myfeature", "--acceptance", "x"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     assert res.returncode != 0
     # missing --acceptance
     res = subprocess.run(
         _peers_ctl_cmd() + ["amend", "myfeature", "--reason", "y"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     assert res.returncode != 0
 
@@ -126,13 +153,15 @@ def test_amend_missing_required_flags_fails(tmp_path, monkeypatch):
 def test_amend_verify_passes_after_change(tmp_path, monkeypatch):
     """Amendment leaves contracts in verifiable state."""
     proj = _make_implement_project(tmp_path)
-    monkeypatch.setenv("PEERS_PROJECTS_ROOT", str(tmp_path / "projects"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    env = _subprocess_env({
+        "PEERS_PROJECTS_ROOT": str(tmp_path / "projects"),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+    })
     res = subprocess.run(
         _peers_ctl_cmd() + ["amend", "myfeature",
                             "--acceptance", "pytest -q",
                             "--reason", "shorter output"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     assert res.returncode == 0
     # Independently verify contracts
@@ -141,29 +170,32 @@ def test_amend_verify_passes_after_change(tmp_path, monkeypatch):
 
 
 def test_amend_invalid_project_name_rejected(tmp_path, monkeypatch):
-    monkeypatch.setenv("PEERS_PROJECTS_ROOT", str(tmp_path / "projects"))
+    env = _subprocess_env({
+        "PEERS_PROJECTS_ROOT": str(tmp_path / "projects"),
+    })
     # path-traversal attempt
     res = subprocess.run(
         _peers_ctl_cmd() + ["amend", "../escape",
                             "--acceptance", "x", "--reason", "y"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     assert res.returncode != 0
     assert "invalid" in res.stderr.lower() or "name" in res.stderr.lower()
 
 
 def test_amend_hashchain_extends(tmp_path, monkeypatch):
-    """Two consecutive amendments produce a 2-entry chain with linked
-    prefixes."""
+    """Two consecutive amendments produce a chain with linked prefixes."""
     proj = _make_implement_project(tmp_path)
-    monkeypatch.setenv("PEERS_PROJECTS_ROOT", str(tmp_path / "projects"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    env = _subprocess_env({
+        "PEERS_PROJECTS_ROOT": str(tmp_path / "projects"),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+    })
 
     res = subprocess.run(
         _peers_ctl_cmd() + ["amend", "myfeature",
                             "--acceptance", "pytest a",
                             "--reason", "first"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     assert res.returncode == 0
 
@@ -171,14 +203,15 @@ def test_amend_hashchain_extends(tmp_path, monkeypatch):
         _peers_ctl_cmd() + ["amend", "myfeature",
                             "--acceptance", "pytest b",
                             "--reason", "second"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     assert res.returncode == 0
 
     log = (proj / ".peers" / "contracts.log").read_text()
     lines = [line for line in log.splitlines() if line.strip()]
-    assert len(lines) == 2
-    # both lines have a 16-char hex prefix
+    # init seed + two amends.
+    assert len(lines) == 3
+    # all lines have a 16-char hex prefix
     for line in lines:
         parts = line.split(" ", 1)
         assert len(parts[0]) == 16

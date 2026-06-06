@@ -38,6 +38,7 @@ from peers.model_provider import (
 from peers.peer_spec import load_peer_specs
 from peers.safe_io import (
     _ensure_private_dir,
+    atomic_write_text_in_dir_no_symlink,
     open_text_in_dir_no_symlink,
     read_text_no_symlink,
 )
@@ -897,12 +898,18 @@ def _parse_duration(text: str) -> int:
 
 def _read_state(project: Project) -> dict[str, Any] | None:
     """Best-effort load of `.peers/state.json`. Returns None if absent
-    or malformed — caller treats missing state as 'fresh project'."""
+    or malformed — caller treats missing state as 'fresh project'.
+
+    BUG-198: read via the no-follow helper so a same-UID project peer
+    can't symlink ``.peers/state.json`` to a forged budget file and spoof
+    ``spent_runtime_s`` / ``consecutive_failures`` past the controller's
+    pre-flight budget-exhausted check. Symmetric to BUG-196 (write side).
+    A symlinked leaf makes ``read_text_no_symlink`` raise OSError, which
+    we treat as 'no state' (fail-safe) rather than trusting the forgery.
+    """
     path = Path(project.path) / ".peers" / "state.json"
-    if not path.is_file():
-        return None
     try:
-        return json.loads(path.read_text())
+        return json.loads(read_text_no_symlink(path))
     except (OSError, ValueError):
         return None
 
@@ -910,11 +917,17 @@ def _read_state(project: Project) -> dict[str, Any] | None:
 def _write_state(project: Project, state: dict[str, Any]) -> None:
     """Atomic-replace write of `.peers/state.json`. Mirrors the
     inner peers loop's persistence pattern so an interrupted write
-    cannot leave a corrupt file."""
+    cannot leave a corrupt file.
+
+    BUG-196: routes through ``atomic_write_text_in_dir_no_symlink`` so
+    a same-UID project peer can't pre-plant ``.peers/state.json.tmp``
+    or the leaf as a symlink to a same-user writable file and redirect
+    the controller's pre-replace write.
+    """
     path = Path(project.path) / ".peers" / "state.json"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    atomic_write_text_in_dir_no_symlink(
+        path, json.dumps(state, indent=2, sort_keys=True),
+    )
 
 
 def _budget_override_path(project: Project) -> Path:
@@ -934,16 +947,18 @@ def _persist_budget_override(project: Project, **caps: int) -> None:
     path = _budget_override_path(project)
     existing: dict[str, object] = {}
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        loaded = json.loads(read_text_no_symlink(path))
         if isinstance(loaded, dict):
             existing = loaded
     except (OSError, ValueError):
         existing = {}
     existing.update(caps)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(existing, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    # avoid predictable ``.tmp`` symlink redirection by
+    # writing through the no-follow atomic helper, same as state.json.
+    atomic_write_text_in_dir_no_symlink(
+        path, json.dumps(existing, indent=2, sort_keys=True),
+    )
 
 
 def _clear_budget_override(project: Project) -> None:
@@ -1292,25 +1307,64 @@ def stop_project(store: Store, project: Project,
     if _is_container_project(project):
         cname = _container_from_project(project)
         if cname and _container_running(cname):
-            # podman stop -t <grace> sends SIGTERM then SIGKILL after.
+            # podman stop -t <grace> sends SIGTERM then SIGKILL,
+            # but if podman is missing, times out, or returns non-zero, we
+            # must fail closed instead of marking the project stopped and
+            # tearing down sidecars while the container keeps running.
             try:
-                subprocess.run(
+                stop_proc = subprocess.run(
                     [PODMAN_CMD, "stop", "-t", str(int(grace_s)), cname],
                     capture_output=True, timeout=grace_s + 30, check=False,
                 )
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
+            except FileNotFoundError as e:
+                raise RuntimeError(
+                    f"refusing to mark {project.name!r} stopped: "
+                    f"{PODMAN_CMD!r} is not available, so the container "
+                    f"{cname!r} cannot be stopped."
+                ) from e
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(
+                    f"refusing to mark {project.name!r} stopped: "
+                    f"`podman stop {cname}` timed out after "
+                    f"{grace_s + 30:.0f}s; container may still be running."
+                ) from e
+            if stop_proc.returncode != 0 or _container_running(cname):
+                err_tail = (stop_proc.stderr or b"").decode(
+                    "utf-8", errors="replace"
+                ).strip().splitlines()[-1:] or [""]
+                raise RuntimeError(
+                    f"refusing to mark {project.name!r} stopped: "
+                    f"`podman stop {cname}` returned {stop_proc.returncode}"
+                    f" and container is still running. "
+                    f"podman stderr: {err_tail[0]!r}"
+                )
         # Tear sidecars down after the main container exits. Stopping
         # them first would cut the LLM CLI's network/auth mid-tick.
         _stop_auth_proxy_best_effort(project)
         _stop_egress_proxy_best_effort(project)
         # Reap the log-streamer pid too if still alive.
+        #
+        # this branch used to signal whenever the PID was alive,
+        # unlike the host branch which gates on _pid_still_matches_startup.
+        # A recycled PID in the registry (notes still hold the original
+        # streamer starttime) would get SIGTERM'd even though it belongs to
+        # an unrelated same-user process. Apply the same starttime check
+        # here; if the starttime doesn't match, the streamer is already gone
+        # and we just drop the registry entry.
         streamer_pid = project.pid
         if streamer_pid and is_pid_alive(streamer_pid):
-            try:
-                os.kill(streamer_pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
+            if _pid_still_matches_startup(project):
+                try:
+                    os.kill(streamer_pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            else:
+                print(
+                    f"peers-ctl: refusing to signal container log-streamer "
+                    f"pid {streamer_pid} for {project.name!r} — starttime "
+                    "mismatch (PID was recycled). Skipping.",
+                    file=sys.stderr,
+                )
         store.update(project.name, state="stopped", pid=None,
                      last_stopped_at=_dt.datetime.now(
                          _dt.timezone.utc

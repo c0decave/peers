@@ -68,6 +68,9 @@ _STATE_BY_MARK: dict[str, str] = {
 }
 _SUBKEY_RE = re.compile(r"^\s+-\s*(?P<key>[a-z_][a-z0-9_]*)\s*:\s*(?P<val>.*?)\s*$")
 _META_KV_RE = re.compile(r"^(?P<key>[a-z_][a-z0-9_]*)\s*:\s*(?P<val>.*?)\s*$")
+# closed vocabulary for `surfaces:` so typos don't silently
+# bypass the e2e requirement (`web`/`gui` trigger an e2e: contract).
+_VALID_SURFACES = frozenset({"cli", "web", "lib", "gui"})
 _BULLET_RE = re.compile(r"^-\s+(?P<text>.+?)\s*$")
 _LIST_INLINE_RE = re.compile(r"^\[(?P<inner>.*)\]$")
 # Trailing `(SHA)` annotation on a step's text line. The SHA is a hex
@@ -225,6 +228,20 @@ def _parse_meta(body: list[str]) -> dict[str, object]:
             out[key] = val
     if "surfaces" not in out:
         raise PlanValidationError("Meta is missing required key `surfaces`")
+    # enforce a closed vocabulary on `surfaces` so a typo
+    # such as `[weeb]` or an empty `[]` cannot bypass the e2e contract.
+    surfaces = out["surfaces"]
+    if not isinstance(surfaces, list) or not surfaces:
+        raise PlanValidationError(
+            "Meta key `surfaces` must be a non-empty list — pick from "
+            f"{sorted(_VALID_SURFACES)}"
+        )
+    bad = [s for s in surfaces if s not in _VALID_SURFACES]
+    if bad:
+        raise PlanValidationError(
+            f"Meta key `surfaces` has unknown surface(s) {bad!r}; "
+            f"valid surfaces are {sorted(_VALID_SURFACES)}"
+        )
     if "acceptance" not in out or not str(out.get("acceptance", "")).strip():
         raise PlanValidationError("Meta is missing required key `acceptance`")
     return out

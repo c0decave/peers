@@ -2,11 +2,57 @@
 """Fail if a test that was green at audit start is now red."""
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+from peers.safe_io import (
+    atomic_write_text_in_dir_no_symlink,
+    read_text_no_symlink,
+)
+
+
+def _refuse_if_linked(path: Path) -> str | None:
+    """Return an error message if ``path`` exists as a symlink or hardlink.
+
+    Returns ``None`` when the path is missing or a plain regular file.
+    Used pre-write so --snapshot does not atomically destroy a pre-planted
+    symlink the way ``atomic_write_text_in_dir_no_symlink`` otherwise would.
+
+    BUG-177: leaf lstat alone misses a symlinked PARENT component (e.g. a
+    pre-planted ``.peers/`` directory symlink) — the leaf resolves through
+    it to a regular file at the real location. Walk the ancestor chain and
+    refuse any intermediate symlink (mirrors the no-follow ancestor guard
+    in safe_io / HybridCommLayer, BUG-175/185). Shadowed by the driver's
+    _verify_peer_dir_identity in the loop, but standalone gate-script
+    invocations are not otherwise protected.
+    """
+    for _parent in path.parents:
+        if _parent == _parent.parent:  # stop at '.' (cwd) / '/' (fs root)
+            break
+        try:
+            _pst = os.lstat(_parent)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            return f"cannot stat {_parent}: {e}"
+        if stat.S_ISLNK(_pst.st_mode):
+            return f"refusing symlinked parent: {_parent}"
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"cannot stat {path}: {e}"
+    if stat.S_ISLNK(st.st_mode):
+        return f"refusing symlinked leaf: {path}"
+    if stat.S_ISREG(st.st_mode) and st.st_nlink != 1:
+        return f"refusing hard-linked leaf: {path}"
+    return None
 
 
 BASELINE = Path(".peers/passing-baseline.txt")
@@ -89,17 +135,44 @@ def collect_passing_with_retry(attempts: int = 2) -> set[str] | None:
 def main() -> int:
     if "--snapshot" in sys.argv:
         BASELINE.parent.mkdir(parents=True, exist_ok=True)
+        # refuse a symlinked or hard-linked leaf before writing.
+        # atomic_write_text_in_dir_no_symlink alone would just replace the
+        # symlink with a regular file (safe — does not clobber the target)
+        # but a pre-planted symlink is itself a tamper signal we want
+        # surfaced to the operator, not silently overwritten.
+        err = _refuse_if_linked(BASELINE)
+        if err:
+            print(f"no_regression FAIL: {err}")
+            return 1
         passing = collect_passing()
         if passing is None:
             print("no_regression: cannot snapshot — pytest did not run cleanly")
             return 1
-        BASELINE.write_text("\n".join(sorted(passing)) + "\n")
+        try:
+            atomic_write_text_in_dir_no_symlink(
+                BASELINE, "\n".join(sorted(passing)) + "\n",
+            )
+        except OSError as e:
+            print(f"no_regression: refusing snapshot of {BASELINE}: {e}")
+            return 1
         print(f"no_regression: snapshot saved to {BASELINE} ({len(passing)} tests)")
         return 0
-    if not BASELINE.exists():
+    # use no-follow read so a symlinked baseline does not become
+    # an attacker-controlled comparison set. O_NOFOLLOW raises ELOOP on
+    # the symlink open itself, surfacing as OSError to the caller.
+    err = _refuse_if_linked(BASELINE)
+    if err:
+        print(f"no_regression FAIL: {err}")
+        return 1
+    try:
+        baseline_text = read_text_no_symlink(BASELINE)
+    except FileNotFoundError:
         print(f"no_regression: missing {BASELINE}; run once with --snapshot")
         return 1
-    expected = set(BASELINE.read_text().splitlines()) - {""}
+    except OSError as e:
+        print(f"no_regression: refusing to read {BASELINE}: {e}")
+        return 1
+    expected = set(baseline_text.splitlines()) - {""}
     if not expected:
         # Fix A (calc v2): an empty baseline (0 tests green at run start, e.g.
         # a greenfield build from zero) has nothing that CAN regress. Pass

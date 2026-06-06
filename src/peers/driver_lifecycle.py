@@ -7,7 +7,7 @@ import sys
 from typing import Any
 
 from peers.driver_helpers import _hash_goals_yaml
-from peers.safe_io import read_text_no_symlink
+from peers.safe_io import atomic_write_text_in_dir_no_symlink, read_text_no_symlink
 
 
 def _driver_module() -> Any:
@@ -64,14 +64,10 @@ class DriverLifecycleMixin:
         try:
             import datetime as _dt
             sentinel = self.peer_dir / "last-stop-reason.txt"
-            tmp = sentinel.with_suffix(sentinel.suffix + ".tmp")
             ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
-            tmp.write_text(f"{reason} {ts}\n")
-            try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                pass
-            os.replace(tmp, sentinel)
+            atomic_write_text_in_dir_no_symlink(
+                sentinel, f"{reason} {ts}\n",
+            )
         except Exception as e:
             print(
                 f"peers: warning, failed to write stop-reason sentinel: {e!r}",

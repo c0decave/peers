@@ -48,3 +48,41 @@ def test_grounded_flags_kind_mismatch(tmp_path: Path):
     cm = _cm(Entry("pkg.mod.func", "class", "src/pkg/mod.py", 1))
     v = check_grounded(repo, cm)
     assert len(v) == 1
+
+
+def test_grounded_rejects_absolute_path(tmp_path: Path):
+    """BUG-151: an absolute path like /etc/passwd must not be groundable
+    even when the file exists, because the codemap claims it is repo source."""
+    repo = _repo(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_text("def func(a, b):\n    return a\n")
+    cm = _cm(Entry("pkg.mod.func", "function", str(outside), 1, "func(a, b)"))
+    v = check_grounded(repo, cm)
+    assert len(v) == 1 and "out of project tree" in v[0]
+
+
+def test_grounded_rejects_parent_traversal(tmp_path: Path):
+    """BUG-151: `..`-escape past the project root must be rejected."""
+    repo = _repo(tmp_path)
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("def func(a, b):\n    return a\n")
+    try:
+        cm = _cm(Entry(
+            "pkg.mod.func", "function",
+            f"../{outside.name}", 1, "func(a, b)",
+        ))
+        v = check_grounded(repo, cm)
+        assert len(v) == 1 and "out of project tree" in v[0]
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+def test_grounded_flags_wrong_line(tmp_path: Path):
+    """BUG-151: the declared line must match the symbol's AST lineno; a
+    CODEMAP cannot claim `func` lives on line 99 when it actually starts
+    at line 1."""
+    repo = _repo(tmp_path)
+    cm = _cm(Entry("pkg.mod.func", "function", "src/pkg/mod.py", 99,
+                   "func(a, b)"))
+    v = check_grounded(repo, cm)
+    assert len(v) == 1 and "line 99" in v[0] and "actual 1" in v[0]

@@ -27,6 +27,7 @@ import yaml
 from peers.safe_io import read_text_no_symlink
 
 DEFAULT_N = 3
+_MAX_CONFIG_BYTES = 512 * 1024
 
 
 def main(root: str = ".") -> int:
@@ -46,7 +47,9 @@ def main(root: str = ".") -> int:
     n_needed = DEFAULT_N
     if cfg_path.is_file():
         try:
-            cfg = yaml.safe_load(cfg_path.read_text()) or {}
+            cfg = yaml.safe_load(
+                read_text_no_symlink(cfg_path, max_bytes=_MAX_CONFIG_BYTES)
+            ) or {}
         except (OSError, yaml.YAMLError) as e:
             print(f"convergence_reached FAIL: config.yaml unreadable: {e}")
             return 1

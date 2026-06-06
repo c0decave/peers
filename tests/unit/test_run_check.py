@@ -132,3 +132,58 @@ def test_run_check_ambiguous_without_prefix(tmp_path):
     assert "aaa:dup" in r.stderr
     assert "bbb:dup" in r.stderr
     assert "ambiguous" in r.stderr.lower()
+
+
+def test_run_check_rejects_traversal_in_unqualified_name(tmp_path):
+    """BUG-163: a `..`/slash in the check name must not escape the
+    checks dir even if a script happens to exist outside it."""
+    repo = _new_repo(tmp_path)
+    # Plant an "escape" script one level above proj_checks; with the
+    # buggy path-join, "../evil" resolves to .peers/evil.py.
+    peer = repo / ".peers"
+    peer.mkdir(exist_ok=True)
+    (peer / "checks").mkdir(exist_ok=True)
+    (peer / "evil.py").write_text(
+        "import sys\nprint('escape-evil')\nsys.exit(7)\n"
+    )
+    r = _run_peers(repo, "run-check", "../evil",
+                   env_extra={"PEERS_MODES_DIR": str(tmp_path / "no-user")})
+    assert r.returncode != 7, (r.stdout, r.stderr)
+    assert "escape-evil" not in r.stdout
+    assert "invalid" in r.stderr.lower() or "no such check" in r.stderr.lower()
+
+
+def test_run_check_rejects_traversal_in_mode_qualified_name(tmp_path):
+    """BUG-163: the post-colon check name must also be a plain id —
+    slashes or dots cannot reach files outside the mode's checks dir."""
+    repo = _new_repo(tmp_path)
+    peer = repo / ".peers"
+    peer.mkdir(exist_ok=True)
+    (peer / "checks").mkdir(exist_ok=True)
+    (peer / "evil2.py").write_text(
+        "import sys\nprint('escape-evil2')\nsys.exit(7)\n"
+    )
+    # audit:../evil2 → audit/checks/../evil2.py would resolve under the
+    # mode (no hit), but proj_checks/.../evil2.py is the realistic vector.
+    r = _run_peers(repo, "run-check", "audit:../evil2",
+                   env_extra={"PEERS_MODES_DIR": str(tmp_path / "no-user")})
+    assert r.returncode != 7, (r.stdout, r.stderr)
+    assert "escape-evil2" not in r.stdout
+    assert "invalid" in r.stderr.lower() or "no such check" in r.stderr.lower()
+
+
+def test_run_check_rejects_slash_in_name(tmp_path):
+    """BUG-163: a `/` in the check name must be rejected as invalid —
+    even when a matching file exists at the joined path."""
+    repo = _new_repo(tmp_path)
+    peer_checks = repo / ".peers" / "checks"
+    peer_checks.mkdir(parents=True)
+    (peer_checks / "sub").mkdir()
+    (peer_checks / "sub" / "nested.py").write_text(
+        "import sys\nprint('nested-ran')\nsys.exit(7)\n"
+    )
+    r = _run_peers(repo, "run-check", "sub/nested",
+                   env_extra={"PEERS_MODES_DIR": str(tmp_path / "no-user")})
+    assert r.returncode != 7, (r.stdout, r.stderr)
+    assert "nested-ran" not in r.stdout
+    assert "invalid" in r.stderr.lower() or "no such check" in r.stderr.lower()

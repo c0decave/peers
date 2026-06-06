@@ -107,6 +107,34 @@ def test_sentinel_overwritten_on_re_run(
     assert "max_ticks" in new_content
 
 
+def test_sentinel_refuses_symlinked_tmp(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """BUG-152: a pre-planted .peers/last-stop-reason.txt.tmp symlink to
+    an outside same-user writable file must not become the chmod/write
+    target. The atomic write helper refuses symlinked leaves, so the
+    sentinel write either lands on a regular file or is skipped — the
+    outside victim is never touched."""
+    repo = _init_repo(tmp_path / "repo")
+    peer_dir = repo / ".peers"
+    peer_dir.mkdir(mode=0o700)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched\n")
+    # Plant the tmp leaf as a symlink to the victim BEFORE the run.
+    tmp_link = peer_dir / "last-stop-reason.txt.tmp"
+    tmp_link.symlink_to(victim)
+    monkeypatch.setattr(
+        "peers.driver_orchestrator._run_recon",
+        lambda r, pd, force=False: "recon: stub",
+    )
+    drv = OrchestratorDriver(
+        repo=repo, peer_dir=peer_dir, goals=[], peer_specs=_specs(),
+    )
+    drv.run(max_ticks=0)
+    # The victim must not have been overwritten.
+    assert victim.read_text() == "untouched\n"
+
+
 def test_lock_held_does_not_clobber_sentinel(
     tmp_path: Path, monkeypatch,
 ) -> None:

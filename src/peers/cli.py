@@ -7,6 +7,7 @@ import json
 import math
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -451,15 +452,35 @@ def cmd_init(target: Path, force: bool, driver: str = "orchestrator",
         # The harness hardening below makes .peers/checks read-only (so a
         # peer cannot delete a gate script). A plain rmtree cannot remove a
         # non-writable directory, so pre-unlock the whole tree first.
+        #
+        # os.chmod follows symlinks, so a symlink leaf under .peers
+        # could redirect the chmod onto an arbitrary same-user target. Walk
+        # with followlinks=False (default) and use lstat to skip symlinks
+        # entirely — they will be unlinked by rmtree without ever being
+        # chmod'd through.
         import os as _os
-        for _root, _dirs, _files in _os.walk(peers):
+        for _root, _dirs, _files in _os.walk(peers, followlinks=False):
             try:
-                _os.chmod(_root, 0o755)
+                root_st = _os.lstat(_root)
             except OSError:
-                pass
-            for _f in _files:
+                root_st = None
+            if root_st is not None and stat.S_ISDIR(root_st.st_mode):
                 try:
-                    _os.chmod(_os.path.join(_root, _f), 0o644)
+                    _os.chmod(_root, 0o755)
+                except OSError:
+                    pass
+            for _f in _files:
+                _p = _os.path.join(_root, _f)
+                try:
+                    _st = _os.lstat(_p)
+                except OSError:
+                    continue
+                if stat.S_ISLNK(_st.st_mode):
+                    # rmtree will unlink the symlink itself; never chmod
+                    # through it.
+                    continue
+                try:
+                    _os.chmod(_p, 0o644)
                 except OSError:
                     pass
         shutil.rmtree(peers)
@@ -1697,6 +1718,13 @@ def cmd_run_check(
     proj_checks = target / ".peers" / "checks"
     modes = discover()
 
+    def _valid_id(s: str) -> bool:
+        # Plain identifier: alnum + `_` + `-`, no dots, no slashes, no
+        # leading dash. Rejects "..", "../x", "/etc/passwd", "x/y", etc.
+        if not s or s[0] == "-":
+            return False
+        return all(c.isalnum() or c in ("_", "-") for c in s)
+
     resolved: Path | None = None
     if ":" in name:
         mode_name, _, check_name = name.partition(":")
@@ -1704,6 +1732,13 @@ def cmd_run_check(
             print(
                 f"peers run-check: invalid name {name!r}; expected "
                 "`name` or `mode:name`",
+                file=sys.stderr,
+            )
+            return 1
+        if not _valid_id(mode_name) or not _valid_id(check_name):
+            print(
+                f"peers run-check: invalid name {name!r}; mode and check "
+                "must be plain identifiers (alnum, _ or -)",
                 file=sys.stderr,
             )
             return 1
@@ -1724,6 +1759,13 @@ def cmd_run_check(
             _print_available_checks(modes, proj_checks)
             return 1
     else:
+        if not _valid_id(name):
+            print(
+                f"peers run-check: invalid name {name!r}; must be a plain "
+                "identifier (alnum, _ or -)",
+                file=sys.stderr,
+            )
+            return 1
         # Unqualified: project's .peers/checks/ first.
         cand = proj_checks / f"{name}.py"
         if cand.is_file():

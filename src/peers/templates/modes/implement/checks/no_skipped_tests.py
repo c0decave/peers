@@ -13,6 +13,8 @@ Scanned in ``tests/`` ``.py`` files only:
 
 * ``@pytest.mark.skip`` (with or without ``()`` / arguments)
 * ``@pytest.mark.skipif`` (same)
+* ``@pytest.mark.xfail`` (same)
+* module-level ``pytestmark = pytest.mark.skip/xfail/...``
 * ``@unittest.skip`` / ``@unittest.skipIf`` / ``@unittest.skipUnless``
 * ``pytest.skip(...)`` call inside a function body
 * ``xit`` / ``xdescribe`` (textual, for JS-style port compat)
@@ -50,7 +52,11 @@ import ast
 import sys
 from pathlib import Path
 
-from peers_ctl.justifications import is_justified
+from peers_ctl.justifications import (
+    JustificationError,
+    is_justified,
+    verify_log_chain,
+)
 
 
 _SKIP_REASON_TAG = "# SKIP-REASON:"
@@ -82,6 +88,7 @@ def _decorator_path(dec: ast.expr) -> str:
 _SKIP_DECORATOR_PATHS = frozenset({
     "pytest.mark.skip",
     "pytest.mark.skipif",
+    "pytest.mark.xfail",
     "unittest.skip",
     "unittest.skipIf",
     "unittest.skipUnless",
@@ -116,6 +123,44 @@ def _line_has_skip_reason(text_lines: list[str], lineno: int) -> bool:
     return _SKIP_REASON_TAG in text_lines[prev_idx]
 
 
+def _record_skip_violation(
+    violations: list[str], text_lines: list[str],
+    seen_lines: set[tuple[int, str]],
+    plan_dir: Path, relpath: str, lineno: int, kind: str, target: str,
+) -> None:
+    key = (lineno, kind)
+    if key in seen_lines:
+        return
+    seen_lines.add(key)
+    if _line_has_skip_reason(text_lines, lineno):
+        signed, _signer = is_justified(plan_dir, relpath, lineno)
+        if signed:
+            return
+        violations.append(
+            f"{relpath}:{lineno}: SKIP-REASON-but-unsigned: {kind}"
+        )
+        return
+    violations.append(f"{relpath}:{lineno}: {kind}: target={target}")
+
+
+def _scan_pytestmark_value(
+    value: ast.expr, violations: list[str], text_lines: list[str],
+    seen_lines: set[tuple[int, str]], plan_dir: Path, relpath: str,
+) -> None:
+    is_skip, kind = _decorator_is_skip(value)
+    if is_skip:
+        _record_skip_violation(
+            violations, text_lines, seen_lines, plan_dir, relpath,
+            value.lineno, kind, "<module-level pytestmark>",
+        )
+        return
+    if isinstance(value, (ast.List, ast.Tuple)):
+        for item in value.elts:
+            _scan_pytestmark_value(
+                item, violations, text_lines, seen_lines, plan_dir, relpath,
+            )
+
+
 def _scan_python_file(
     path: Path, relpath: str, plan_dir: Path
 ) -> list[str]:
@@ -144,46 +189,26 @@ def _scan_python_file(
                     is_skip, kind = _decorator_is_skip(dec)
                     if not is_skip:
                         continue
-                    lineno = dec.lineno
-                    key = (lineno, kind)
-                    if key in seen_lines:
-                        continue
-                    seen_lines.add(key)
-                    if _line_has_skip_reason(text_lines, lineno):
-                        signed, _signer = is_justified(
-                            plan_dir, relpath, lineno
-                        )
-                        if signed:
-                            continue
-                        violations.append(
-                            f"{relpath}:{lineno}: "
-                            f"SKIP-REASON-but-unsigned: {kind}"
-                        )
-                        continue
-                    violations.append(
-                        f"{relpath}:{lineno}: {kind}: "
-                        f"target={node.name}"
+                    _record_skip_violation(
+                        violations, text_lines, seen_lines, plan_dir,
+                        relpath, dec.lineno, kind, node.name,
                     )
             if isinstance(node, ast.Call) and _is_pytest_skip_call(node):
-                lineno = node.lineno
-                key = (lineno, "pytest.skip")
-                if key in seen_lines:
-                    continue
-                seen_lines.add(key)
-                if _line_has_skip_reason(text_lines, lineno):
-                    signed, _signer = is_justified(
-                        plan_dir, relpath, lineno
-                    )
-                    if signed:
-                        continue
-                    violations.append(
-                        f"{relpath}:{lineno}: "
-                        f"SKIP-REASON-but-unsigned: pytest.skip"
-                    )
-                    continue
-                violations.append(
-                    f"{relpath}:{lineno}: pytest.skip: runtime-skip"
+                _record_skip_violation(
+                    violations, text_lines, seen_lines, plan_dir, relpath,
+                    node.lineno, "pytest.skip", "runtime-skip",
                 )
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+                if any(isinstance(t, ast.Name) and t.id == "pytestmark"
+                       for t in targets):
+                    _scan_pytestmark_value(
+                        node.value, violations, text_lines, seen_lines,
+                        plan_dir, relpath,
+                    )
 
     # ---- Textual scan: xit / xdescribe (JS-style port markers). ----
     for idx, line in enumerate(text_lines):
@@ -226,6 +251,14 @@ def main(project_dir: str = ".") -> int:
     if not tests_root.is_dir():
         print("no-skipped-tests: clean (no tests/ to scan)")
         return 0
+
+    # verify chain before consulting the log. is_justified() is
+    # a pure lookup and accepts forged entries with a bogus chain prefix.
+    try:
+        verify_log_chain(plan_dir)
+    except JustificationError as e:
+        print(f"no-skipped-tests FAIL: justifications log chain broken: {e}")
+        return 1
 
     all_violations: list[str] = []
     files = _iter_test_files(tests_root)

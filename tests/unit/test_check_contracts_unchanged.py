@@ -1,28 +1,28 @@
 """Test contracts-unchanged check (Task 2.7)."""
 from __future__ import annotations
-import json
-from hashlib import sha256
 from pathlib import Path
 
 from peers.templates.modes.implement.checks import contracts_unchanged
+from peers_ctl.contracts import write_frozen_contracts
 
 
 def _make_setup(tmp_path: Path) -> Path:
-    """Create minimal valid frozen-contracts project layout."""
+    """Create minimal valid frozen-contracts project layout.
+
+    Uses write_frozen_contracts() so the layout (including the BUG-178
+    audit-log seed entry) stays in sync with the writer code path.
+    """
     plan_dir = tmp_path / ".peers"
-    contracts = plan_dir / "contracts"
-    contracts.mkdir(parents=True)
-    acc = contracts / "acceptance.sh"
-    acc.write_text("#!/bin/sh\nexit 0\n")
-    acc.chmod(0o444)
-    plan_orig = plan_dir / "PLAN.original.md"
-    plan_orig.write_text("# F\n## Meta\nsurfaces: [cli]\nacceptance: x\n## Steps\n- [ ] [STEP-1] x\n")
-    plan_orig.chmod(0o444)
-    sha_map = {
-        "acceptance.sh": sha256(acc.read_bytes()).hexdigest(),
-        "PLAN.original.md": sha256(plan_orig.read_bytes()).hexdigest(),
-    }
-    (plan_dir / "contracts.sha").write_text(json.dumps(sha_map, indent=2))
+    plan_dir.mkdir(parents=True)
+    write_frozen_contracts(
+        plan_dir,
+        acceptance="exit 0",
+        e2e=None,
+        plan_md_content=(
+            "# F\n## Meta\nsurfaces: [cli]\nacceptance: x\n"
+            "## Steps\n- [ ] [STEP-1] x\n"
+        ),
+    )
     return tmp_path
 
 

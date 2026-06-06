@@ -239,13 +239,22 @@ def test_amend_logs_to_contracts_log(tmp_path):
 def test_amend_hashchain_genesis(tmp_path):
     plan_dir = _plan_dir(tmp_path)
     _make(plan_dir)
+    # write_frozen_contracts seeds the log with an init entry
+    # using "genesis" as the previous chain value; the first amend then
+    # chains from that init entry's prefix, not from "genesis".
     amend_acceptance(plan_dir, "pytest -q", reason="quiet")
-    line = (plan_dir / "contracts.log").read_text(encoding="utf-8").rstrip("\n")
-    chain_prefix, _, rest = line.partition(" ")
-    # rest is: "<iso> amend acceptance: <cmd> | reason: <reason>"
-    entry_text = rest + "\n"
-    expected = hashlib.sha256(("genesis" + entry_text).encode("utf-8")).hexdigest()[:16]
-    assert chain_prefix == expected
+    lines = (plan_dir / "contracts.log").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2, lines
+    init_prefix, _, init_rest = lines[0].partition(" ")
+    expected_init = hashlib.sha256(
+        ("genesis" + init_rest + "\n").encode("utf-8"),
+    ).hexdigest()[:16]
+    assert init_prefix == expected_init
+    amend_prefix, _, amend_rest = lines[1].partition(" ")
+    expected_amend = hashlib.sha256(
+        (init_prefix + amend_rest + "\n").encode("utf-8"),
+    ).hexdigest()[:16]
+    assert amend_prefix == expected_amend
 
 
 def test_amend_hashchain_continues(tmp_path):
@@ -254,13 +263,14 @@ def test_amend_hashchain_continues(tmp_path):
     amend_acceptance(plan_dir, "pytest -q", reason="quiet")
     amend_acceptance(plan_dir, "pytest -v", reason="verbose")
     lines = (plan_dir / "contracts.log").read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 2
-    prev_prefix = lines[0].split(" ", 1)[0]
-    second_prefix, _, second_rest = lines[1].partition(" ")
+    # init + two amends.
+    assert len(lines) == 3, lines
+    prev_prefix = lines[1].split(" ", 1)[0]
+    third_prefix, _, third_rest = lines[2].partition(" ")
     expected = hashlib.sha256(
-        (prev_prefix + second_rest + "\n").encode("utf-8"),
+        (prev_prefix + third_rest + "\n").encode("utf-8"),
     ).hexdigest()[:16]
-    assert second_prefix == expected
+    assert third_prefix == expected
 
 
 def test_amend_preserves_read_only(tmp_path):
@@ -319,3 +329,285 @@ def test_amend_acceptance_atomic_on_corrupt_sha_BUG_201(tmp_path: Path):
         "_load_pins() detected the corrupt contracts.sha, wedging the "
         "contract layout permanently"
     )
+
+
+# --- BUG-157: contract writes must refuse symlinked leaves ---------------
+
+def test_amend_acceptance_refuses_symlinked_acceptance_sh(tmp_path):
+    """BUG-157: if a peer pre-replaces acceptance.sh with a symlink to an
+    outside same-user writable file, amend_acceptance must refuse to write
+    through the symlink. The victim's content must be unchanged."""
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+
+    acc_path = plan_dir / "contracts" / "acceptance.sh"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched\n", encoding="utf-8")
+
+    # Replace acceptance.sh with a symlink to the victim.
+    _chmod_writable(acc_path)
+    acc_path.unlink()
+    acc_path.symlink_to(victim)
+
+    with pytest.raises(OSError, match="symlink"):
+        amend_acceptance(plan_dir, "pytest -x", reason="symlink-attack")
+
+    # Victim must not have been overwritten by the amend payload.
+    assert victim.read_text() == "untouched\n"
+
+
+def test_write_frozen_contracts_refuses_symlinked_plan_original(tmp_path):
+    """BUG-157 happy-path: write_frozen_contracts must also refuse to
+    follow a pre-planted symlink on its initial write."""
+    plan_dir = _plan_dir(tmp_path)
+    victim = tmp_path / "victim.md"
+    victim.write_text("KEEP ME\n", encoding="utf-8")
+    (plan_dir / "PLAN.original.md").symlink_to(victim)
+
+    with pytest.raises(OSError, match="symlink"):
+        write_frozen_contracts(
+            plan_dir,
+            acceptance="pytest", e2e=None,
+            plan_md_content="# new plan\n",
+        )
+    assert victim.read_text() == "KEEP ME\n"
+
+
+def test_amend_acceptance_refuses_chmod_through_symlink(tmp_path):
+    """BUG-157 edge: even before the write, the pre-chmod step must not
+    follow a symlink — the hardened impl rejects with OSError on lstat
+    before touching the victim's mode."""
+    import os as _os
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+
+    acc_path = plan_dir / "contracts" / "acceptance.sh"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("x\n", encoding="utf-8")
+    _os.chmod(victim, 0o600)
+
+    _chmod_writable(acc_path)
+    acc_path.unlink()
+    acc_path.symlink_to(victim)
+
+    original_mode = _os.stat(victim).st_mode & 0o777
+
+    with pytest.raises(OSError, match="symlink"):
+        amend_acceptance(plan_dir, "pytest -x", reason="symlink-chmod-attack")
+
+    assert _os.stat(victim).st_mode & 0o777 == original_mode
+
+
+# --- BUG-164: contracts.sha / contracts.log / pin writes harden -------------
+
+def test_amend_refuses_symlinked_contracts_sha_BUG_188(tmp_path):
+    """BUG-188: _load_pins must reject a symlinked contracts.sha BEFORE
+    amend_acceptance mutates acceptance.sh. Previously read_text followed
+    the link, _load_pins succeeded, _write_read_only rewrote acceptance.sh,
+    and only then _save_pins (via write_text_no_symlink) raised OSError —
+    leaving the frozen layout half-mutated: contracts.sha unchanged but
+    pointing at the OLD sha, while acceptance.sh has the NEW body.
+    Recovery required manual rollback. The fix rejects up front via
+    lstat in _load_pins, propagating an OSError so the operator sees the
+    specific safe-IO refusal.
+    """
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+    acc_path = plan_dir / "contracts" / "acceptance.sh"
+    original_body = acc_path.read_bytes()
+
+    # contracts.sha is a symlink to a valid JSON file. The link target's
+    # body would have made _load_pins succeed before the BUG-188 fix.
+    sha_path = plan_dir / "contracts.sha"
+    backup = tmp_path / "backup-sha.json"
+    backup.write_text(sha_path.read_text(), encoding="utf-8")
+    _chmod_writable(sha_path)
+    sha_path.unlink()
+    sha_path.symlink_to(backup)
+
+    with pytest.raises(OSError, match="symlink"):
+        amend_acceptance(plan_dir, "pytest -x", reason="symlinked-sha")
+
+    assert acc_path.read_bytes() == original_body, (
+        "BUG-188: amend_acceptance must not rewrite acceptance.sh "
+        "when contracts.sha is a symlink — partial mutation wedges "
+        "the frozen layout"
+    )
+
+
+def test_amend_refuses_hardlinked_contracts_sha_BUG_188(tmp_path):
+    """BUG-188 edge: contracts.sha as a hardlink to another file gets
+    the same fail-fast guard so amend_acceptance does not mutate the
+    pin and leave the frozen layout drifting from the log state."""
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+    acc_path = plan_dir / "contracts" / "acceptance.sh"
+    original_body = acc_path.read_bytes()
+
+    sha_path = plan_dir / "contracts.sha"
+    twin = tmp_path / "twin-sha.json"
+    twin.write_text(sha_path.read_text(), encoding="utf-8")
+    _chmod_writable(sha_path)
+    sha_path.unlink()
+    import os as _os
+    _os.link(twin, sha_path)
+
+    with pytest.raises(OSError, match="hard-linked"):
+        amend_acceptance(plan_dir, "pytest -x", reason="hardlinked-sha")
+    assert acc_path.read_bytes() == original_body
+    # Twin must not have been written through.
+    assert twin.read_text() == sha_path.read_text()
+
+
+def test_amend_refuses_hardlinked_acceptance_BUG_164(tmp_path):
+    """BUG-164: _write_read_only opens with O_TRUNC before checking
+    st_nlink, so a hardlinked contract leaf gets truncated even
+    though we then bail. The fix must check nlink BEFORE any
+    destructive open."""
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+    acc_path = plan_dir / "contracts" / "acceptance.sh"
+    victim = tmp_path / "victim_hardlinked.txt"
+    victim.write_text("PROTECT ME\n", encoding="utf-8")
+
+    _chmod_writable(acc_path)
+    acc_path.unlink()
+    import os as _os
+    _os.link(victim, acc_path)
+    assert acc_path.stat().st_nlink == 2
+
+    with pytest.raises(OSError):
+        amend_acceptance(plan_dir, "pytest -x", reason="hardlink-attack")
+    # Victim must not have been clobbered to empty / contents preserved.
+    assert victim.read_text() == "PROTECT ME\n"
+
+
+def test_amend_refuses_symlinked_contracts_sha_BUG_164(tmp_path):
+    """BUG-164: contracts.sha is written via Path.write_text() which
+    follows symlinks. A pre-planted symlink must be refused."""
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+    sha_path = plan_dir / "contracts.sha"
+    victim = tmp_path / "victim_sha.json"
+    victim.write_text("{}\n", encoding="utf-8")
+
+    sha_path.unlink()
+    sha_path.symlink_to(victim)
+    with pytest.raises(OSError):
+        amend_acceptance(plan_dir, "pytest -x", reason="sha-symlink-attack")
+    assert victim.read_text() == "{}\n"
+
+
+def test_amend_refuses_symlinked_contracts_log_BUG_164(tmp_path):
+    """BUG-164: contracts.log read+append goes through Path.open
+    which follows symlinks. A symlink there can redirect or poison
+    the audit chain."""
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+    log_path = plan_dir / "contracts.log"
+    victim = tmp_path / "victim_log.txt"
+    victim.write_text("attacker prev\n", encoding="utf-8")
+
+    # write_frozen_contracts now seeds contracts.log; remove
+    # the seed entry so the attack scenario (pre-planted symlink) holds.
+    log_path.unlink()
+    log_path.symlink_to(victim)
+    with pytest.raises(OSError):
+        amend_acceptance(plan_dir, "pytest -x", reason="log-symlink-attack")
+    # Victim untouched.
+    assert victim.read_text() == "attacker prev\n"
+
+
+# --- BUG-178: contracts.sha must be chain-bound to the audit log ------------
+
+def test_verify_contracts_detects_silent_pin_rewrite_BUG_178(tmp_path):
+    """BUG-178: a peer with write access to .peers/ can rewrite
+    acceptance.sh and update contracts.sha to match in one shot.
+    Without binding the pins to the hash-chained audit log,
+    verify_contracts() treats this as clean — no amend was ever recorded.
+
+    After the fix, write_frozen_contracts() seeds an initial chain entry
+    that pins the genesis state and verify_contracts() cross-checks the
+    current pins against the latest chain entry. A silent rewrite that
+    does not extend the chain must now be rejected.
+    """
+    import json
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+    # The fix requires contracts.log to be seeded at init.
+    log_path = plan_dir / "contracts.log"
+    assert log_path.is_file(), (
+        "BUG-178 prerequisite: write_frozen_contracts must seed contracts.log "
+        "with an init entry recording the genesis pin state"
+    )
+    # Attacker rewrites acceptance.sh and updates contracts.sha to match.
+    acc_path = plan_dir / "contracts" / "acceptance.sh"
+    _chmod_writable(acc_path)
+    new_body = "#!/bin/sh\nset -e\necho FAKE PASS\n"
+    acc_path.write_text(new_body, encoding="utf-8")
+
+    sha_path = plan_dir / "contracts.sha"
+    _chmod_writable(sha_path)
+    pins = json.loads(sha_path.read_text(encoding="utf-8"))
+    pins["acceptance.sh"] = hashlib.sha256(
+        new_body.encode("utf-8"),
+    ).hexdigest()
+    sha_path.write_text(
+        json.dumps(pins, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    # Silent pin-rewrite (no amend log entry) must be caught.
+    with pytest.raises(ContractsMismatch):
+        verify_contracts(plan_dir)
+
+
+def test_verify_contracts_detects_missing_contracts_log_BUG_178(tmp_path):
+    """BUG-178: after the fix the audit log is part of the root of trust.
+    Deleting contracts.log removes the chain anchor and must fail
+    verification (so an attacker can't bypass chain-binding by simply
+    removing the log)."""
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+    log_path = plan_dir / "contracts.log"
+    # On the buggy code the init entry is never written, so the unlink
+    # itself fails — the test still fails (TDD expectation).
+    log_path.unlink()
+    with pytest.raises(ContractsMismatch):
+        verify_contracts(plan_dir)
+
+
+def test_verify_contracts_detects_chain_break_BUG_178(tmp_path):
+    """BUG-178: a tampered chain prefix on the latest log entry must be
+    rejected. This is the post-fix counterpart to silent-pin-rewrite:
+    even if the attacker also touches the log, a broken chain reveals
+    the tamper."""
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+    log_path = plan_dir / "contracts.log"
+    if not log_path.is_file():
+        pytest.fail(
+            "BUG-178: write_frozen_contracts did not seed contracts.log "
+            "with the genesis chain entry",
+        )
+    _chmod_writable(log_path)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    # Corrupt the chain prefix of the first (only) entry.
+    prefix, _, rest = lines[0].partition(" ")
+    lines[0] = ("0" * len(prefix)) + " " + rest
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(ContractsMismatch):
+        verify_contracts(plan_dir)
+
+
+def test_amend_acceptance_records_pin_state_in_chain_BUG_178(tmp_path):
+    """BUG-178: each amend entry must carry the post-amend pin-state so
+    verify_contracts can confirm the chain encodes the current pins."""
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+    amend_acceptance(plan_dir, "pytest -q", reason="quiet")
+    # Verify is clean immediately after a legitimate amend.
+    verify_contracts(plan_dir)
+    # And after a second amend.
+    amend_acceptance(plan_dir, "pytest -v", reason="verbose")
+    verify_contracts(plan_dir)

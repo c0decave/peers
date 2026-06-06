@@ -569,12 +569,13 @@ def test_gate_tdd_passes_when_reproduce_precedes_fix(tmp_path: Path):
     from peers.bug_hunt import gate_tdd_pass
     repo = _init_repo(tmp_path / "r")
     _file_blocking_bug(repo, "BUG-300", sev="high")
-    _commit(repo, textwrap.dedent("""\
+    # reproduce commit must touch a test path to count.
+    _commit_touching(repo, textwrap.dedent("""\
         test: reproduce BUG-300
 
         Peer: claude
         Bug-Reproduce: BUG-300
-    """))
+    """), "tests/test_bug_300.py", "def test_x(): assert False\n")
     _commit(repo, textwrap.dedent("""\
         fix BUG-300
 
@@ -607,6 +608,106 @@ def test_gate_tdd_fails_when_fix_has_no_reproduce(tmp_path: Path):
     assert "BUG-301" in diag and "no Bug-Reproduce" in diag
 
 
+def test_gate_tdd_accepts_explicit_historical_waiver_BUG_182(tmp_path: Path):
+    """BUG-182: existing ledgers need an auditable non-rewrite escape
+    for historical fixes that cannot gain older reproducer commits."""
+    from peers.bug_hunt import gate_tdd_pass
+
+    repo = _init_repo(tmp_path / "r")
+    _file_blocking_bug(repo, "BUG-800", sev="med")
+    _commit(repo, textwrap.dedent("""\
+        fix BUG-800 before the waiver was recorded
+
+        ## Bug-Resolution
+        {"id":"BUG-800","status":"fixed"}
+
+        Peer: claude
+        Bug-Resolves: BUG-800
+    """))
+    _commit(repo, textwrap.dedent("""\
+        waive historical TDD evidence for BUG-800
+
+        ## Bug-Reproduce-Waiver
+        {
+          "id": "BUG-800",
+          "reason": "Historical audit-batch fix landed before the waiver mechanism existed; rewriting committed history to move a reproducer ahead of it would be destructive."
+        }
+
+        Peer: claude
+        Bug-Reproduce-Waive: BUG-800
+    """))
+
+    ok, diag = gate_tdd_pass(repo)
+    assert ok, diag
+    assert "waived historical fix(es): BUG-800" in diag
+
+
+def test_gate_tdd_rejects_waiver_without_substantive_reason_BUG_182(
+    tmp_path: Path,
+):
+    """BUG-182 sad path: a waiver is not a bare trailer loophole."""
+    from peers.bug_hunt import gate_tdd_pass
+
+    repo = _init_repo(tmp_path / "r")
+    _file_blocking_bug(repo, "BUG-802", sev="med")
+    _commit(repo, textwrap.dedent("""\
+        fix BUG-802 without reproducer
+
+        ## Bug-Resolution
+        {"id":"BUG-802","status":"fixed"}
+
+        Peer: claude
+        Bug-Resolves: BUG-802
+    """))
+    _commit(repo, textwrap.dedent("""\
+        bad waiver for BUG-802
+
+        ## Bug-Reproduce-Waiver
+        {"id":"BUG-802","reason":"old"}
+
+        Peer: claude
+        Bug-Reproduce-Waive: BUG-802
+    """))
+
+    ok, diag = gate_tdd_pass(repo)
+    assert ok is False
+    assert "BUG-802" in diag and "no Bug-Reproduce" in diag
+
+
+def test_gate_tdd_rejects_prefixed_waiver_before_fix_BUG_182(tmp_path: Path):
+    """BUG-182 edge path: a waiver can document historical debt after
+    a fix, but cannot pre-authorize skipping TDD for a future fix."""
+    from peers.bug_hunt import gate_tdd_pass
+
+    repo = _init_repo(tmp_path / "r")
+    _file_blocking_bug(repo, "BUG-803", sev="med")
+    _commit(repo, textwrap.dedent("""\
+        premature waiver for BUG-803
+
+        ## Bug-Reproduce-Waiver
+        {
+          "id": "BUG-803",
+          "reason": "This long reason is intentionally not accepted because it was committed before the fix."
+        }
+
+        Peer: claude
+        Bug-Reproduce-Waive: BUG-803
+    """))
+    _commit(repo, textwrap.dedent("""\
+        fix BUG-803 after waiver
+
+        ## Bug-Resolution
+        {"id":"BUG-803","status":"fixed"}
+
+        Peer: claude
+        Bug-Resolves: BUG-803
+    """))
+
+    ok, diag = gate_tdd_pass(repo)
+    assert ok is False
+    assert "BUG-803" in diag and "no Bug-Reproduce" in diag
+
+
 def test_gate_tdd_fails_when_reproduce_lands_after_fix(tmp_path: Path):
     """Test-with-fix (not test-before-fix) is rejected."""
     from peers.bug_hunt import gate_tdd_pass
@@ -621,13 +722,14 @@ def test_gate_tdd_fails_when_reproduce_lands_after_fix(tmp_path: Path):
         Peer: claude
         Bug-Resolves: BUG-302
     """))
-    # Reproduce commit AFTER the fix — wrong order.
-    _commit(repo, textwrap.dedent("""\
+    # Reproduce commit AFTER the fix — wrong order. Must still
+    # touch a test path so BUG-161 isn't the reason it fails.
+    _commit_touching(repo, textwrap.dedent("""\
         test: reproduce BUG-302
 
         Peer: claude
         Bug-Reproduce: BUG-302
-    """))
+    """), "tests/test_bug_302.py", "def test_x(): assert False\n")
     ok, diag = gate_tdd_pass(repo)
     assert ok is False
     assert "TDD-order broken" in diag
@@ -688,6 +790,99 @@ def test_cli_gate_tdd_exit_code(tmp_path: Path):
     )
     assert result.returncode == 1
     assert "BUG-500" in result.stdout
+
+
+def _commit_touching(p: Path, msg: str, rel_path: str, content: str = "x") -> str:
+    """Commit `msg` with a file change at `rel_path` so the reproduce
+    commit actually carries test evidence."""
+    f = p / rel_path
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(content)
+    _git(p, "add", rel_path)
+    _git(p, "commit", "-q", "-m", msg)
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=p, capture_output=True, text=True,
+    )
+    return out.stdout.strip()
+
+
+def test_gate_tdd_rejects_reproduce_without_test_path_BUG_161(tmp_path: Path):
+    """BUG-161: a Bug-Reproduce trailer alone does not count — the
+    commit must touch a real test path. A no-op-trailer-only commit
+    used to satisfy the gate; that hole is now closed."""
+    from peers.bug_hunt import gate_tdd_pass
+
+    repo = _init_repo(tmp_path / "r")
+    _file_blocking_bug(repo, "BUG-700", sev="high")
+    # Reproduce commit touches NOT a test path.
+    _commit_touching(repo, textwrap.dedent("""\
+        TDD: reproducer for BUG-700
+
+        Peer: claude
+        Bug-Reproduce: BUG-700
+    """), "notes/random.md")
+    # Then the fix.
+    _commit_touching(repo, textwrap.dedent("""\
+        fix BUG-700
+
+        ## Bug-Resolution
+        {"id":"BUG-700","status":"fixed"}
+
+        Peer: codex
+        Bug-Resolves: BUG-700
+    """), "src/foo.py")
+    ok, diag = gate_tdd_pass(repo)
+    assert ok is False, diag
+    assert "BUG-700" in diag
+
+
+def test_gate_tdd_rejects_empty_reproduce_commit_BUG_161(tmp_path: Path):
+    """BUG-161: an empty commit (no diff at all) with only a
+    Bug-Reproduce trailer must NOT satisfy the gate."""
+    from peers.bug_hunt import gate_tdd_pass
+
+    repo = _init_repo(tmp_path / "r")
+    _file_blocking_bug(repo, "BUG-701", sev="high")
+    _git(repo, "commit", "--allow-empty", "-q", "-m",
+         "TDD: reproducer for BUG-701\n\nPeer: claude\nBug-Reproduce: BUG-701\n")
+    _commit_touching(repo, textwrap.dedent("""\
+        fix BUG-701
+
+        ## Bug-Resolution
+        {"id":"BUG-701","status":"fixed"}
+
+        Peer: codex
+        Bug-Resolves: BUG-701
+    """), "src/bar.py")
+    ok, diag = gate_tdd_pass(repo)
+    assert ok is False, diag
+    assert "BUG-701" in diag
+
+
+def test_gate_tdd_accepts_reproduce_touching_tests_dir_BUG_161(tmp_path: Path):
+    """BUG-161 fix happy path: a reproduce commit that adds a file
+    under tests/ satisfies the gate."""
+    from peers.bug_hunt import gate_tdd_pass
+
+    repo = _init_repo(tmp_path / "r")
+    _file_blocking_bug(repo, "BUG-702", sev="med")
+    _commit_touching(repo, textwrap.dedent("""\
+        TDD: reproducer for BUG-702
+
+        Peer: claude
+        Bug-Reproduce: BUG-702
+    """), "tests/unit/test_bug_702.py", "def test_x(): assert False\n")
+    _commit_touching(repo, textwrap.dedent("""\
+        fix BUG-702
+
+        ## Bug-Resolution
+        {"id":"BUG-702","status":"fixed"}
+
+        Peer: codex
+        Bug-Resolves: BUG-702
+    """), "src/baz.py")
+    ok, diag = gate_tdd_pass(repo)
+    assert ok, diag
 
 
 def test_cli_gate_exit_code(tmp_path: Path):

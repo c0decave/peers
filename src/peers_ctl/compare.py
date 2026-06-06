@@ -13,6 +13,17 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from peers.safe_io import read_text_no_symlink
+
+# bound each project-controlled read so a malicious project
+# cannot make the operator's compare command consume unbounded memory.
+# state.json and per-bug files are kilobytes in practice; runs.jsonl is
+# the heaviest log but stays in the low MB range even after long runs.
+_MAX_STATE_BYTES = 1 * 1024 * 1024  # 1 MB
+_MAX_STOP_REASON_BYTES = 64 * 1024  # 64 KB
+_MAX_BUG_HEAD_BYTES = 8 * 1024  # 8 KB header per BUG file
+_MAX_RUNS_BYTES = 32 * 1024 * 1024  # 32 MB runs.jsonl cap
+
 
 @dataclass
 class ProjectMetrics:
@@ -40,9 +51,14 @@ class ProjectMetrics:
 
 
 def _read_state(project_path: Path) -> dict | None:
+    # read_text_no_symlink refuses symlinked / hardlinked /
+    # non-regular files and caps the read at _MAX_STATE_BYTES so a
+    # malicious project cannot disclose a same-user-readable file or
+    # exhaust the operator's memory.
     p = project_path / ".peers" / "state.json"
     try:
-        return json.loads(p.read_text())
+        raw = read_text_no_symlink(p, max_bytes=_MAX_STATE_BYTES)
+        return json.loads(raw)
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -51,7 +67,12 @@ def _read_runs_jsonl(project_path: Path) -> list[dict]:
     p = project_path / ".peers" / "log" / "runs.jsonl"
     out: list[dict] = []
     try:
-        for line in p.read_text().splitlines():
+        # bounded no-follow read for the runs log too. Truncation
+        # at the cap is harmless: we'd just lose tail entries (compare is
+        # a forensic snapshot, not transactional). The last partial line is
+        # filtered by the json.loads try/except.
+        raw = read_text_no_symlink(p, max_bytes=_MAX_RUNS_BYTES)
+        for line in raw.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -67,7 +88,10 @@ def _read_runs_jsonl(project_path: Path) -> list[dict]:
 def _read_stop_reason(project_path: Path) -> str:
     p = project_path / ".peers" / "last-stop-reason.txt"
     try:
-        text = p.read_text().strip()
+        # stop-reason is a single token; cap at a small bound
+        # so we don't even page in a giant attacker-planted file before
+        # discovering it has no token.
+        text = read_text_no_symlink(p, max_bytes=_MAX_STOP_REASON_BYTES).strip()
     except OSError:
         return ""
     return text.split()[0] if text else ""
@@ -81,13 +105,18 @@ def _read_bug_counts(project_path: Path) -> tuple[int, dict[str, int]]:
     bugs_dir = project_path / ".peers" / "bugs"
     by_severity: Counter[str] = Counter()
     total = 0
-    if bugs_dir.is_dir():
+    if bugs_dir.is_dir() and not bugs_dir.is_symlink():
         for f in bugs_dir.iterdir():
-            if not f.is_file() or not f.name.startswith("BUG-"):
+            # refuse symlinks at the leaf so an attacker cannot
+            # use the bug-file scan to disclose an arbitrary same-user
+            # file through the operator's compare output.
+            if f.is_symlink() or not f.is_file():
+                continue
+            if not f.name.startswith("BUG-"):
                 continue
             total += 1
             try:
-                head = f.read_text(errors="ignore")[:512]
+                head = read_text_no_symlink(f, max_bytes=_MAX_BUG_HEAD_BYTES)
             except OSError:
                 continue
             # JSON header line carries severity

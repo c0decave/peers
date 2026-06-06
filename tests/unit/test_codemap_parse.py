@@ -56,3 +56,47 @@ def test_entries_must_be_list(tmp_path: Path):
     p.write_text("entries: not-a-list\n")
     with pytest.raises(CodeMapError):
         parse_codemap(p)
+
+
+# line field must be a real int, not a coercible value.
+# YAML `true` ⇒ Python True; `int(True) == 1` silently passes the
+# coercion-based validator and a symbol declared at line `true` then
+# matches AST line 1 in grounded/signature gates. Numeric strings and
+# floats have the same lossy-coercion problem.
+def test_line_bool_rejected(tmp_path: Path):
+    p = tmp_path / "CODEMAP.yaml"
+    p.write_text(
+        "entries:\n"
+        "  - id: pkg.mod.x\n"
+        "    kind: function\n"
+        "    file: a.py\n"
+        "    line: true\n"
+    )
+    with pytest.raises(CodeMapError, match="line must"):
+        parse_codemap(p)
+
+
+def test_line_numeric_string_rejected(tmp_path: Path):
+    p = tmp_path / "CODEMAP.yaml"
+    p.write_text(
+        "entries:\n"
+        "  - id: pkg.mod.x\n"
+        "    kind: function\n"
+        "    file: a.py\n"
+        '    line: "42"\n'
+    )
+    with pytest.raises(CodeMapError, match="line must"):
+        parse_codemap(p)
+
+
+def test_line_float_rejected(tmp_path: Path):
+    p = tmp_path / "CODEMAP.yaml"
+    p.write_text(
+        "entries:\n"
+        "  - id: pkg.mod.x\n"
+        "    kind: function\n"
+        "    file: a.py\n"
+        "    line: 1.5\n"
+    )
+    with pytest.raises(CodeMapError, match="line must"):
+        parse_codemap(p)

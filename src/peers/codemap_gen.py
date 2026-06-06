@@ -29,6 +29,7 @@ from peers.codemap import (
 from peers.safe_io import (
     _ensure_private_dir,
     open_text_in_dir_no_symlink,
+    read_bytes_no_symlink,
     write_text_no_symlink,
 )
 
@@ -344,12 +345,16 @@ def check_agents_sync(project_dir: Path, codemap: CodeMap) -> list[str]:
     regenerate makes this erupt. Lives here (not in codemap.py) because it
     depends on `render_agents_md`."""
     path = Path(project_dir) / AGENTS_FILE
+    # refuse symlinked deliverables; read through bounded
+    # no-follow helper (8 MiB cap — typical AGENTS.md is <1 MiB).
+    if path.is_symlink():
+        return [f"{AGENTS_FILE}: refusing symlinked deliverable"]
     if not path.is_file():
         return [f"{AGENTS_FILE}: missing (run `peers agents-doc` to generate it)"]
     try:
         # Raw bytes: a true byte comparison (read_text would universal-newline-
         # normalize CRLF→LF and let a CRLF-corrupted file slip past the gate).
-        actual = path.read_bytes()
+        actual = read_bytes_no_symlink(path, max_bytes=8 * 1024 * 1024)
     except OSError as e:
         return [f"{AGENTS_FILE}: unreadable: {e}"]
     if actual != render_agents_md(codemap).encode("utf-8"):

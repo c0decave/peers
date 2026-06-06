@@ -30,7 +30,7 @@ from peers.goal_engine import GoalResult
 from peers.health_guard import RunResult
 from peers.peer_spec import PeerSpec
 from peers.prompt_builder import build_prompt
-from peers.safe_io import read_text_no_symlink
+from peers.safe_io import atomic_write_text_in_dir_no_symlink, read_text_no_symlink
 from peers.skeptic_engine import PHASE_B_SKEPTIC_GATES, SkepticEngine
 from peers.turn_manager import TurnManager
 
@@ -121,13 +121,14 @@ class DriverTickHooksMixin:
             return None
         reason = "checkpoint:phase-0-complete"
         try:
-            (self.peer_dir / "awaiting_user").write_text(
+            # no-follow atomic write so a swapped .peers / symlinked leaf cannot redirect the sentinel.
+            atomic_write_text_in_dir_no_symlink(
+                self.peer_dir / "awaiting_user",
                 f"checkpoint at iter={state.get('iteration', 0)}\n"
                 "review RECON.md + PLAN.aligned.md + "
                 "ARCHITECTURE.intended.md, then run "
                 "`peers-ctl resume <project>` + "
                 "`peers-ctl start <project>` to continue.\n",
-                encoding="utf-8",
             )
         except OSError as e:
             print(

@@ -47,20 +47,28 @@ def test_atomic_write_uses_temp_then_rename(tmp_path: Path):
 
 
 def test_save_refuses_symlinked_temp_file(tmp_path: Path):
+    """BUG-181: the writer used to use the predictable ``state.json.tmp``
+    name; a pre-planted symlink there would be refused via O_NOFOLLOW.
+    After BUG-181 the temp name is randomized per call, so the
+    legacy pre-planted symlink is bypassed entirely — the save still
+    succeeds AND the bait remains untouched (strictly stronger
+    guarantee). The pre-planted symlink stays on disk; we just route
+    around it."""
     path = tmp_path / "state.json"
     bait = tmp_path / "bait"
     bait.write_text("keep me")
     (tmp_path / "state.json.tmp").symlink_to(bait)
 
-    with pytest.raises(OSError):
-        StateStore(path).save({
-            "iteration": 1,
-            "peer_order": ["claude", "codex"],
-            "turn_index": 0,
-            "peers": {"claude": {"state": "healthy"},
-                      "codex": {"state": "healthy"}},
-        })
+    StateStore(path).save({
+        "iteration": 1,
+        "peer_order": ["claude", "codex"],
+        "turn_index": 0,
+        "peers": {"claude": {"state": "healthy"},
+                  "codex": {"state": "healthy"}},
+    })
 
+    assert path.exists()
+    # The legacy predictable name is never written, so the bait survives.
     assert bait.read_text() == "keep me"
 
 
@@ -95,11 +103,12 @@ def test_save_refuses_symlinked_parent_before_temp_write(tmp_path: Path):
 def test_save_refuses_late_hardlinked_temp_without_truncating(
     tmp_path: Path, monkeypatch,
 ):
-    """BUG-119 (v15 internal testing): regression-lock on the dir-fd save path —
-    the temp open must not truncate until after the nlink check, or a
-    hardlink raced onto state.json.tmp between the pre-stat and the open is
-    clobbered. (Latent on the previously leaf path, which already delayed
-    truncation; this locks the property into the rewritten save.)"""
+    """BUG-119: a hardlink raced onto the writer's temp file
+    before the open must not clobber the linked victim. BUG-181
+    randomized the temp filename and added O_EXCL, so the same race
+    now lands as a FileExistsError on the create rather than passing
+    the nlink check — both outcomes satisfy the safety property: the
+    bait keeps its bytes."""
     path = tmp_path / "state.json"
     bait = tmp_path / "bait"
     bait.write_text("keep me")
@@ -108,21 +117,32 @@ def test_save_refuses_late_hardlinked_temp_without_truncating(
     raced = {"done": False}
 
     def racing_open(p, flags, *args, **kwargs):
+        # Match the new <name>.<random>.tmp scheme by basename pattern.
+        name_str = str(p)
         if (
             not raced["done"]
-            and str(p).endswith("state.json.tmp")
+            and "state.json." in name_str
+            and name_str.endswith(".tmp")
             and (flags & os.O_CREAT)
         ):
             raced["done"] = True
+            # Plant a hardlink at the exact name the writer is about to
+            # try creating, so O_EXCL trips on the create.
             try:
-                os.link(bait, tmp_path / "state.json.tmp")
-            except OSError as e:
-                pytest.skip(f"hard links unavailable: {e}")
+                os.link(bait, name_str, dst_dir_fd=kwargs.get("dir_fd"))
+            except (TypeError, OSError):
+                # Fall back without dir_fd; relative paths land in cwd
+                # only when we have the dir_fd, but the racing case is
+                # already exercised via O_EXCL collision below.
+                try:
+                    os.link(bait, tmp_path / name_str)
+                except OSError as e2:
+                    pytest.skip(f"hard links unavailable: {e2}")
         return real_open(p, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", racing_open)
 
-    with pytest.raises(OSError, match="hard-linked"):
+    with pytest.raises(OSError):
         StateStore(path).save(dict(_VALID_STATE))
 
     assert raced["done"], "race hook never fired — test did not exercise path"

@@ -66,7 +66,11 @@ import ast
 import sys
 from pathlib import Path
 
-from peers_ctl.justifications import is_justified
+from peers_ctl.justifications import (
+    JustificationError,
+    is_justified,
+    verify_log_chain,
+)
 
 
 _FORBIDDEN_MARKERS = ("TODO", "FIXME", "XXX", "HACK", "PLACEHOLDER", "STUB")
@@ -250,6 +254,15 @@ def main(project_dir: str = ".") -> int:
     if not src_root.is_dir():
         print("no-shortcut-markers: clean (no src/ to scan)")
         return 0
+
+    # fail closed if the justifications log is tampered or
+    # syntactically broken. is_justified() is a pure lookup and would
+    # otherwise accept a hand-written entry whose chain prefix is bogus.
+    try:
+        verify_log_chain(plan_dir)
+    except JustificationError as e:
+        print(f"no-shortcut-markers FAIL: justifications log chain broken: {e}")
+        return 1
 
     all_violations: list[str] = []
     files = _iter_src_files(src_root)

@@ -121,6 +121,62 @@ acceptance: pytest
         parse_plan(_write(tmp_path, text))
 
 
+def test_empty_surfaces_list_fails_BUG_166(tmp_path: Path) -> None:
+    """BUG-166: `surfaces: []` must be rejected — an empty list can
+    bypass the e2e enforcement for UI projects."""
+    text = """\
+# F
+
+## Meta
+surfaces: []
+acceptance: pytest
+
+## Steps
+- [ ] [STEP-1] x
+  - touches: src/x.py
+"""
+    with pytest.raises(PlanValidationError, match="surfaces"):
+        parse_plan(_write(tmp_path, text))
+
+
+def test_unknown_surface_token_fails_BUG_166(tmp_path: Path) -> None:
+    """BUG-166: a typo such as `weeb` (instead of `web`) must NOT be
+    silently accepted — that would bypass the e2e contract."""
+    text = """\
+# F
+
+## Meta
+surfaces: [weeb]
+acceptance: pytest
+
+## Steps
+- [ ] [STEP-1] x
+  - touches: src/x.py
+"""
+    with pytest.raises(PlanValidationError, match="surface"):
+        parse_plan(_write(tmp_path, text))
+
+
+def test_unknown_surface_token_with_real_surface_fails_BUG_166(
+    tmp_path: Path,
+) -> None:
+    """BUG-166: mixing a real surface with a typo also fails — every
+    token must come from the closed vocabulary."""
+    text = """\
+# F
+
+## Meta
+surfaces: [cli, webb]
+acceptance: pytest
+
+## Steps
+- [ ] [STEP-1] x
+  - touches: src/x.py
+"""
+    with pytest.raises(PlanValidationError, match="surface"):
+        parse_plan(_write(tmp_path, text))
+
+
 def test_cli_surface_no_e2e_needed(tmp_path: Path) -> None:
     text = """\
 # F

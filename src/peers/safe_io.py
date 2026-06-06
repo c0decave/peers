@@ -11,6 +11,7 @@ and pre-existing hardlinks before truncating or appending.
 from __future__ import annotations
 
 import os
+import secrets
 import stat
 from pathlib import Path
 from typing import IO, Sequence
@@ -312,6 +313,114 @@ def read_text_no_symlink(path: Path, max_bytes: int | None = None) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def read_bytes_under_root_no_follow(
+    root: Path, rel_parts: Sequence[str], max_bytes: int | None = None,
+) -> bytes:
+    """Read bytes from ``root/<rel_parts>`` rejecting symlinks on every
+    component of the path.
+
+    BUG-185 defense: ``read_bytes_no_symlink`` only carries ``O_NOFOLLOW``
+    on the leaf open; the kernel still resolves every ancestor component.
+    Callers that need to read project-controlled paths inside an operator-
+    chosen root (the goals DSL ``json()`` helper, controller compare/replay)
+    must refuse a symlinked ancestor too. This walks the path one component
+    at a time, opening each intermediate with ``O_DIRECTORY|O_NOFOLLOW``
+    relative to the previous dir-fd, then opens the leaf via the final
+    dir-fd. A late swap of ``root/a`` or any deeper dir to a symlink is
+    rejected because the very next ``os.open`` carries ``O_NOFOLLOW``.
+
+    ``rel_parts`` must be plain string components — no ``..``, no
+    embedded separators, no absolute names. The empty list reads ``root``
+    itself, which we reject (callers want a file leaf).
+    """
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
+    if not rel_parts:
+        raise ValueError("rel_parts must include at least the file name")
+    for name in rel_parts:
+        if name in ("", ".", "..") or Path(name).name != name:
+            raise ValueError(
+                f"rel_parts must be plain components, got {name!r}"
+            )
+    dir_flags = os.O_RDONLY
+    dir_flags |= getattr(os, "O_DIRECTORY", 0)
+    dir_flags |= getattr(os, "O_NOFOLLOW", 0)
+    dir_flags |= getattr(os, "O_CLOEXEC", 0)
+    parent_fd = os.open(str(root), dir_flags)
+    fds_to_close: list[int] = [parent_fd]
+    try:
+        # Confirm the freshly opened root isn't a symlink (O_NOFOLLOW only
+        # rejects following — a swap to a non-symlink dir between lstat
+        # and open is also fine because we re-stat via fstat).
+        lst = root.lstat()
+        if stat.S_ISLNK(lst.st_mode):
+            raise OSError(f"refusing symlinked root: {root}")
+        st = os.fstat(parent_fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"refusing non-directory root: {root}")
+        if (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino):
+            raise OSError(f"refusing swapped root: {root}")
+        for name in rel_parts[:-1]:
+            child_fd = os.open(name, dir_flags, dir_fd=parent_fd)
+            fds_to_close.append(child_fd)
+            cst = os.fstat(child_fd)
+            clst = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(clst.st_mode):
+                raise OSError(f"refusing symlinked ancestor under {root}: {name}")
+            if not stat.S_ISDIR(cst.st_mode):
+                raise OSError(f"refusing non-directory ancestor under {root}: {name}")
+            if (cst.st_dev, cst.st_ino) != (clst.st_dev, clst.st_ino):
+                raise OSError(f"refusing swapped ancestor under {root}: {name}")
+            parent_fd = child_fd
+        leaf_name = rel_parts[-1]
+        leaf_flags = os.O_RDONLY
+        leaf_flags |= getattr(os, "O_NOFOLLOW", 0)
+        leaf_flags |= getattr(os, "O_NONBLOCK", 0)
+        leaf_flags |= getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(leaf_name, leaf_flags, dir_fd=parent_fd)
+        try:
+            lst_leaf = os.stat(
+                leaf_name, dir_fd=parent_fd, follow_symlinks=False,
+            )
+            if stat.S_ISLNK(lst_leaf.st_mode):
+                raise OSError(
+                    f"refusing symlinked leaf under {root}: {leaf_name}"
+                )
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode):
+                raise OSError(
+                    f"refusing non-regular leaf under {root}: {leaf_name}"
+                )
+            if fst.st_nlink != 1:
+                raise OSError(
+                    f"refusing hard-linked leaf under {root}: {leaf_name}"
+                )
+            if (fst.st_dev, fst.st_ino) != (lst_leaf.st_dev, lst_leaf.st_ino):
+                raise OSError(
+                    f"refusing swapped leaf under {root}: {leaf_name}"
+                )
+            with os.fdopen(fd, "rb") as f:
+                fd = -1
+                return f.read() if max_bytes is None else f.read(max_bytes)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    finally:
+        for f in reversed(fds_to_close):
+            try:
+                os.close(f)
+            except OSError:
+                pass
+
+
+def read_text_under_root_no_follow(
+    root: Path, rel_parts: Sequence[str], max_bytes: int | None = None,
+) -> str:
+    """UTF-8 text variant of :func:`read_bytes_under_root_no_follow`."""
+    data = read_bytes_under_root_no_follow(root, rel_parts, max_bytes=max_bytes)
+    return data.decode("utf-8", errors="replace")
+
+
 def write_text_no_symlink(path: Path, text: str) -> None:
     with open_text_no_symlink(path, "w") as f:
         f.write(text)
@@ -398,12 +507,19 @@ def atomic_write_text_in_dir_no_symlink(path: Path, text: str) -> None:
     parent = path.parent
     name = path.name
     _validate_single_path_component(name, "filename")
-    tmp_name = name + ".tmp"
+    # never use the predictable "<name>.tmp" as the rename
+    # source — a same-UID peer can pre-plant a symlink/hardlink there
+    # and the writer's open-without-O_EXCL would race them. Instead,
+    # mint a unique temp name per call and open it with O_EXCL so a
+    # collision (random guess or atomic race) fails fast instead of
+    # silently following or truncating.
+    tmp_name = f"{name}.{secrets.token_hex(8)}.tmp"
     display_tmp = parent / tmp_name
     dir_fd = _open_dir_fd_no_symlink(parent)
     fd = -1
+    tmp_unlinked = False
     try:
-        flags = os.O_WRONLY | os.O_CREAT
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
         flags |= getattr(os, "O_CLOEXEC", 0)
@@ -419,13 +535,13 @@ def atomic_write_text_in_dir_no_symlink(path: Path, text: str) -> None:
         if st.st_nlink != 1:
             raise OSError(f"refusing to open hard-linked file: {display_tmp}")
         _tighten_to_private(fd)
-        os.ftruncate(fd, 0)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = -1
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        tmp_unlinked = True
         # Durability: the rename's metadata only hits disk after the parent
         # dir is fsync'd. Some filesystems (FAT, NFS) don't support it — skip
         # rather than fail, same as the leaf write above.
@@ -436,4 +552,12 @@ def atomic_write_text_in_dir_no_symlink(path: Path, text: str) -> None:
     finally:
         if fd >= 0:
             os.close(fd)
+        # if anything between open and replace failed we leave
+        # the unique tmp behind. Clean it up so the parent dir doesn't
+        # accumulate <name>.<random>.tmp turds across retries.
+        if not tmp_unlinked:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass
         os.close(dir_fd)

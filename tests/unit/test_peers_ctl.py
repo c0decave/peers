@@ -197,6 +197,45 @@ def test_reconcile_clean_self_termination_marks_stopped(tmp_path: Path):
     assert p.pid is None
 
 
+def test_reconcile_refuses_symlinked_stop_reason(tmp_path: Path):
+    """BUG-193 sad path: a project-controlled stop sentinel symlink must
+    not be followed and treated as a clean termination marker."""
+    s = Store(tmp_path / "ctl")
+    target = tmp_path / "p"
+    (target / ".peers").mkdir(parents=True)
+    victim = tmp_path / "same-user-file.txt"
+    victim.write_text("complete forged-by-symlink\n")
+    (target / ".peers" / "last-stop-reason.txt").symlink_to(victim)
+    s.add(Project(name="x", path=str(target)))
+    s.update("x", state="running", pid=0x7fffffff)
+
+    reconcile(s)
+
+    p = s.get("x")
+    assert p.state == "crashed"
+    assert p.pid is None
+
+
+def test_reconcile_refuses_oversized_stop_reason(tmp_path: Path):
+    """BUG-193 edge case: a huge sentinel must not be read unboundedly or
+    accepted just because its first token looks like a clean stop."""
+    s = Store(tmp_path / "ctl")
+    target = tmp_path / "p"
+    (target / ".peers").mkdir(parents=True)
+
+    (target / ".peers" / "last-stop-reason.txt").write_text(
+        "complete " + "x" * (64 * 1024 + 1),
+    )
+    s.add(Project(name="x", path=str(target)))
+    s.update("x", state="running", pid=0x7fffffff)
+
+    reconcile(s)
+
+    p = s.get("x")
+    assert p.state == "crashed"
+    assert p.pid is None
+
+
 def test_reconcile_max_ticks_termination_marks_stopped(tmp_path: Path):
     s = Store(tmp_path / "ctl")
     target = tmp_path / "p"
@@ -1728,3 +1767,125 @@ def test_default_config_dir_uses_xdg(monkeypatch, tmp_path: Path):
 def test_entrypoint_module_imports():
     import peers_ctl.cli as m
     assert hasattr(m, "main")
+
+
+def test_write_state_refuses_symlinked_tmp_BUG_196(tmp_path: Path) -> None:
+    """BUG-196: `.peers/state.json.tmp` must not be followed if a
+    symlink was pre-planted at that predictable name. A same-UID
+    project peer can drop a symlink there and otherwise redirect the
+    pre-replace write into any same-user writable target.
+
+    After the fix the writer uses a per-call randomized tmp name AND
+    opens it with O_EXCL/O_NOFOLLOW via the safe_io atomic helper, so
+    the pre-planted symlink is untouched and the victim file is not
+    overwritten.
+    """
+    import json
+    import peers_ctl.runner as runner_mod
+
+    target = _stub_target(tmp_path)
+    proj = Project(name="x", path=str(target))
+
+    victim = tmp_path / "victim.json"
+    victim.write_text('{"untouched": true}')
+
+    predictable_tmp = target / ".peers" / "state.json.tmp"
+    predictable_tmp.symlink_to(victim)
+
+    state = {"iteration": 1, "budget": {"max_runtime_s": 10}}
+    runner_mod._write_state(proj, state)
+
+    assert json.loads(victim.read_text()) == {"untouched": True}, (
+        "victim file followed via symlinked state.json.tmp"
+    )
+    state_path = target / ".peers" / "state.json"
+    assert state_path.is_file() and not state_path.is_symlink()
+    assert json.loads(state_path.read_text()) == state
+
+
+def test_persist_budget_override_refuses_symlinked_tmp_BUG_196(
+    tmp_path: Path,
+) -> None:
+    """BUG-196 mirror for `.peers/budget-overrides.json.tmp` — same
+    threat, same fix. Pre-planted symlink at the predictable tmp name
+    must not redirect the override write."""
+    import json
+    import peers_ctl.runner as runner_mod
+    from peers.budget_accountant import OPERATOR_BUDGET_OVERRIDE_FILE
+
+    target = _stub_target(tmp_path)
+    proj = Project(name="x", path=str(target))
+
+    victim = tmp_path / "victim.json"
+    victim.write_text('{"untouched": true}')
+
+    predictable_tmp = (
+        target / ".peers" / (OPERATOR_BUDGET_OVERRIDE_FILE + ".tmp")
+    )
+    predictable_tmp.symlink_to(victim)
+
+    runner_mod._persist_budget_override(proj, max_runtime_s=43200)
+
+    assert json.loads(victim.read_text()) == {"untouched": True}, (
+        "victim file followed via symlinked budget-overrides.json.tmp"
+    )
+    sidecar = target / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE
+    assert sidecar.is_file() and not sidecar.is_symlink()
+    assert json.loads(sidecar.read_text())["max_runtime_s"] == 43200
+
+
+def test_persist_budget_override_refuses_symlinked_overrides_BUG_196(
+    tmp_path: Path,
+) -> None:
+    """Final-name leaf is also read before write to merge prior
+    overrides. A symlinked leaf would leak any same-user-readable JSON
+    in via `existing`. After the fix the merge-read should fall back
+    to an empty dict rather than follow the symlink."""
+    import json
+    import peers_ctl.runner as runner_mod
+    from peers.budget_accountant import OPERATOR_BUDGET_OVERRIDE_FILE
+
+    target = _stub_target(tmp_path)
+    proj = Project(name="x", path=str(target))
+
+    secret = tmp_path / "secret.json"
+    secret.write_text('{"max_runtime_s": 1, "leaked_field": "yes"}')
+
+    sidecar = target / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE
+    sidecar.symlink_to(secret)
+
+    runner_mod._persist_budget_override(proj, max_runtime_s=43200)
+
+    # Symlink was replaced atomically with the real file, secret
+    # remains untouched, and no leaked field made it into the merged
+    # overrides.
+    assert json.loads(secret.read_text()) == {
+        "max_runtime_s": 1, "leaked_field": "yes",
+    }, "secret file was clobbered via symlinked sidecar"
+    assert sidecar.is_file() and not sidecar.is_symlink()
+    written = json.loads(sidecar.read_text())
+    assert written == {"max_runtime_s": 43200}, (
+        f"merge read followed the symlink and leaked: {written!r}"
+    )
+
+
+def test_write_state_happy_path_writes_atomic_no_symlink_BUG_196(
+    tmp_path: Path,
+) -> None:
+    """Sanity: the no-symlink atomic writer still round-trips state."""
+    import json
+    import peers_ctl.runner as runner_mod
+
+    target = _stub_target(tmp_path)
+    proj = Project(name="x", path=str(target))
+
+    state = {"iteration": 7, "budget": {"max_runtime_s": 99}}
+    runner_mod._write_state(proj, state)
+    assert json.loads((target / ".peers" / "state.json").read_text()) == state
+
+    state["iteration"] = 8
+    runner_mod._write_state(proj, state)
+    assert (
+        json.loads((target / ".peers" / "state.json").read_text())["iteration"]
+        == 8
+    )

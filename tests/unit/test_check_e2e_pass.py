@@ -5,6 +5,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from peers.templates.modes.implement.checks import e2e_pass
+from peers_ctl.contracts import _append_chain_entry, _INIT_EVENT, _pin_state_hash
 
 
 def _make_e2e_setup(tmp_path: Path, e2e_body: str) -> Path:
@@ -27,6 +28,8 @@ def _make_e2e_setup(tmp_path: Path, e2e_body: str) -> Path:
         "PLAN.original.md": sha256(plan_orig.read_bytes()).hexdigest(),
     }
     (plan_dir / "contracts.sha").write_text(json.dumps(sha_map, indent=2))
+    # chain-bind initial pin state in contracts.log.
+    _append_chain_entry(plan_dir, _INIT_EVENT, "", _pin_state_hash(sha_map))
     return tmp_path
 
 
@@ -46,6 +49,7 @@ def _make_non_e2e_setup(tmp_path: Path) -> Path:
         "PLAN.original.md": sha256(plan_orig.read_bytes()).hexdigest(),
     }
     (plan_dir / "contracts.sha").write_text(json.dumps(sha_map, indent=2))
+    _append_chain_entry(plan_dir, _INIT_EVENT, "", _pin_state_hash(sha_map))
     return tmp_path
 
 

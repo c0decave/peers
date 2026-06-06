@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from peers.peer_spec import is_valid_peer_name
-from peers.safe_io import _ensure_private_dir
+from peers.safe_io import (
+    _ensure_private_dir,
+    _open_dir_fd_no_symlink,
+    _open_private_nested_dir_fd_no_symlink,
+)
 
 # Trailer keys must be at least 2 chars to avoid matching one-letter
 # words at the start of body lines. They must also not be common
@@ -160,6 +164,12 @@ class HybridCommLayer:
         dotfile first, then linked into its final NNNN name. Consumers only
         glob final `NNNN-*.md` files, so they never archive an empty or
         partially written message.
+
+        BUG-186: every directory hop and every file open uses a no-follow
+        ``dir_fd`` so a same-user race that swaps ``.peers``,
+        ``.peers/comms``, or ``.peers/comms/<inbox>`` to a symlink between
+        creation and write cannot redirect the message file outside the
+        inbox.
         """
         # Defence against path traversal: peer names must be tame
         # tokens — they end up as directory components. Reject anything
@@ -170,70 +180,146 @@ class HybridCommLayer:
                 raise ValueError(
                     f"hybrid comm: invalid {label} name: {who!r}"
                 )
-        _ensure_private_dir(self.peer_dir)
-        _ensure_private_dir(self.peer_dir / "comms")
-        d = self._inbox_dir(sender, receiver)
-        _ensure_private_dir(d)
-        safe_topic = re.sub(r"[^a-zA-Z0-9_-]+", "-", topic).strip("-")[:40]
-        safe_topic = safe_topic or "msg"
-
-        # Seed the sequence at the highest existing+1 number, then keep
-        # bumping until O_EXCL succeeds.
-        existing = sorted(d.glob("[0-9][0-9][0-9][0-9]-*.md"))
-        next_n = 1 + (int(existing[-1].name[:4]) if existing else 0)
-        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        payload = (
-            f"---\nfrom: {sender}\nto: {receiver}\nts: {ts}\n"
-            f"topic: {topic}\n---\n\n{body.rstrip()}\n"
-        )
         import os as _os
-        for attempt in range(10_000):  # generous upper bound on collisions
-            path = d / f"{next_n:04d}-{safe_topic}.md"
-            tmp_path = d / (
-                f".{next_n:04d}-{safe_topic}.{_os.getpid()}.{attempt}.tmp"
-            )
-            try:
-                flags = _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL
-                flags |= getattr(_os, "O_NOFOLLOW", 0)
-                flags |= getattr(_os, "O_CLOEXEC", 0)
-                fd = _os.open(
-                    str(tmp_path),
-                    flags,
-                    0o600,
+        inbox_dirname = f"{sender}-to-{receiver}"
+        # Anchor every file op to a freshly opened dir fd that walked
+        # every component with O_NOFOLLOW. A later swap of any ancestor
+        # cannot follow into an attacker dir.
+        dir_fd = _open_private_nested_dir_fd_no_symlink(
+            self.peer_dir, ("comms", inbox_dirname),
+        )
+        try:
+            safe_topic = re.sub(r"[^a-zA-Z0-9_-]+", "-", topic).strip("-")[:40]
+            safe_topic = safe_topic or "msg"
+
+            # Seed the sequence at the highest existing+1 number using the
+            # dir_fd-relative listing so a swapped inbox cannot lie to us.
+            existing_names = sorted(
+                n for n in _os.listdir(dir_fd)
+                if (
+                    len(n) >= 5
+                    and n[:4].isdigit()
+                    and n[4] == "-"
+                    and n.endswith(".md")
                 )
-            except FileExistsError:
-                next_n += 1
-                continue
-            try:
-                with _os.fdopen(fd, "w") as f:
-                    f.write(payload)
-                    f.flush()
-                    _os.fsync(f.fileno())
+            )
+            next_n = 1 + (int(existing_names[-1][:4]) if existing_names else 0)
+            ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            payload = (
+                f"---\nfrom: {sender}\nto: {receiver}\nts: {ts}\n"
+                f"topic: {topic}\n---\n\n{body.rstrip()}\n"
+            )
+            d_for_display = self._inbox_dir(sender, receiver)
+            for attempt in range(10_000):  # generous upper bound on collisions
+                final_name = f"{next_n:04d}-{safe_topic}.md"
+                tmp_name = (
+                    f".{next_n:04d}-{safe_topic}"
+                    f".{_os.getpid()}.{attempt}.tmp"
+                )
                 try:
-                    _os.link(str(tmp_path), str(path))
+                    flags = _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL
+                    flags |= getattr(_os, "O_NOFOLLOW", 0)
+                    flags |= getattr(_os, "O_CLOEXEC", 0)
+                    fd = _os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
                 except FileExistsError:
                     next_n += 1
                     continue
-                return path
-            except OSError:
-                # If write fails, clean up the empty file and retry.
-                raise
-            finally:
                 try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-        raise RuntimeError(
-            f"hybrid comm: gave up after 10000 attempts to create a "
-            f"unique inbox file in {d}"
-        )
+                    with _os.fdopen(fd, "w") as f:
+                        f.write(payload)
+                        f.flush()
+                        _os.fsync(f.fileno())
+                    try:
+                        _os.link(
+                            tmp_name, final_name,
+                            src_dir_fd=dir_fd, dst_dir_fd=dir_fd,
+                        )
+                    except FileExistsError:
+                        next_n += 1
+                        continue
+                    return d_for_display / final_name
+                finally:
+                    try:
+                        _os.unlink(tmp_name, dir_fd=dir_fd)
+                    except OSError:
+                        pass
+            raise RuntimeError(
+                f"hybrid comm: gave up after 10000 attempts to create a "
+                f"unique inbox file in {d_for_display}"
+            )
+        finally:
+            _os.close(dir_fd)
 
     def fetch_new(self, sender: str, receiver: str) -> list[Path]:
-        """Returns sorted list of unarchived messages from sender→receiver."""
-        d = self._inbox_dir(sender, receiver)
-        if not d.exists():
+        """Returns sorted list of unarchived messages from sender→receiver.
+
+        BUG-186: walk the chain with O_DIRECTORY|O_NOFOLLOW and list via
+        ``os.listdir(dir_fd)`` so a same-user race that swaps the comms or
+        inbox directory to a symlink between the BUG-175 check and the
+        listing cannot import attacker-controlled files into the prompt.
+        Does NOT create the inbox when missing (read-only operation).
+        """
+        import os as _os
+        comms_path = self.peer_dir / "comms"
+        try:
+            comms_fd = _open_dir_fd_no_symlink(comms_path)
+        except FileNotFoundError:
             return []
-        return sorted(d.glob("[0-9][0-9][0-9][0-9]-*.md"))
+        try:
+            inbox_dirname = f"{sender}-to-{receiver}"
+            inbox_display = comms_path / inbox_dirname
+            # Pre-flight lstat so we can give a specific symlinked-inbox
+            # error rather than the generic ELOOP/ENOTDIR that O_NOFOLLOW
+            # surfaces (callers and tests key off the message text).
+            try:
+                pre = _os.stat(
+                    inbox_dirname, dir_fd=comms_fd, follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return []
+            import stat as _stat
+            if _stat.S_ISLNK(pre.st_mode):
+                raise OSError(
+                    f"refusing symlinked inbox path: {inbox_display}"
+                )
+            flags = _os.O_RDONLY
+            flags |= getattr(_os, "O_DIRECTORY", 0)
+            flags |= getattr(_os, "O_NOFOLLOW", 0)
+            flags |= getattr(_os, "O_CLOEXEC", 0)
+            try:
+                inbox_fd = _os.open(inbox_dirname, flags, dir_fd=comms_fd)
+            except FileNotFoundError:
+                return []
+            except OSError as e:
+                # ELOOP or ENOTDIR after our pre-flight passed means a
+                # late swap raced us; re-stat to confirm and re-raise as
+                # the canonical symlinked-inbox refusal.
+                try:
+                    post = _os.stat(
+                        inbox_dirname, dir_fd=comms_fd, follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    return []
+                if _stat.S_ISLNK(post.st_mode):
+                    raise OSError(
+                        f"refusing symlinked inbox path: {inbox_display}"
+                    ) from e
+                raise
+            try:
+                inbox = self._inbox_dir(sender, receiver)
+                return sorted(
+                    inbox / n for n in _os.listdir(inbox_fd)
+                    if (
+                        len(n) >= 5
+                        and n[:4].isdigit()
+                        and n[4] == "-"
+                        and n.endswith(".md")
+                    )
+                )
+            finally:
+                _os.close(inbox_fd)
+        finally:
+            _os.close(comms_fd)
 
     def archive(self, path: Path) -> None:
         """Move a consumed message to the archive.
@@ -244,29 +330,79 @@ class HybridCommLayer:
         would clobber the second on rename. Namespace the archive by
         the source inbox directory name so cross-direction collisions
         are impossible.
+
+        BUG-186: source and destination are both opened via no-follow
+        dir-fd chains; the rename uses ``src_dir_fd``/``dst_dir_fd`` so
+        a swapped inbox or archive directory cannot redirect the
+        operation through a symlink.
         """
-        a = self._archive_dir()
-        _ensure_private_dir(self.peer_dir)
-        _ensure_private_dir(self.peer_dir / "comms")
-        _ensure_private_dir(a)
+        import os as _os
+        # refuse to archive out of a symlinked source inbox.
+        if path.parent is not None and path.parent.is_symlink():
+            raise OSError(
+                f"refusing to archive from symlinked inbox: {path.parent}"
+            )
         # Source inbox dirname (e.g. "claude-to-codex") becomes the
         # archive subdir; keep filename intact for forensics.
         inbox_name = path.parent.name if path.parent is not None else ""
-        dest_dir = (a / inbox_name) if inbox_name else a
-        _ensure_private_dir(dest_dir)
-        target = dest_dir / path.name
-        if target.exists():
-            # Belt-and-braces: even within the same inbox, NNNN reuse
-            # could happen after a manual cleanup. Append a numeric
-            # suffix so we never overwrite history.
-            n = 1
-            while True:
-                candidate = dest_dir / f"{path.stem}.{n}{path.suffix}"
-                if not candidate.exists():
-                    target = candidate
-                    break
-                n += 1
+        if not inbox_name:
+            # Fall back to the legacy path-based rename for paths without
+            # a parent name; safe_io still ensures private dirs.
+            a = self._archive_dir()
+            _ensure_private_dir(self.peer_dir)
+            _ensure_private_dir(self.peer_dir / "comms")
+            _ensure_private_dir(a)
+            target = a / path.name
+            try:
+                path.rename(target)
+            except FileNotFoundError:
+                pass
+            return
+        # Open src inbox and dst archive subdir under no-follow chains.
         try:
-            path.rename(target)
+            src_fd = _open_private_nested_dir_fd_no_symlink(
+                self.peer_dir, ("comms", inbox_name),
+            )
         except FileNotFoundError:
-            pass
+            return
+        try:
+            dst_fd = _open_private_nested_dir_fd_no_symlink(
+                self.peer_dir, ("comms", "archive", inbox_name),
+            )
+            try:
+                target_name = path.name
+                try:
+                    target_st = _os.stat(
+                        target_name, dir_fd=dst_fd, follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    target_st = None
+                if target_st is not None:
+                    n = 1
+                    stem, dot, suffix = path.name.rpartition(".")
+                    if not dot:
+                        stem, suffix = path.name, ""
+                    while True:
+                        candidate = (
+                            f"{stem}.{n}.{suffix}" if suffix
+                            else f"{stem}.{n}"
+                        )
+                        try:
+                            _os.stat(
+                                candidate, dir_fd=dst_fd, follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            target_name = candidate
+                            break
+                        n += 1
+                try:
+                    _os.rename(
+                        path.name, target_name,
+                        src_dir_fd=src_fd, dst_dir_fd=dst_fd,
+                    )
+                except FileNotFoundError:
+                    pass
+            finally:
+                _os.close(dst_fd)
+        finally:
+            _os.close(src_fd)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import threading
 import urllib.error
 import urllib.parse
@@ -14,6 +15,49 @@ from typing import Callable, Mapping
 from auth_proxy.oauth_refresh import OAuthRefreshError, load_claude_oauth
 from auth_proxy.oauth_refresh import refresh_claude_config
 
+# bound request body, response body, and concurrent connections
+# so a peer-controlled workspace cannot exhaust sidecar memory or thread
+# count via a huge POST body, a mocked upstream that returns gigabytes,
+# or a fan-out of slow connections.
+_DEFAULT_MAX_REQUEST_BYTES = 16 * 1024 * 1024   # 16 MiB
+_DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024  # 32 MiB
+_DEFAULT_MAX_CONCURRENT = 16
+_REQUEST_BYTES_ENV = "AUTH_PROXY_MAX_REQUEST_BYTES"
+_RESPONSE_BYTES_ENV = "AUTH_PROXY_MAX_RESPONSE_BYTES"
+_CONCURRENT_ENV = "AUTH_PROXY_MAX_CONCURRENT"
+# bound the socket-level read timeout so slowloris-style
+# trickle-the-headers cannot hold a request handler thread for the
+# entire upstream timeout (120 s). The upstream forwarder uses a
+# separate, longer timeout passed via AuthProxyHandler.timeout-not.
+_DEFAULT_SOCKET_TIMEOUT_SECONDS = 30.0
+_SOCKET_TIMEOUT_ENV = "AUTH_PROXY_SOCKET_TIMEOUT_SECONDS"
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+class _ResponseTooLarge(RuntimeError):
+    """Upstream / OAuth-error body exceeded the configured response cap."""
+
 
 _HOP_BY_HOP_HEADERS = {
     "connection",
@@ -25,7 +69,14 @@ _HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
-_DROP_REQUEST_HEADERS = _HOP_BY_HOP_HEADERS | {"host", "authorization"}
+# strip Content-Length from forwarded request headers so urllib
+# computes it from the actual body. Otherwise a duplicate or truncated
+# body produces a body shorter than the declared length and ties an
+# upstream worker waiting for the missing bytes until the upstream
+# timeout fires.
+_DROP_REQUEST_HEADERS = _HOP_BY_HOP_HEADERS | {
+    "host", "authorization", "content-length",
+}
 _DROP_RESPONSE_HEADERS = _HOP_BY_HOP_HEADERS | {"content-length"}
 
 
@@ -82,6 +133,17 @@ def _upstream_url(upstream_base: str, path: str) -> str:
     ))
 
 
+def _read_bounded(stream, cap: int) -> bytes:
+    """Read up to ``cap`` bytes from ``stream``; raise _ResponseTooLarge
+    if more are available."""
+    data = stream.read(cap + 1)
+    if len(data) > cap:
+        raise _ResponseTooLarge(
+            f"upstream response exceeded {cap} bytes cap"
+        )
+    return data
+
+
 def _send_once(
     method: str,
     url: str,
@@ -90,6 +152,7 @@ def _send_once(
     *,
     opener: Callable,
     timeout: float,
+    response_cap: int = _DEFAULT_MAX_RESPONSE_BYTES,
 ) -> ProxyResponse:
     request = urllib.request.Request(
         url,
@@ -99,16 +162,28 @@ def _send_once(
     )
     try:
         with opener(request, timeout=timeout) as response:
+            try:
+                payload = _read_bounded(response, response_cap)
+            except _ResponseTooLarge as e:
+                return ProxyResponse(
+                    status=502,
+                    headers={"Content-Type": "text/plain; charset=utf-8"},
+                    body=str(e).encode("utf-8", errors="replace"),
+                )
             return ProxyResponse(
                 status=int(response.status),
                 headers=_clean_response_headers(dict(response.headers)),
-                body=response.read(),
+                body=payload,
             )
     except urllib.error.HTTPError as e:
+        try:
+            err_body = _read_bounded(e, response_cap)
+        except _ResponseTooLarge:
+            err_body = b"upstream error body exceeded response cap"
         return ProxyResponse(
             status=int(e.code),
             headers=_clean_response_headers(dict(e.headers)),
-            body=e.read(),
+            body=err_body,
         )
     except urllib.error.URLError as e:
         message = f"upstream request failed: {e.reason}".encode(
@@ -140,60 +215,124 @@ def forward_request(
     upstream_base: str = "https://api.anthropic.com",
     opener: Callable = urllib.request.urlopen,
     timeout: float = 120.0,
+    response_cap: int = _DEFAULT_MAX_RESPONSE_BYTES,
 ) -> ProxyResponse:
     clean_headers = _clean_request_headers(headers)
     clean_headers["Authorization"] = f"Bearer {token_store.access_token()}"
     url = _upstream_url(upstream_base, path)
     first = _send_once(
         method, url, clean_headers, body, opener=opener, timeout=timeout,
+        response_cap=response_cap,
     )
     if first.status != 401 or not token_store.refresh():
         return first
     clean_headers["Authorization"] = f"Bearer {token_store.access_token()}"
     return _send_once(
         method, url, clean_headers, body, opener=opener, timeout=timeout,
+        response_cap=response_cap,
     )
 
 
 class AuthProxyHandler(BaseHTTPRequestHandler):
     token_store: ClaudeTokenStore
     upstream_base = "https://api.anthropic.com"
-    timeout = 120.0
+    # `timeout` is what StreamRequestHandler.setup() pushes
+    # onto self.connection.settimeout(), so it caps every rfile
+    # read (headers + body). Keep it short to defeat slowloris;
+    # the upstream forwarder uses `upstream_timeout` separately.
+    timeout = _DEFAULT_SOCKET_TIMEOUT_SECONDS
+    upstream_timeout = 120.0
+    max_request_bytes = _DEFAULT_MAX_REQUEST_BYTES
+    max_response_bytes = _DEFAULT_MAX_RESPONSE_BYTES
 
     def _handle_proxy(self) -> None:
+        # cap concurrent in-flight requests so a peer cannot fan
+        # out enough connections to exhaust the sidecar's thread / FD
+        # budget. Semaphore is shared across all threads of the bound
+        # server class; if it can't be acquired without blocking we fail
+        # fast with 503 rather than queue indefinitely.
+        sem: threading.BoundedSemaphore | None = getattr(
+            self.server, "auth_proxy_semaphore", None,
+        )
+        acquired = False
+        if sem is not None:
+            acquired = sem.acquire(blocking=False)
+            if not acquired:
+                self.send_error(503, "auth proxy concurrency cap reached")
+                return
         try:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-        except ValueError:
-            self.send_error(400, "invalid Content-Length")
-            return
-        if length < 0:
-            self.send_error(400, "invalid Content-Length")
-            return
-        body = self.rfile.read(length) if length > 0 else b""
-        try:
-            response = forward_request(
-                self.command,
-                self.path,
-                self.headers,
-                body,
-                self.token_store,
-                upstream_base=self.upstream_base,
-                timeout=self.timeout,
+            # a request that arrives with two conflicting
+            # Content-Length values is an HTTP smuggling / framing error
+            # (RFC 9112 §6.3). self.headers is an HTTPMessage and
+            # get_all() reveals duplicates; dict-like fallback (test
+            # harnesses) just returns the single value.
+            cl_all = (
+                self.headers.get_all("Content-Length")
+                if hasattr(self.headers, "get_all") else None
             )
-        except OAuthRefreshError as e:
-            message = str(e).encode("utf-8", errors="replace")
-            self.send_response(502)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(message)))
+            if cl_all is not None and len(cl_all) > 1:
+                # Multiple values can legally be a comma-separated list
+                # iff every part is identical; mismatch is rejected.
+                parts = {p.strip() for v in cl_all for p in v.split(",")}
+                if len(parts) > 1:
+                    self.send_error(400, "conflicting Content-Length")
+                    return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                self.send_error(400, "invalid Content-Length")
+                return
+            if length < 0:
+                self.send_error(400, "invalid Content-Length")
+                return
+            if length > self.max_request_bytes:
+                self.send_error(
+                    413,
+                    f"request body exceeds {self.max_request_bytes}-byte cap",
+                )
+                return
+            # even with a sane Content-Length header, the actual
+            # bytes on the wire could exceed it. self.rfile.read(length)
+            # already caps by length, so the header check above is
+            # sufficient — but we re-bound the read with an explicit cap
+            # in case length is set to a huge legal value (e.g. exactly
+            # max_request_bytes) we still don't want to allocate beyond.
+            body = (
+                self.rfile.read(min(length, self.max_request_bytes))
+                if length > 0 else b""
+            )
+            try:
+                response = forward_request(
+                    self.command,
+                    self.path,
+                    self.headers,
+                    body,
+                    self.token_store,
+                    upstream_base=self.upstream_base,
+                    timeout=self.upstream_timeout,
+                    response_cap=self.max_response_bytes,
+                )
+            except OAuthRefreshError as e:
+                message = str(e).encode("utf-8", errors="replace")
+                # Bound the OAuth error message too — exception strings
+                # can include the upstream body in obscure error paths.
+                if len(message) > self.max_response_bytes:
+                    message = message[:self.max_response_bytes]
+                self.send_response(502)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(message)))
+                self.end_headers()
+                self.wfile.write(message)
+                return
+            self.send_response(response.status)
+            for key, value in response.headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(response.body)))
             self.end_headers()
-            self.wfile.write(message)
-            return
-        self.send_response(response.status)
-        for key, value in response.headers.items():
-            self.send_header(key, value)
-        self.send_header("Content-Length", str(len(response.body)))
-        self.end_headers()
-        self.wfile.write(response.body)
+            self.wfile.write(response.body)
+        finally:
+            if acquired and sem is not None:
+                sem.release()
 
     def do_GET(self) -> None:
         self._handle_proxy()
@@ -215,20 +354,93 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
 
+class _AuthProxyThreadingHTTPServer(ThreadingHTTPServer):
+    """BUG-159: enforce the concurrency cap at accept time so
+    slowloris-style attackers cannot hold one thread per stalled
+    connection before the in-handler semaphore would gate them.
+
+    `process_request` runs on the accept thread; we acquire the
+    accept semaphore non-blocking and refuse the new connection
+    when the cap is full. The slot is released at the end of the
+    spawned handler thread.
+    """
+
+    daemon_threads = True
+
+    def process_request(self, request, client_address):  # type: ignore[override]
+        sem = getattr(self, "auth_proxy_accept_semaphore", None)
+        if sem is not None and not sem.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 0\r\n\r\n",
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):  # type: ignore[override]
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            sem = getattr(self, "auth_proxy_accept_semaphore", None)
+            if sem is not None:
+                try:
+                    sem.release()
+                except ValueError:
+                    # BoundedSemaphore release > capacity raises;
+                    # swallow so a refusal path that already
+                    # released doesn't crash the accept loop.
+                    pass
+
+
 def make_server(
     *,
     host: str,
     port: int,
     token_file: Path,
     upstream_base: str = "https://api.anthropic.com",
+    max_request_bytes: int | None = None,
+    max_response_bytes: int | None = None,
+    max_concurrent: int | None = None,
+    socket_timeout: float | None = None,
 ) -> ThreadingHTTPServer:
     class BoundAuthProxyHandler(AuthProxyHandler):
         bound_handler = True
 
     BoundAuthProxyHandler.token_store = ClaudeTokenStore(token_file)
     BoundAuthProxyHandler.upstream_base = upstream_base
+    if max_request_bytes is None:
+        max_request_bytes = _positive_int_env(
+            _REQUEST_BYTES_ENV, _DEFAULT_MAX_REQUEST_BYTES,
+        )
+    if max_response_bytes is None:
+        max_response_bytes = _positive_int_env(
+            _RESPONSE_BYTES_ENV, _DEFAULT_MAX_RESPONSE_BYTES,
+        )
+    if max_concurrent is None:
+        max_concurrent = _positive_int_env(
+            _CONCURRENT_ENV, _DEFAULT_MAX_CONCURRENT,
+        )
+    if socket_timeout is None:
+        socket_timeout = _positive_float_env(
+            _SOCKET_TIMEOUT_ENV, _DEFAULT_SOCKET_TIMEOUT_SECONDS,
+        )
+    BoundAuthProxyHandler.max_request_bytes = max_request_bytes
+    BoundAuthProxyHandler.max_response_bytes = max_response_bytes
+    BoundAuthProxyHandler.timeout = socket_timeout
 
-    return ThreadingHTTPServer((host, port), BoundAuthProxyHandler)
+    srv = _AuthProxyThreadingHTTPServer((host, port), BoundAuthProxyHandler)
+    # In-handler cap — protects against slow-handler exhaustion
+    # AFTER headers parse; refuses with 503 from within _handle_proxy.
+    srv.auth_proxy_semaphore = threading.BoundedSemaphore(max_concurrent)
+    # Accept-time cap — protects against slowloris by refusing
+    # new connections at the accept thread BEFORE a worker is spawned.
+    srv.auth_proxy_accept_semaphore = threading.BoundedSemaphore(max_concurrent)
+    return srv
 
 
 def main(argv: list[str] | None = None) -> int:

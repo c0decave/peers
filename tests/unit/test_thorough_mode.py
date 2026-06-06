@@ -183,6 +183,27 @@ def test_thorough_gate_respects_config_override(tmp_path: Path):
     assert "3/5" in result.stdout
 
 
+def test_convergence_reached_refuses_symlinked_config_BUG_195(tmp_path: Path):
+    """BUG-195: config.yaml must not be read through a project symlink."""
+    peers_dir = tmp_path / ".peers"
+    peers_dir.mkdir()
+    (peers_dir / "state.json").write_text(json.dumps(
+        {"schema_version": 2, "consecutive_clean_ticks": 1}
+    ))
+    real_config = tmp_path / "outside-config.yaml"
+    real_config.write_text("goals:\n  convergence_n: 1\n")
+    (peers_dir / "config.yaml").symlink_to(real_config)
+
+    result = subprocess.run(
+        [sys.executable, str(_convergence_script()), str(tmp_path)],
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "config.yaml unreadable" in result.stdout
+    assert "clean" not in result.stdout
+
+
 # --- Integration: orchestrator hook persists the counter (test 7) -----------
 
 

@@ -16,6 +16,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from peers.safe_io import (
+    _ensure_private_dir,
+    atomic_write_text_in_dir_no_symlink,
+)
+
 
 def _handoff_msg_path(project_root: Path) -> Path:
     return Path(project_root) / ".peers" / "handoff-msg.txt"
@@ -27,10 +32,15 @@ def write_handoff_msg(project_root: Path, text: str) -> Path:
     Older experiments wrote a root-level ``.handoff-msg.txt`` which then
     showed up as untracked work. This helper keeps the scratch file in
     the control directory where it belongs.
+
+    BUG-183: the leaf write goes through the no-follow atomic writer so a
+    same-user symlink planted at ``.peers/handoff-msg.txt`` (or a swapped
+    ``.peers`` directory) cannot redirect the substrate scratch to another
+    file.
     """
     path = _handoff_msg_path(project_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    _ensure_private_dir(path.parent)
+    atomic_write_text_in_dir_no_symlink(path, text)
     return path
 
 

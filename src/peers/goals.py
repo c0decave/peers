@@ -15,7 +15,10 @@ from typing import Any
 
 import yaml
 
-from peers.safe_io import read_bytes_no_symlink, read_text_no_symlink
+from peers.safe_io import (
+    read_bytes_no_symlink,
+    read_text_under_root_no_follow,
+)
 
 
 VALID_REVIEWER_MODES = ("other", "both", "alternating", "quorum")
@@ -345,24 +348,28 @@ def _make_env(ctx: dict[str, Any]) -> dict[str, Any]:
         # Security: clamp json() to files inside the target repo. An
         # attacker-influenced pass_when otherwise reads /etc/passwd or
         # any other JSON-shaped file on the host.
-        if Path(rel_path).is_absolute():
+        rel = Path(rel_path)
+        if rel.is_absolute():
             raise ValueError(
                 f"json() requires a relative path, got {rel_path!r}"
             )
-        raw_target = cwd / rel_path
-        if raw_target.is_symlink():
-            raise OSError(f"refusing to read symlink: {raw_target}")
-        target = raw_target.resolve()
-        try:
-            target.relative_to(cwd_resolved)
-        except ValueError as e:
+        # read_text_no_symlink only protects the leaf — the
+        # kernel still resolves every parent. Reject ``..``/empty parts
+        # and then walk each ancestor with O_NOFOLLOW so a same-user
+        # symlink swap on any intermediate dir cannot redirect the read
+        # outside ``cwd_resolved``.
+        parts = tuple(rel.parts)
+        if not parts or any(p in ("", ".", "..") for p in parts):
             raise ValueError(
-                f"json() escapes target dir: {rel_path!r} resolved to "
-                f"{target}, which is outside {cwd_resolved}"
-            ) from e
-        raw = read_text_no_symlink(
-            raw_target, max_bytes=_MAX_DSL_JSON_BYTES + 1
-        )
+                f"json() rejects path with empty or parent components: "
+                f"{rel_path!r}"
+            )
+        try:
+            raw = read_text_under_root_no_follow(
+                cwd_resolved, parts, max_bytes=_MAX_DSL_JSON_BYTES + 1,
+            )
+        except OSError:
+            raise
         if len(raw.encode("utf-8", errors="replace")) > _MAX_DSL_JSON_BYTES:
             raise ValueError(
                 f"json() file too large (>{_MAX_DSL_JSON_BYTES} bytes): "

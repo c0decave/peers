@@ -876,14 +876,17 @@ def parse_runtime_duration(text: str) -> tuple[int, bool]:
     return seconds, additive
 
 
-def cmd_ack_block(name: str, step_id: str, reason: str) -> int:
+def cmd_ack_block(
+    name: str, step_id: str, reason: str,
+    config_dir: Path | None = None,
+) -> int:
     """Task 7.3: transition a step's ``[BLOCKED]`` marker to
     ``[BLOCKED-ACK]`` in ``<project>/PLAN.md`` and append a hash-chained
     audit entry to ``<project>/.peers/blocks.log``.
 
     Errors (exit 1) when:
-      * project name is invalid or no such project under
-        ``$PEERS_PROJECTS_ROOT`` (exit 2 for name-validation failure
+      * project name is invalid or no such project under the registry
+        / ``$PEERS_PROJECTS_ROOT`` (exit 2 for name-validation failure
         to keep symmetry with the rest of the CLI).
       * STEP-N is not present in PLAN.md.
       * STEP-N is not currently in the ``[BLOCKED]`` state.
@@ -893,13 +896,18 @@ def cmd_ack_block(name: str, step_id: str, reason: str) -> int:
     only the marker substring. PLAN.md's other lines are preserved
     byte-for-byte. Mirrors the :func:`peers_ctl.contracts.amend_acceptance`
     log format: ``<chain16> <iso8601> ack-block STEP-N | reason: <text>``.
+
+    BUG-192: looks up the project through the Store before falling back
+    to ``projects_root() / name`` so projects registered via
+    ``peers-ctl add --name X /abs/path`` work the same as start, status,
+    logs, resume, compare, and replay.
     """
     try:
         validate_project_name(name)
     except ValueError as e:
         print(f"peers-ctl: {e}", file=sys.stderr)
         return 2
-    proj_dir = projects_root() / name
+    proj_dir = _resolve_project_dir(name, config_dir)
     if not proj_dir.is_dir():
         print(f"peers-ctl: no such project: {name}", file=sys.stderr)
         return 1
@@ -973,9 +981,12 @@ def cmd_ack_block(name: str, step_id: str, reason: str) -> int:
         f"{timestamp} ack-block {step_id} | reason: {reason}\n"
     )
     prev = "genesis"
-    if log_path.is_file():
+    # read/append must refuse symlinks at .peers/blocks.log
+    # so a project-controlled symlink cannot redirect the operator's
+    # audit-log append outside the project or poison the chain prev.
+    if not log_path.is_symlink() and log_path.is_file():
         try:
-            with log_path.open("r", encoding="utf-8") as f:
+            with open_text_read_no_symlink(log_path) as f:
                 for log_line in f:
                     log_line = log_line.rstrip("\n")
                     if not log_line:
@@ -985,11 +996,17 @@ def cmd_ack_block(name: str, step_id: str, reason: str) -> int:
         except OSError as e:
             print(f"peers-ctl: cannot read {log_path}: {e}", file=sys.stderr)
             return 1
+    elif log_path.is_symlink():
+        print(
+            f"peers-ctl: refusing to follow symlink at {log_path}",
+            file=sys.stderr,
+        )
+        return 1
     chain_prefix = hashlib.sha256(
         (prev + entry_text).encode("utf-8")
     ).hexdigest()[:16]
     try:
-        with log_path.open("a", encoding="utf-8") as f:
+        with open_text_in_dir_no_symlink(plan_dir, "blocks.log", "a") as f:
             f.write(f"{chain_prefix} {entry_text}")
     except OSError as e:
         print(f"peers-ctl: cannot append to {log_path}: {e}",
@@ -1000,25 +1017,33 @@ def cmd_ack_block(name: str, step_id: str, reason: str) -> int:
     return 0
 
 
-def cmd_amend(name: str, acceptance: str, reason: str) -> int:
+def cmd_amend(
+    name: str, acceptance: str, reason: str,
+    config_dir: Path | None = None,
+) -> int:
     """Legitimate-escape: re-pin the frozen acceptance command.
 
-    For implement-mode projects only. Looks up
-    ``<projects_root>/<name>/.peers/``, verifies it's an implement-mode
-    project (has ``contracts.sha``), then calls
+    For implement-mode projects only. Looks up the project (registry
+    first, then ``$PEERS_PROJECTS_ROOT/<name>``), verifies it's an
+    implement-mode project (has ``contracts.sha``), then calls
     :func:`peers_ctl.contracts.amend_acceptance` which rewrites
     ``acceptance.sh``, re-pins its SHA, and appends a hash-chained audit
     line to ``contracts.log``. After the amendment, verifies contracts
     are self-consistent.
 
     Errors go to stderr with exit 1; no traceback.
+
+    BUG-192: prior to this, projects registered with
+    ``peers-ctl add --name X /abs/path`` could not use this command —
+    it only looked under ``projects_root()/X``. The Store lookup brings
+    it in line with start/status/logs/resume/compare/replay.
     """
     try:
         validate_project_name(name)
     except ValueError as e:
         print(f"peers-ctl: {e}", file=sys.stderr)
         return 2
-    proj_dir = projects_root() / name
+    proj_dir = _resolve_project_dir(name, config_dir)
     if not proj_dir.is_dir():
         print(f"peers-ctl: no such project: {name}", file=sys.stderr)
         return 1
@@ -1760,10 +1785,24 @@ def cmd_status(name: str | None = None,
     if (inner / "state.json").exists():
         print()
         print("--- peers status ---")
-        subprocess.run(
-            ["peers", "-C", p.path, "status"],
-            check=False,
-        )
+        # container-oriented hosts can have peers-ctl + podman
+        # without a host `peers` binary on PATH. Don't let a missing
+        # executable crash the whole status command; report it as a
+        # warning so the registry portion above still reaches the
+        # operator.
+        try:
+            subprocess.run(
+                ["peers", "-C", p.path, "status"],
+                check=False,
+            )
+        except FileNotFoundError:
+            print(
+                "peers-ctl: warning: `peers` binary not on PATH; "
+                "registry status above is authoritative. Install the "
+                "host peers package or run via container to see "
+                "embedded `.peers/state.json` status.",
+                file=sys.stderr,
+            )
     return 0
 
 
@@ -2367,9 +2406,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                        peer_provider=args.peer_provider,
                        config_dir=cd)
     if args.cmd == "ack-block":
-        return cmd_ack_block(args.project_name, args.step_id, args.reason)
+        return cmd_ack_block(
+            args.project_name, args.step_id, args.reason, config_dir=cd,
+        )
     if args.cmd == "amend":
-        return cmd_amend(args.project_name, args.acceptance, args.reason)
+        return cmd_amend(
+            args.project_name, args.acceptance, args.reason, config_dir=cd,
+        )
     if args.cmd == "remove":
         return cmd_remove(args.name, cd)
     if args.cmd == "list":

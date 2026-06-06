@@ -36,9 +36,16 @@ def main(project_dir: str = ".") -> int:
     repo = Path(project_dir).resolve()
     try:
         summary = bug_hunt.summarize(repo)
-    except Exception as e:  # pragma: no cover - defensive: never crash the loop
-        print(f"no-open-bug-reports: clean (ledger unavailable: {e})")
-        return 0
+    except Exception as e:
+        # fail closed. A corrupt or unreadable ledger means
+        # the gate cannot verify cleanliness; returning 0 here would
+        # let any open blocking bug slip through convergence.
+        print(
+            f"no-open-bug-reports FAIL: ledger unavailable ({e!r}); "
+            "cannot verify convergence",
+            file=sys.stderr,
+        )
+        return 1
 
     if summary.open_blocking_count == 0:
         print("no-open-bug-reports: clean (no open blocking bug-reports)")

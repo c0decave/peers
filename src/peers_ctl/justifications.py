@@ -46,7 +46,13 @@ not in scope (plan_dir is per-project, exclusive to one substrate).
 from __future__ import annotations
 
 import hashlib
+import stat
 from pathlib import Path
+
+from peers.safe_io import (
+    open_text_in_dir_no_symlink,
+    read_text_no_symlink,
+)
 
 __all__ = [
     "JustificationError",
@@ -78,18 +84,44 @@ def _chain_prefix(prev: str, entry_text: str) -> str:
     ]
 
 
+_MAX_LOG_BYTES = 16 * 1024 * 1024
+
+
+def _read_log_text_no_symlink(log_path: Path) -> str | None:
+    """Return the log contents, or ``None`` if the log does not exist.
+
+    BUG-197 defense: a symlinked leaf is rejected by ``read_text_no_
+    symlink`` (raises OSError). We pre-check via ``lstat`` so an
+    attacker-planted symlink raises :class:`JustificationError`, while
+    a genuinely-missing file returns ``None``. The size cap bounds the
+    amount of attacker-influenced data we'll read into the gate path.
+    """
+    try:
+        st = log_path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        raise JustificationError(
+            f"refusing symlinked justifications log: {log_path}",
+        )
+    if not stat.S_ISREG(st.st_mode):
+        raise JustificationError(
+            f"refusing non-regular justifications log: {log_path}",
+        )
+    return read_text_no_symlink(log_path, max_bytes=_MAX_LOG_BYTES)
+
+
 def _previous_chain_value(log_path: Path) -> str:
     """Return the previous chain prefix, or the genesis seed for line one."""
-    if not log_path.is_file():
+    text = _read_log_text_no_symlink(log_path)
+    if text is None:
         return _HASH_CHAIN_SEED
     last_prefix: str | None = None
-    with log_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            prefix, _, _ = line.partition(" ")
-            last_prefix = prefix
+    for line in text.splitlines():
+        if not line:
+            continue
+        prefix, _, _ = line.partition(" ")
+        last_prefix = prefix
     return last_prefix if last_prefix is not None else _HASH_CHAIN_SEED
 
 
@@ -163,7 +195,10 @@ def append_justification(
     entry_text = f"{file_path}:{line_number} {reviewer_peer} {reason}\n"
     prev = _previous_chain_value(log_path)
     chain = _chain_prefix(prev, entry_text)
-    with log_path.open("a", encoding="utf-8") as f:
+    # use the no-symlink helper (O_NOFOLLOW on parent dir-fd
+    # AND on leaf open) so a same-UID peer cannot redirect appends
+    # into an external file via a symlinked log leaf.
+    with open_text_in_dir_no_symlink(plan_dir, _LOG_FILENAME, "a") as f:
         f.write(f"{chain} {entry_text}")
 
 
@@ -185,19 +220,18 @@ def is_justified(
     time). Doing so on every query would be O(n*m) and noisy.
     """
     log_path = plan_dir / _LOG_FILENAME
-    if not log_path.is_file():
+    text = _read_log_text_no_symlink(log_path)
+    if text is None:
         return (False, None)
-    with log_path.open("r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.rstrip("\n")
-            if not line:
-                continue
-            parsed = _parse_entry(line)
-            if parsed is None:
-                continue
-            _chain, fpath, lno, reviewer, _reason = parsed
-            if fpath == file_path and lno == line_number:
-                return (True, reviewer)
+    for line in text.splitlines():
+        if not line:
+            continue
+        parsed = _parse_entry(line)
+        if parsed is None:
+            continue
+        _chain, fpath, lno, reviewer, _reason = parsed
+        if fpath == file_path and lno == line_number:
+            return (True, reviewer)
     return (False, None)
 
 
@@ -222,36 +256,35 @@ def verify_log_chain(plan_dir: Path) -> None:
     single separating space (including the trailing newline).
     """
     log_path = plan_dir / _LOG_FILENAME
-    if not log_path.is_file():
+    text = _read_log_text_no_symlink(log_path)
+    if text is None:
         return
     prev = _HASH_CHAIN_SEED
-    with log_path.open("r", encoding="utf-8") as f:
-        for lineno, raw in enumerate(f, start=1):
-            line = raw.rstrip("\n")
-            if not line:
-                continue
-            chain, _, rest = line.partition(" ")
-            if not chain or not rest:
-                raise JustificationError(
-                    f"malformed entry on line {lineno}: {line!r}",
-                )
-            # Validate chain-prefix is hex of expected length
-            if len(chain) != _HASH_CHAIN_PREFIX_LEN:
-                raise JustificationError(
-                    f"chain prefix on line {lineno} has length "
-                    f"{len(chain)}, expected {_HASH_CHAIN_PREFIX_LEN}",
-                )
-            try:
-                int(chain, 16)
-            except ValueError as e:
-                raise JustificationError(
-                    f"chain prefix on line {lineno} is not hex: {chain!r}",
-                ) from e
-            entry_text = rest + "\n"
-            expected = _chain_prefix(prev, entry_text)
-            if chain != expected:
-                raise JustificationError(
-                    f"hash-chain broken on line {lineno}: "
-                    f"got {chain}, expected {expected}",
-                )
-            prev = chain
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line:
+            continue
+        chain, _, rest = line.partition(" ")
+        if not chain or not rest:
+            raise JustificationError(
+                f"malformed entry on line {lineno}: {line!r}",
+            )
+        # Validate chain-prefix is hex of expected length
+        if len(chain) != _HASH_CHAIN_PREFIX_LEN:
+            raise JustificationError(
+                f"chain prefix on line {lineno} has length "
+                f"{len(chain)}, expected {_HASH_CHAIN_PREFIX_LEN}",
+            )
+        try:
+            int(chain, 16)
+        except ValueError as e:
+            raise JustificationError(
+                f"chain prefix on line {lineno} is not hex: {chain!r}",
+            ) from e
+        entry_text = rest + "\n"
+        expected = _chain_prefix(prev, entry_text)
+        if chain != expected:
+            raise JustificationError(
+                f"hash-chain broken on line {lineno}: "
+                f"got {chain}, expected {expected}",
+            )
+        prev = chain

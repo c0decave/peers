@@ -62,6 +62,7 @@ _TDD_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_SCHEME_KEYS = {"http", "https", "ftp", "ftps", "ssh", "file", "ws", "wss"}
+_TDD_WAIVER_REASON_MIN = 40
 
 
 @dataclass
@@ -586,11 +587,76 @@ def gate_pass(repo: Path) -> tuple[bool, str]:
     return s.is_clean(), format_summary(s)
 
 
+_TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?/|test_[^/]+\.py$|[^/]+_test\.py$|"
+    r"[^/]*\.test\.[a-z0-9]+$)"
+)
+
+
+def _commit_touches_test_path(repo: Path, sha: str) -> bool:
+    """BUG-161 helper: True iff `sha` touched at least one path that
+    looks like a test artifact. Used to reject trailer-only reproduce
+    commits that carry no test evidence (empty diff or only doc/src
+    changes)."""
+    try:
+        out = _git(repo, "show", "--name-only", "--format=", sha)
+    except subprocess.CalledProcessError:
+        return False
+    for line in out.splitlines():
+        line = line.strip()
+        if line and _TEST_PATH_RE.search(line):
+            return True
+    return False
+
+
+def _json_mentions_bug(value: object, bid: str) -> bool:
+    if value == bid:
+        return True
+    if isinstance(value, list):
+        return bid in {str(v) for v in value}
+    return False
+
+
+def _tdd_waivers(repo: Path) -> dict[str, tuple[str, str]]:
+    """Return explicit historical TDD waivers by bug id.
+
+    A waiver is intentionally not a bare trailer loophole: it must carry a
+    Peer trailer and a JSON block whose id/ids/waives field names the bug,
+    plus a substantive reason. Newest valid waiver wins.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    for sha, body in list_commits(repo):
+        trailers = parse_commit_trailers(body)
+        bids = trailers.get("Bug-Reproduce-Waive", [])
+        if not bids or not trailers.get("Peer"):
+            continue
+        json_block = _first_json_block(body)
+        if not isinstance(json_block, dict):
+            continue
+        reason = str(json_block.get("reason") or json_block.get("note") or "")
+        if len(reason.strip()) < _TDD_WAIVER_REASON_MIN:
+            continue
+        for bid in bids:
+            if not (
+                _json_mentions_bug(json_block.get("id"), bid)
+                or _json_mentions_bug(json_block.get("ids"), bid)
+                or _json_mentions_bug(json_block.get("waives"), bid)
+            ):
+                continue
+            out.setdefault(bid, (sha, reason))
+    return out
+
+
 def gate_tdd_pass(repo: Path) -> tuple[bool, str]:
     """Helper for the optional `tdd-reproduces-bug` hard gate. Returns
     (pass?, diagnostic). Pass iff every Bug-Resolves with status=fixed
     at a blocking severity has at least one Bug-Reproduce commit that
-    landed BEFORE the resolve (i.e. the test was committed first).
+
+      (a) landed BEFORE the resolve (the test was committed first), AND
+      (b) actually touched a test path: trailer-only commits
+          with no diff, or commits that only changed src/docs, do not
+          count as evidence that a failing test was added.
+
     Bugs deferred / wontfix / duplicate / invalid are not subject to
     this check — they were never fixed, so there's no fix to reproduce.
 
@@ -600,43 +666,79 @@ def gate_tdd_pass(repo: Path) -> tuple[bool, str]:
     histories where a reproduce commit lives on a side branch that was
     merged after the resolve will fail this gate — and that's the
     correct behavior: if the test wasn't on `main` at the time of fix,
-    the discipline wasn't followed."""
+    the discipline wasn't followed.
+
+    BUG-182: existing ledgers may carry historical fixes where the
+    reproduce-first evidence cannot be reordered into place without a
+    destructive history rewrite. Those require an explicit
+    Bug-Reproduce-Waive trailer with a substantive reason, and the waiver
+    must land after the fix it documents. Future fixes cannot be
+    pre-waived.
+    """
     s = summarize(repo)
     missing: list[str] = []
+    waived: list[str] = []
     # Build a sha→index map for "before" comparison. Newest = index 0.
     # `list_commits` is newest-first, so a commit's index is its
     # distance from HEAD. Lower index = NEWER.
     order = {sha: i for i, (sha, _body) in enumerate(list_commits(repo))}
+    waivers = _tdd_waivers(repo)
     for bid, rep in s.reports.items():
         if rep.severity not in BLOCKING_SEVERITIES:
             continue
         res = s.resolutions.get(bid)
         if res is None or res.status != "fixed":
             continue
+        resolve_idx = order.get(res.sha, -1)
         repros = s.reproductions.get(bid, [])
-        if not repros:
-            missing.append(
-                f"  {bid} ({rep.severity}, fixed in {res.sha[:8]}): "
-                "no Bug-Reproduce commit found"
+        # a Bug-Reproduce trailer is only credible when the
+        # commit it lives on actually touched a test path. Otherwise a
+        # peer can satisfy the gate with `git commit --allow-empty`.
+        evident = [r for r in repros if _commit_touches_test_path(repo, r.sha)]
+        if not evident:
+            waiver = waivers.get(bid)
+            if not repros and waiver is not None:
+                waiver_sha, _reason = waiver
+                waiver_idx = order.get(waiver_sha, -1)
+                if waiver_idx >= 0 and resolve_idx > waiver_idx:
+                    waived.append(bid)
+                    continue
+            if repros:
+                missing.append(
+                    f"  {bid} ({rep.severity}, fixed in {res.sha[:8]}): "
+                    "Bug-Reproduce commit(s) carry no test-path evidence "
+                    "(trailer-only, empty, or only touch non-test paths)"
+                )
+            else:
+                missing.append(
+                    f"  {bid} ({rep.severity}, fixed in {res.sha[:8]}): "
+                    "no Bug-Reproduce commit found"
             )
             continue
         # The earliest reproduce must be older (= higher index in our
         # newest-first iteration) than the resolve.
-        resolve_idx = order.get(res.sha, -1)
-        repro_indices = [order.get(r.sha, -1) for r in repros]
+        repro_indices = [order.get(r.sha, -1) for r in evident]
         earliest_repro = max(repro_indices) if repro_indices else -1
         if earliest_repro <= resolve_idx:
-            shas = ",".join(r.sha[:8] for r in repros)
+            shas = ",".join(r.sha[:8] for r in evident)
             missing.append(
                 f"  {bid} ({rep.severity}, fixed in {res.sha[:8]}): "
                 f"reproduce commit(s) [{shas}] are not OLDER than the "
                 "resolve — TDD-order broken (test landed with/after fix)"
             )
+    waived_note = (
+        "; waived historical fix(es): " + ", ".join(sorted(waived))
+        if waived else
+        ""
+    )
     head = (
         f"tdd-gate: {len(missing)} fix(es) without preceding reproduce"
         if missing else
-        f"tdd-gate: clean ({s.reproduced_count}/{sum(1 for r in s.resolutions.values() if r.status=='fixed')} fixes have reproduces)"
+        "tdd-gate: clean "
+        f"({s.reproduced_count} reproduced, {len(waived)} waived, "
+        f"{sum(1 for r in s.resolutions.values() if r.status=='fixed')} fixed)"
     )
+    head += waived_note
     if missing:
         return False, head + "\n" + "\n".join(missing)
     return True, head

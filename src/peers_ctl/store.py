@@ -30,6 +30,7 @@ _VALID_PROJECT_STATES = {
     "fresh", "stopped", "running", "crashed", "unknown",
 }
 _PROJECTS_REGISTRY_MAX_BYTES = 2 * 1024 * 1024
+_STOP_REASON_MAX_BYTES = 64 * 1024
 
 
 def default_config_dir() -> Path:
@@ -435,9 +436,14 @@ def _read_stop_reason(project: Project) -> str | None:
     """
     sentinel = Path(project.path) / ".peers" / "last-stop-reason.txt"
     try:
-        text = sentinel.read_text(errors="ignore")
+        raw = read_bytes_no_symlink(
+            sentinel, max_bytes=_STOP_REASON_MAX_BYTES + 1,
+        )
     except (OSError, ValueError):
         return None
+    if len(raw) > _STOP_REASON_MAX_BYTES:
+        return None
+    text = raw.decode("utf-8", errors="ignore")
     head = text.strip().split(None, 1)
     return head[0] if head else None
 

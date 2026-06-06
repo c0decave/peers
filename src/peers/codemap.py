@@ -15,8 +15,14 @@ from pathlib import Path
 
 import yaml
 
+from peers.safe_io import read_text_no_symlink
+
 _KINDS = {"module", "class", "function", "method"}
 _REQUIRED = ("id", "kind", "file", "line")
+# bounded reads for document-mode deliverables. Sized
+# generously — typical CODEMAP.yaml is well under 1 MiB.
+_CODEMAP_MAX_BYTES = 8 * 1024 * 1024
+_ARCHITECTURE_MAX_BYTES = 4 * 1024 * 1024
 
 
 class CodeMapError(Exception):
@@ -79,18 +85,47 @@ def _expected_key(e: Entry) -> str:
     return e.name
 
 
+def _resolve_in_tree(project_dir: Path, file_str: str) -> Path | None:
+    """Resolve `file_str` against `project_dir`, refusing absolute paths,
+    parent-traversal escapes, and anything that resolves outside the project
+    root. Returns None if the entry's file claim leaves the tree."""
+    fpath = Path(file_str)
+    if fpath.is_absolute():
+        return None
+    parts = fpath.parts
+    if any(p == ".." for p in parts):
+        return None
+    try:
+        resolved = (project_dir / fpath).resolve()
+        root = project_dir.resolve()
+    except OSError:
+        return None
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return None
+    return resolved
+
+
 def check_grounded(project_dir: Path, codemap: CodeMap) -> list[str]:
     """Return a list of ungrounded-entry messages (empty = clean).
 
-    An entry is grounded when its file exists and — for class/function/method
-    kinds — a symbol of that kind and name actually lives in that file. A
-    `module` entry only requires the file to exist. This is the anti-
-    fabrication core: a hallucinated or wrong-file symbol is reported.
+    An entry is grounded when its file exists in-tree, its declared `line`
+    matches the AST lineno of the symbol it points at (for class/function/
+    method kinds), and a symbol of that kind/name lives there. A `module`
+    entry only requires the file to exist in-tree. Absolute paths and `..`
+    escapes are rejected so a CODEMAP cannot claim `/etc/passwd` or
+    `../outside.py` and bypass the anti-fabrication moat.
     """
     project_dir = Path(project_dir)
     violations: list[str] = []
     for e in codemap.entries:
-        fpath = project_dir / e.file
+        fpath = _resolve_in_tree(project_dir, e.file)
+        if fpath is None:
+            violations.append(
+                f"{e.id}: file out of project tree: {e.file}"
+            )
+            continue
         if not fpath.is_file():
             violations.append(f"{e.id}: file not found: {e.file}")
             continue
@@ -104,6 +139,12 @@ def check_grounded(project_dir: Path, codemap: CodeMap) -> list[str]:
         if info is None or info.kind != e.kind:
             violations.append(
                 f"{e.id}: no {e.kind} `{e.name}` found in {e.file}"
+            )
+            continue
+        if e.line != info.lineno:
+            violations.append(
+                f"{e.id}: declared line {e.line} != actual {info.lineno} "
+                f"in {e.file}"
             )
     return violations
 
@@ -258,11 +299,15 @@ def check_architecture(project_dir: Path, codemap: CodeMap) -> list[str]:
     review`'s job — same division of labor as summaries-complete vs
     summaries-cross-review. A missing file = every subsystem uncovered (red)."""
     path = Path(project_dir) / ARCHITECTURE_FILE
+    # refuse symlinked deliverables and read through a
+    # bounded no-follow helper.
+    if path.is_symlink():
+        return [f"{ARCHITECTURE_FILE}: refusing symlinked deliverable"]
     if not path.is_file():
         return [f"{ARCHITECTURE_FILE}: missing "
                 "(a document-mode build seeds and fills it)"]
     try:
-        text = path.read_text(encoding="utf-8")
+        text = read_text_no_symlink(path, max_bytes=_ARCHITECTURE_MAX_BYTES)
     except OSError as e:
         return [f"{ARCHITECTURE_FILE}: unreadable: {e}"]
     violations: list[str] = []
@@ -313,8 +358,8 @@ def check_signatures(project_dir: Path, codemap: CodeMap) -> list[str]:
     for e in codemap.entries:
         if e.kind not in ("function", "method") or not e.signature:
             continue
-        fpath = project_dir / e.file
-        if not fpath.is_file():
+        fpath = _resolve_in_tree(project_dir, e.file)
+        if fpath is None or not fpath.is_file():
             continue
         idx = index_module(fpath)
         if idx is None:
@@ -362,10 +407,22 @@ def index_module(path: Path) -> dict[str, SymbolInfo] | None:
 def parse_codemap(path: Path) -> CodeMap:
     """Load + validate a CODEMAP.yaml. Raises CodeMapError on any problem."""
     path = Path(path)
+    # a symlinked CODEMAP can redirect the gate to an
+    # external file; refuse before any open.
+    if path.is_symlink():
+        raise CodeMapError(f"CODEMAP refusing symlinked path: {path}")
     if not path.is_file():
         raise CodeMapError(f"CODEMAP not found: {path}")
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        text = read_text_no_symlink(path, max_bytes=_CODEMAP_MAX_BYTES)
+    except OSError as e:
+        raise CodeMapError(f"CODEMAP unreadable: {e}") from e
+    if len(text.encode("utf-8")) >= _CODEMAP_MAX_BYTES:
+        raise CodeMapError(
+            f"CODEMAP exceeds {_CODEMAP_MAX_BYTES}-byte cap: {path}"
+        )
+    try:
+        data = yaml.safe_load(text) or {}
     except yaml.YAMLError as e:
         raise CodeMapError(f"CODEMAP invalid YAML: {e}") from e
     if not isinstance(data, dict):
@@ -386,10 +443,14 @@ def parse_codemap(path: Path) -> CodeMap:
                 f"CODEMAP entry {i}: bad kind {kind!r} (expected one of "
                 f"{sorted(_KINDS)})"
             )
-        try:
-            line = int(item["line"])
-        except (TypeError, ValueError):
+        # int(...) silently coerced YAML bools (true → 1) and
+        # numeric strings ("42" → 42), letting a CODEMAP pin a symbol to
+        # the wrong line and still pass the grounded gate. Require a
+        # genuine int and exclude bool (bool is a subclass of int).
+        raw_line = item["line"]
+        if isinstance(raw_line, bool) or not isinstance(raw_line, int):
             raise CodeMapError(f"CODEMAP entry {i}: line must be an int")
+        line = raw_line
         sig = item.get("signature")
         entries.append(
             Entry(

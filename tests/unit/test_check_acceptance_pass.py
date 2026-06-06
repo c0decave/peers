@@ -5,10 +5,18 @@ from hashlib import sha256
 from pathlib import Path
 
 from peers.templates.modes.implement.checks import acceptance_pass
+from peers_ctl.contracts import _append_chain_entry, _INIT_EVENT, _pin_state_hash
 
 
 def _make_acceptance_setup(tmp_path: Path, script_body: str) -> Path:
-    """Create minimal valid project: .peers/contracts/acceptance.sh + contracts.sha."""
+    """Create minimal valid project: .peers/contracts/acceptance.sh + contracts.sha.
+
+    Builds the layout by hand so each test can supply an arbitrary
+    ``script_body`` (the public ``write_frozen_contracts`` wraps the
+    user's command in a fixed shebang/header). The BUG-178 audit-log
+    seed entry is then written via the internal ``_append_chain_entry``
+    helper so ``verify_contracts`` sees a chain-bound pin state.
+    """
     plan_dir = tmp_path / ".peers"
     contracts = plan_dir / "contracts"
     contracts.mkdir(parents=True)
@@ -24,6 +32,7 @@ def _make_acceptance_setup(tmp_path: Path, script_body: str) -> Path:
         "PLAN.original.md": sha256(plan_orig.read_bytes()).hexdigest(),
     }
     (plan_dir / "contracts.sha").write_text(json.dumps(sha_map, indent=2))
+    _append_chain_entry(plan_dir, _INIT_EVENT, "", _pin_state_hash(sha_map))
     return tmp_path
 
 

@@ -364,3 +364,92 @@ def test_existing_owner_only_file_stays_private(tmp_path: Path):
     os.chmod(target, 0o600)
     append_text_no_symlink(target, "new\n")
     assert _perms(target) == 0o600
+
+
+def test_atomic_write_ignores_preplanted_predictable_tmp_BUG_181(
+    tmp_path: Path,
+) -> None:
+    """BUG-181: atomic_write_text_in_dir_no_symlink wrote to ``<name>.tmp``
+    opened with O_CREAT but no O_EXCL. A same-UID peer with write access
+    to the control directory can pre-plant ``<name>.tmp`` as a symlink (or
+    a hardlink) and let the writer race them between open(no-trunc) and
+    os.replace(). After the fix, the helper uses a unique random temp
+    name so a pre-planted predictable name is bypassed entirely — the
+    atomic write succeeds AND the attacker's bait is untouched.
+    """
+    from peers.safe_io import atomic_write_text_in_dir_no_symlink
+
+    target = tmp_path / "state.json"
+    bait = tmp_path / "bait"
+    bait.write_text("keep me", encoding="utf-8")
+
+    # Pre-plant the OLD predictable temp name as a symlink to bait.
+    (tmp_path / "state.json.tmp").symlink_to(bait)
+
+    # On the buggy code: the writer tries to open state.json.tmp without
+    # O_EXCL; on Linux the open follows the symlink → either bait is
+    # rewritten or an OSError leaks before a successful rename. After
+    # the fix the writer picks a fresh random name so this never matters.
+    atomic_write_text_in_dir_no_symlink(target, "fresh\n")
+
+    # Final file must contain the new content.
+    assert target.read_text(encoding="utf-8") == "fresh\n"
+    # And the bait MUST be untouched (no follow-through).
+    assert bait.read_text(encoding="utf-8") == "keep me"
+
+
+def test_atomic_write_temp_name_is_unpredictable_BUG_181(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """BUG-181: the writer's temp filename must be unique per call, not
+    ``<name>.tmp``. We snapshot the directory contents from inside the
+    fdopen write (when the temp file is mid-flight) and assert no entry
+    matches the legacy predictable name."""
+    from peers.safe_io import atomic_write_text_in_dir_no_symlink
+
+    target = tmp_path / "state.json"
+    seen_tmp_names: list[str] = []
+
+    real_fdopen = os.fdopen
+
+    def spy_fdopen(fd, mode, *args, **kwargs):
+        # Snapshot tmp dir entries while the temp file is still on disk.
+        seen_tmp_names.extend(
+            n for n in os.listdir(tmp_path)
+            if n.endswith(".tmp") or ".tmp" in n
+        )
+        return real_fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", spy_fdopen)
+    atomic_write_text_in_dir_no_symlink(target, "v1\n")
+    assert seen_tmp_names, "expected to observe a temp file during the write"
+    # Must NOT match the old predictable name.
+    assert "state.json.tmp" not in seen_tmp_names, (
+        f"writer used predictable temp name: {seen_tmp_names!r}"
+    )
+    # Must include something with the target's stem in the name (so
+    # the temp lives next to the target and rename semantics work).
+    assert any("state.json" in n for n in seen_tmp_names)
+
+
+def test_atomic_write_refuses_preplanted_tmp_collision_BUG_181(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """BUG-181: even if an attacker guesses the random temp name and
+    plants it before our O_EXCL open, the helper must refuse rather
+    than truncating. We force the collision by stubbing token_hex to
+    a fixed value, then pre-planting that exact name as a bait
+    symlink. The writer must raise without touching the bait."""
+    import secrets
+    from peers.safe_io import atomic_write_text_in_dir_no_symlink
+
+    target = tmp_path / "state.json"
+    bait = tmp_path / "bait"
+    bait.write_text("keep me", encoding="utf-8")
+
+    monkeypatch.setattr(secrets, "token_hex", lambda n=8: "deadbeefcafebabe")
+    (tmp_path / "state.json.deadbeefcafebabe.tmp").symlink_to(bait)
+
+    with pytest.raises(OSError):
+        atomic_write_text_in_dir_no_symlink(target, "fresh\n")
+    assert bait.read_text(encoding="utf-8") == "keep me"

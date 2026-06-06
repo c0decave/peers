@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    import fcntl as _fcntl  # POSIX-only; falls back to no-op on Windows
+except ImportError:  # pragma: no cover - non-POSIX
+    _fcntl = None  # type: ignore[assignment]
+
 
 _ACCESS_KEYS = ("accessToken", "access_token", "oauth_token")
 _REFRESH_KEYS = ("refreshToken", "refresh_token", "oauth_refresh_token")
@@ -61,9 +66,25 @@ def _first_string(mapping: dict[str, Any], keys: tuple[str, ...]) -> tuple[str, 
     return None
 
 
+def _read_text_with_shared_lock(path: Path) -> str:
+    """BUG-167: take fcntl.flock(LOCK_SH) before reading so a concurrent
+    in-place rewrite (the bind-mount fallback) cannot expose a torn
+    file. The kernel makes the reader wait until the writer's
+    LOCK_EX is released."""
+    with path.open("rb") as fp:
+        if _fcntl is not None:
+            try:
+                _fcntl.flock(fp.fileno(), _fcntl.LOCK_SH)
+            except OSError:
+                # Best-effort: if flock isn't supported on this fd
+                # (e.g. NFS without lockd), fall through to the read.
+                pass
+        return fp.read().decode("utf-8")
+
+
 def load_claude_oauth(path: Path) -> OAuthConfig:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(_read_text_with_shared_lock(path))
     except (OSError, json.JSONDecodeError) as e:
         raise OAuthRefreshError(f"cannot read OAuth token file {path}: {e}") from e
     if not isinstance(raw, dict):
@@ -93,22 +114,47 @@ def load_claude_oauth(path: Path) -> OAuthConfig:
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_LOOPBACK_OPT_IN_ENV = "AUTH_PROXY_OAUTH_ALLOW_LOOPBACK"
+_OAUTH_RESPONSE_MAX_BYTES_DEFAULT = 1 * 1024 * 1024
+_OAUTH_RESPONSE_MAX_BYTES_ENV = "AUTH_PROXY_OAUTH_RESPONSE_MAX_BYTES"
+
+
+def _oauth_response_max_bytes() -> int:
+    """BUG-158: bound the OAuth refresh response body. Default 1 MiB;
+    typical responses are <1 KiB. Operators can tune via env if a
+    provider returns large JWTs."""
+    raw = os.environ.get(_OAUTH_RESPONSE_MAX_BYTES_ENV, "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            return _OAUTH_RESPONSE_MAX_BYTES_DEFAULT
+        if value > 0:
+            return value
+    return _OAUTH_RESPONSE_MAX_BYTES_DEFAULT
 _HTTPS_REQUIRED_MSG = (
     "OAuth refresh endpoint must be an https:// URL "
-    "(or http:// to a loopback host)"
+    "(http:// to a loopback host requires AUTH_PROXY_OAUTH_ALLOW_LOOPBACK=1)"
 )
 
 
 def _is_loopback_http(parsed: urllib.parse.SplitResult) -> bool:
     """RFC 8252 §7.3: http:// to a loopback host stays on the local machine
-    and therefore does not expose the refresh_token over the wire. The
-    BUG-203 cleartext-exfiltration vector requires an off-box URL; loopback
-    is safe and is the only way local integration tests / dev-mode setups
-    can exercise the refresh flow without provisioning TLS."""
+    and therefore does not expose the refresh_token over the wire UNTIL the
+    process shares its loopback with peer-controlled code. BUG-155: the
+    auth-proxy sidecar joins the egress-proxy network namespace alongside
+    the main peers container, so loopback there is reachable from the
+    workspace. Require an explicit AUTH_PROXY_OAUTH_ALLOW_LOOPBACK=1 opt-in
+    (set only in local dev / integration tests) before honoring the
+    loopback exception; container deployments leave it unset and loopback
+    URLs are refused as if they were any other off-box http URL."""
     if parsed.scheme.lower() != "http":
         return False
     host = parsed.hostname
-    return host is not None and host.lower() in _LOOPBACK_HOSTS
+    if host is None or host.lower() not in _LOOPBACK_HOSTS:
+        return False
+    opt_in = os.environ.get(_LOOPBACK_OPT_IN_ENV, "").strip().lower()
+    return opt_in in ("1", "true", "yes")
 
 
 def _token_url(config: OAuthConfig) -> str:
@@ -158,11 +204,20 @@ def refresh_access_token(
             "Accept": "application/json",
         },
     )
+    cap = _oauth_response_max_bytes()
     try:
         with opener(request, timeout=timeout) as response:
-            data = response.read()
+            # ask for one byte over the cap; if the body fills
+            # that, the response was too large and we refuse rather
+            # than parse a partial body or buffer unbounded memory.
+            data = response.read(cap + 1)
     except Exception as e:
         raise OAuthRefreshError(f"OAuth refresh request failed: {e}") from e
+    if len(data) > cap:
+        raise OAuthRefreshError(
+            f"OAuth refresh response too large (> {cap} bytes); "
+            "set AUTH_PROXY_OAUTH_RESPONSE_MAX_BYTES to raise the cap"
+        )
     try:
         refreshed = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -178,11 +233,25 @@ def refresh_access_token(
 def _rewrite_in_place_from_tmp(tmp: Path, path: Path) -> None:
     data = tmp.read_bytes()
     with path.open("r+b") as fp:
+        # take fcntl.flock(LOCK_EX) before the seek/write/
+        # truncate window so concurrent readers (LOCK_SH in
+        # _read_text_with_shared_lock) wait until the rewrite is
+        # durable instead of seeing a torn file.
+        if _fcntl is not None:
+            try:
+                _fcntl.flock(fp.fileno(), _fcntl.LOCK_EX)
+            except OSError:
+                pass
         fp.seek(0)
         fp.write(data)
         fp.truncate()
         fp.flush()
         os.fsync(fp.fileno())
+        if _fcntl is not None:
+            try:
+                _fcntl.flock(fp.fileno(), _fcntl.LOCK_UN)
+            except OSError:
+                pass
     try:
         path.chmod(0o600)
     except OSError:

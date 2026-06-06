@@ -85,6 +85,31 @@ def test_init_refuses_to_modify_symlinked_gitignore(tmp_path: Path):
     assert not (target / ".peers").exists()
 
 
+def test_init_force_does_not_chmod_through_symlink_in_peers(tmp_path: Path):
+    """BUG-153: cmd_init(..., force=True) pre-unlocks .peers/ with chmod
+    before rmtree. os.chmod follows symlinks, so a symlinked leaf under
+    .peers could redirect chmod onto a same-user file outside the tree.
+    The cleanup must skip symlinks (rmtree unlinks them without
+    following), leaving the victim's mode unchanged."""
+    cmd_init(target=tmp_path, force=False)
+    victim = tmp_path.parent / "force_victim.txt"
+    victim.write_text("untouched\n")
+    os.chmod(victim, 0o600)
+    try:
+        # Plant a symlink under the read-only checks/ dir pointing at the
+        # victim. If chmod follows the symlink, the victim's mode flips
+        # to 0o644.
+        link = tmp_path / ".peers" / "checks" / "evil-link"
+        os.chmod(tmp_path / ".peers" / "checks", 0o755)
+        link.symlink_to(victim)
+        rc = cmd_init(target=tmp_path, force=True)
+        assert rc == 0
+        assert victim.stat().st_mode & 0o777 == 0o600, "victim chmod'd"
+        assert victim.read_text() == "untouched\n"
+    finally:
+        victim.unlink(missing_ok=True)
+
+
 def test_init_force_refuses_plain_file_peers_path(tmp_path: Path, capsys):
     (tmp_path / ".peers").write_text("not a dir")
 

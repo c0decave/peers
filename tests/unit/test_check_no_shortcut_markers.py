@@ -125,3 +125,31 @@ def test_skips_peer_template_check_implementations(tmp_path, capsys):
     rc = no_shortcut_markers.main(str(tmp_path))
 
     assert rc == 0
+
+
+def test_forged_justification_with_broken_chain_fails_closed_BUG_173(
+    tmp_path, capsys,
+):
+    """A forged log entry whose hash is not chain-valid must fail the gate.
+
+    The annotated line is *syntactically* covered by a log entry, but
+    the chain prefix does not match sha256(prev + payload)[:16]. Without
+    chain verification at gate entry, ``is_justified`` returns True and
+    the violation is silently waived. The fix runs ``verify_log_chain``
+    first and fails closed on tamper.
+    """
+    _setup(
+        tmp_path,
+        {"a.py": "def f():\n    pass  # TODO  # JUSTIFIED: forged\n"},
+    )
+    plan_dir = tmp_path / ".peers"
+    plan_dir.mkdir()
+    # Hand-write a log entry with a deliberately wrong chain prefix.
+    # `is_justified` would happily accept this; the chain check must not.
+    (plan_dir / "justifications.log").write_text(
+        "0000000000000000 src/a.py:2 attacker forged reason\n",
+    )
+    rc = no_shortcut_markers.main(str(tmp_path))
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "chain" in out.lower() or "tamper" in out.lower()

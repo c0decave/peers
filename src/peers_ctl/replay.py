@@ -45,13 +45,37 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import re
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Iterable
 
+from peers.safe_io import read_text_no_symlink
 from peers_ctl.store import Store, validate_project_name
+
+# cap prompt-file reads so a runaway file (or a hostile prompt
+# log) cannot wedge the operator's terminal. 4 MiB matches the substrate's
+# prompt-budget envelope with plenty of headroom for trailing tool output.
+_MAX_PROMPT_BYTES = 4 * 1024 * 1024
+
+# cap the project-controlled runs.jsonl read so a malicious
+# project cannot make replay disclose a same-user file via a planted
+# symlink or consume unbounded memory via a giant log. 32 MB matches the
+# compare command and is well above realistic tick volumes.
+_MAX_RUNS_BYTES = 32 * 1024 * 1024
+
+# head_before / head_after come from project-controlled
+# runs.jsonl and were previously handed to `git diff <a>..<b>` verbatim.
+# Reject anything that isn't a 4..64-char hex object id so option-like
+# values like "--upload-pack=..." or ref strings like "refs/heads/main"
+# never reach git's argv. SHA-256 git uses 64 hex chars; SHA-1 uses 40
+# and abbreviated forms are at least 4. We deliberately do NOT resolve
+# the ref — the goal is to keep replay read-only and side-effect free.
+_HEX_SHA_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 
 
 # --- options dataclass --------------------------------------------------
@@ -122,21 +146,27 @@ def _resolve_project_dir(name: str, config_dir: Path | None) -> Path | None:
 
 
 def _read_runs(path: Path) -> Iterable[dict]:
-    """Yield JSON objects from a runs.jsonl file. Bad lines skipped."""
+    """Yield JSON objects from a runs.jsonl file. Bad lines skipped.
+
+    BUG-191: route through read_text_no_symlink with a byte cap so a
+    project-controlled runs.jsonl cannot be a symlink redirecting the
+    read to another same-user file, nor a giant file that exhausts the
+    operator's memory.
+    """
     try:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(entry, dict):
-                    yield entry
+        raw = read_text_no_symlink(path, max_bytes=_MAX_RUNS_BYTES)
     except OSError:
         return
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            yield entry
 
 
 def _format_duration(ms: object) -> str:
@@ -220,13 +250,22 @@ def _render_tick(entry: dict, out: IO[str]) -> None:
         out.write(f"  ts: {ts}\n")
 
 
+def _is_safe_hex_sha(value: object) -> bool:
+    """BUG-179: only accept project-controlled head SHAs that look like
+    a real git object id. We refuse on type/length/charset before any
+    git invocation so an attacker-controlled runs.jsonl cannot steer
+    the read-only replay path into option parsing or ref hunting.
+    """
+    return isinstance(value, str) and bool(_HEX_SHA_RE.match(value))
+
+
 def _render_diff(proj_dir: Path, entry: dict, out: IO[str]) -> None:
     """Append a ``git diff`` for the tick's head transition.
 
     Skips ticks whose head_before == head_after (no-op handoff) and
-    ticks with either SHA missing. Failures are surfaced as a single
-    notice line rather than raising — the goal is reviewer convenience,
-    not bisect-quality correctness.
+    ticks with either SHA missing or not a valid hex object id. Failures are surfaced as a single notice line rather
+    than raising — the goal is reviewer convenience, not
+    bisect-quality correctness.
     """
     head_before = entry.get("head_before")
     head_after = entry.get("head_after")
@@ -236,8 +275,16 @@ def _render_diff(proj_dir: Path, entry: dict, out: IO[str]) -> None:
     if head_before == head_after:
         out.write("  diff: (no change — heads identical)\n")
         return
+    if not _is_safe_hex_sha(head_before) or not _is_safe_hex_sha(head_after):
+        out.write(
+            "  diff: (skipped — invalid head SHA in runs.jsonl; "
+            "expected 4..64 hex chars)\n"
+        )
+        return
+    # insert `--` so any future path arg cannot be parsed as
+    # an option; revisions are already validated as hex above.
     argv = ["git", "-C", str(proj_dir), "diff",
-            f"{head_before}..{head_after}"]
+            f"{head_before}..{head_after}", "--"]
     try:
         # 60s timeout: a single tick's diff should be near-instant
         # against the repo's pack; anything slower means the SHAs are
@@ -268,26 +315,60 @@ def _render_prompts(proj_dir: Path, iteration: object,
 
     Format chosen so an operator can ``grep -A`` for prompt boundaries
     without parsing the structure.
+
+    BUG-176: refuse symlinks. ``Path.is_dir()``, ``Path.iterdir()``,
+    ``Path.is_file()`` and ``Path.read_text()`` all follow symlinks, so
+    a peer-controlled link inside the prompts directory (or the directory
+    itself) would leak any same-user-readable host file to the operator's
+    replay output. We pre-check with ``os.lstat`` and skip with a
+    diagnostic instead.
     """
     if not isinstance(iteration, int):
         out.write("  prompt: (skipped — iteration not an int)\n")
         return
     prompts_dir = proj_dir / ".peers" / "log" / "prompts" / f"iter-{iteration}"
-    if not prompts_dir.is_dir():
+    try:
+        dir_lst = os.lstat(prompts_dir)
+    except FileNotFoundError:
+        out.write(f"  prompt: (no prompt directory at {prompts_dir})\n")
+        return
+    except OSError as e:
+        out.write(f"  prompt: (cannot stat {prompts_dir}: {e})\n")
+        return
+    if stat.S_ISLNK(dir_lst.st_mode):
+        out.write(
+            f"  prompt: (refusing symlinked prompt directory: {prompts_dir})\n"
+        )
+        return
+    if not stat.S_ISDIR(dir_lst.st_mode):
         out.write(f"  prompt: (no prompt directory at {prompts_dir})\n")
         return
     try:
-        files = sorted(f for f in prompts_dir.iterdir() if f.is_file())
+        names = sorted(os.listdir(prompts_dir))
     except OSError as e:
         out.write(f"  prompt: (cannot list {prompts_dir}: {e})\n")
         return
+    files: list[Path] = []
+    for name in names:
+        child = prompts_dir / name
+        try:
+            lst = os.lstat(child)
+        except OSError:
+            continue
+        if stat.S_ISLNK(lst.st_mode):
+            out.write(
+                f"  prompt: (refusing symlinked prompt file: {child})\n"
+            )
+            continue
+        if stat.S_ISREG(lst.st_mode):
+            files.append(child)
     if not files:
         out.write(f"  prompt: (empty prompt directory at {prompts_dir})\n")
         return
     for f in files:
         out.write(f"  prompt ({f.name}):\n")
         try:
-            text = f.read_text(encoding="utf-8", errors="replace")
+            text = read_text_no_symlink(f, max_bytes=_MAX_PROMPT_BYTES)
         except OSError as e:
             out.write(f"    (cannot read: {e})\n")
             continue

@@ -214,6 +214,59 @@ def test_replay_show_prompts_notes_when_missing(tmp_path: Path) -> None:
     assert "prompt" in text.lower()
 
 
+def test_replay_show_prompts_refuses_symlinked_file_BUG_176(
+    tmp_path: Path,
+) -> None:
+    """BUG-176: a symlink inside iter-N/ used to be printed via read_text,
+    disclosing any same-user-readable host file (e.g. ~/.ssh/id_rsa) when
+    the operator runs `peers-ctl replay --show-prompts`. The renderer
+    must skip symlinked entries with a clear diagnostic instead.
+    """
+    proj = _seed_project(tmp_path, "demo", [
+        {"iteration": 1, "peer": "claude", "classification": "success",
+         "duration_ms": 100, "success": True,
+         "head_before": "x", "head_after": "y"},
+    ])
+    prompts = proj / ".peers" / "log" / "prompts" / "iter-1"
+    prompts.mkdir(parents=True)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET_HOST_FILE_CONTENT\n")
+    (prompts / "evil.txt").symlink_to(secret)
+
+    opts = _opts(show_prompts=True)
+    rc = replay_project("demo", opts)
+    assert rc == 0
+    text = opts.out.getvalue()
+    assert "SECRET_HOST_FILE_CONTENT" not in text
+    # A skip/refuse diagnostic should explain why nothing was printed.
+    assert "symlink" in text.lower() or "skip" in text.lower()
+
+
+def test_replay_show_prompts_refuses_symlinked_iter_dir_BUG_176(
+    tmp_path: Path,
+) -> None:
+    """The iter-N directory itself may be a symlink. listdir would
+    happily walk into the attacker's directory; the renderer must refuse.
+    """
+    proj = _seed_project(tmp_path, "demo", [
+        {"iteration": 1, "peer": "claude", "classification": "success",
+         "duration_ms": 100, "success": True,
+         "head_before": "x", "head_after": "y"},
+    ])
+    prompts_root = proj / ".peers" / "log" / "prompts"
+    prompts_root.mkdir(parents=True)
+    attacker_dir = tmp_path / "attacker_prompts"
+    attacker_dir.mkdir()
+    (attacker_dir / "leak.txt").write_text("SECRET_ATTACKER_CONTENT\n")
+    (prompts_root / "iter-1").symlink_to(attacker_dir)
+
+    opts = _opts(show_prompts=True)
+    rc = replay_project("demo", opts)
+    assert rc == 0
+    text = opts.out.getvalue()
+    assert "SECRET_ATTACKER_CONTENT" not in text
+
+
 def test_replay_show_prompts_reads_existing(tmp_path: Path) -> None:
     """If a prompt file exists for iter-N, its contents appear in the
     output."""
@@ -292,3 +345,89 @@ def test_replay_edge_boundary_duration_infinity_renders_dash_BUG_304(
     # The duration line must surface as the unknown-marker, not crash
     # and not print a bogus 'inf'-derived integer.
     assert "duration: -" in text
+
+
+# --- BUG-179: replay --show-diffs must validate head SHAs --------------------
+
+def test_replay_show_diffs_refuses_option_like_head_BUG_179(
+    tmp_path: Path,
+) -> None:
+    """BUG-179: _render_diff passes head_before/head_after directly to
+    ``git diff <head_before>..<head_after>``. A runs.jsonl entry under
+    project control can name ``--upload-pack=/tmp/x`` or any other
+    option-like string; without validation the supposedly read-only
+    replay subprocesses arbitrary git option parsing. The renderer must
+    reject anything that isn't a valid hex object id before invoking
+    git.
+    """
+    _seed_project(tmp_path, "demo", [
+        {"iteration": 1, "peer": "claude", "classification": "success",
+         "duration_ms": 100, "success": True,
+         "head_before": "--upload-pack=/tmp/evil",
+         "head_after": "bbb222"},
+    ])
+    opts = _opts(show_diffs=True)
+    # On the buggy code, _render_diff calls subprocess.run with the
+    # attacker-controlled value as a positional arg; patch to capture.
+    with patch("peers_ctl.replay.subprocess.run") as run:
+        run.return_value = subprocess.CompletedProcess(
+            args=["git"], returncode=0, stdout="", stderr="",
+        )
+        rc = replay_project("demo", opts)
+    assert rc == 0
+    # After the fix the renderer skips the tick with a diagnostic and
+    # NEVER invokes git for the malformed revision pair.
+    assert run.call_count == 0, (
+        f"git was invoked with attacker-controlled revision: "
+        f"{run.call_args_list}"
+    )
+    text = opts.out.getvalue()
+    assert "diff:" in text
+    # A clear "rejected"/"invalid" diagnostic should mention the issue.
+    lowered = text.lower()
+    assert "invalid" in lowered or "skipped" in lowered or "rejected" in lowered
+
+
+def test_replay_show_diffs_refuses_non_hex_head_BUG_179(
+    tmp_path: Path,
+) -> None:
+    """BUG-179: random non-hex strings in head_before/head_after are
+    also rejected — git can be steered into expensive ref lookups
+    against the project-controlled string. Only full/abbreviated hex
+    object IDs (4..64 chars) are accepted."""
+    _seed_project(tmp_path, "demo", [
+        {"iteration": 1, "peer": "claude", "classification": "success",
+         "duration_ms": 100, "success": True,
+         "head_before": "refs/heads/main",
+         "head_after": "bbb222"},
+    ])
+    opts = _opts(show_diffs=True)
+    with patch("peers_ctl.replay.subprocess.run") as run:
+        run.return_value = subprocess.CompletedProcess(
+            args=["git"], returncode=0, stdout="", stderr="",
+        )
+        rc = replay_project("demo", opts)
+    assert rc == 0
+    assert run.call_count == 0
+
+
+def test_replay_show_diffs_accepts_short_hex_BUG_179(
+    tmp_path: Path,
+) -> None:
+    """BUG-179 happy path: 4..64-char hex strings are still accepted
+    (covers normal abbreviated and full SHAs after the validation
+    tightens)."""
+    _seed_project(tmp_path, "demo", [
+        {"iteration": 1, "peer": "claude", "classification": "success",
+         "duration_ms": 100, "success": True,
+         "head_before": "abcd",
+         "head_after": "1234567890abcdef1234567890abcdef12345678"},
+    ])
+    opts = _opts(show_diffs=True)
+    with patch("peers_ctl.replay.subprocess.run") as run:
+        run.return_value = subprocess.CompletedProcess(
+            args=["git"], returncode=0, stdout="", stderr="",
+        )
+        rc = replay_project("demo", opts)
+    assert rc == 0
+    assert run.call_count == 1
