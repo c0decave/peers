@@ -32,14 +32,35 @@ import re
 import sys
 from pathlib import Path
 
+from peers.safe_io import read_bytes_no_symlink
 from peers_ctl.plan_parser import PlanValidationError, parse_plan
 
 _STEP_ID_RE = re.compile(r"\[(STEP-\d+)\]")
+_PLAN_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _extract_step_ids(text: str) -> set[str]:
     """Return the set of ``STEP-N`` IDs appearing in ``text``."""
     return set(_STEP_ID_RE.findall(text))
+
+
+def _read_current_plan_text(plan_path: Path) -> str:
+    try:
+        raw = read_bytes_no_symlink(
+            plan_path, max_bytes=_PLAN_MAX_BYTES + 1
+        )
+    except OSError as e:
+        raise PlanValidationError(
+            f"cannot read PLAN.md safely: {e}"
+        ) from e
+    if len(raw) > _PLAN_MAX_BYTES:
+        raise PlanValidationError(
+            f"PLAN.md too large (max {_PLAN_MAX_BYTES} bytes)"
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise PlanValidationError(f"PLAN.md is not valid UTF-8: {e}") from e
 
 
 def main(project_dir: str = ".") -> int:
@@ -61,7 +82,12 @@ def main(project_dir: str = ".") -> int:
         return 1
 
     original_ids = {step.id for step in original_plan.steps}
-    current_ids = _extract_step_ids(plan_path.read_text())
+    try:
+        current_text = _read_current_plan_text(plan_path)
+    except PlanValidationError as e:
+        print(f"plan-original-preserved FAIL: PLAN.md invalid: {e}")
+        return 1
+    current_ids = _extract_step_ids(current_text)
 
     missing = original_ids - current_ids
     if missing:

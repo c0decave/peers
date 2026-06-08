@@ -182,6 +182,15 @@ Example commit body:
 """.strip()
 
 
+CORE_DIRECTIVE = """
+NO SLOP. NO FAKES. NO SKELETONS. BE HONEST.
+- No slop: no vague filler or hand-waving — every claim is specific and grounded in the code.
+- No fakes: never fabricate results, evidence, test output, or citations. Run it; report what actually happened.
+- No skeletons: no stubs, placeholders, or TODO/`pass`/`NotImplementedError` bodies passed off as done.
+- Be honest: report the real state — if something failed, is unverified, or was skipped, say so plainly.
+""".strip()
+
+
 def build_prompt(
     peer: str,
     other: str,
@@ -203,6 +212,9 @@ def build_prompt(
         )
     else:
         parts.append(f"You are peer '{peer}'. Your counterpart is '{other}'.")
+    parts.append("")
+
+    parts.append(CORE_DIRECTIVE)
     parts.append("")
 
     parts.append(PROJECT_CONTEXT_BLOCK)

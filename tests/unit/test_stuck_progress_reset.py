@@ -69,6 +69,26 @@ def test_step_increase_clears_watched_counter() -> None:
     assert state["last_plan_steps_done"] == 2
 
 
+def test_malformed_config_containers_use_default_reset_gates_sad_path() -> None:
+    from peers.driver_tick_hooks import reset_stuck_on_progress
+
+    for state in (
+        _state(
+            {"tests-pass": 4},
+            last_plan_steps_done=1,
+            config=["not-a-mapping"],
+        ),
+        _state(
+            {"tests-pass": 4},
+            last_plan_steps_done=1,
+            config={"goals": ["not-a-mapping"]},
+        ),
+    ):
+        reset_stuck_on_progress(state, plan_steps_done=2, mode_name="implement")
+        assert "tests-pass" not in state["stuck_counter"]
+        assert state["last_plan_steps_done"] == 2
+
+
 def test_no_step_change_keeps_counter() -> None:
     from peers.driver_tick_hooks import reset_stuck_on_progress
     state = _state({"tests-pass": 4}, last_plan_steps_done=2)

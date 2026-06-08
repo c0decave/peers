@@ -611,3 +611,59 @@ def test_amend_acceptance_records_pin_state_in_chain_BUG_178(tmp_path):
     # And after a second amend.
     amend_acceptance(plan_dir, "pytest -v", reason="verbose")
     verify_contracts(plan_dir)
+
+
+def test_verify_contracts_refuses_symlinked_pinned_file_BUG_211(tmp_path):
+    """BUG-211 (sad): verify_contracts must refuse a pinned file that has
+    been swapped for a symlink, even if the target's sha256 matches the
+    pin. A silent follow defeats the BUG-178 chain by reopening the
+    'silent bypass' the chain was supposed to close (TOCTOU between
+    verify and the acceptance run completes the attack once the leaf
+    has been redirected).
+    """
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+
+    acc = plan_dir / "contracts" / "acceptance.sh"
+    # Stash the original frozen content elsewhere, then redirect the
+    # contracts/ leaf to it via a symlink. Hashes still match the pin
+    # because the data is bit-identical, but the leaf is now follow-able
+    # — and an attacker can flip the target between verify and execute.
+    relocated = tmp_path / "stash" / "acceptance.sh"
+    relocated.parent.mkdir(parents=True)
+    relocated.write_bytes(acc.read_bytes())
+    _chmod_writable(acc)
+    acc.unlink()
+    acc.symlink_to(relocated)
+
+    with pytest.raises((ContractsMismatch, OSError)):
+        verify_contracts(plan_dir)
+
+
+def test_verify_contracts_refuses_symlinked_plan_original_BUG_211(tmp_path):
+    """BUG-211 (sad, edge): also enforced on PLAN.original.md, which
+    lives at plan_dir top-level (different code path than the contracts/
+    subdir leaves but the same vulnerability class).
+    """
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir)
+
+    plan_orig = plan_dir / "PLAN.original.md"
+    relocated = tmp_path / "stash_plan" / "PLAN.original.md"
+    relocated.parent.mkdir(parents=True)
+    relocated.write_bytes(plan_orig.read_bytes())
+    _chmod_writable(plan_orig)
+    plan_orig.unlink()
+    plan_orig.symlink_to(relocated)
+
+    with pytest.raises((ContractsMismatch, OSError)):
+        verify_contracts(plan_dir)
+
+
+def test_verify_contracts_happy_after_BUG_211_fix(tmp_path):
+    """Happy regression-defence: legitimate regular-file pins continue
+    to verify cleanly after the no-symlink hardening. Prevents the fix
+    from over-reaching onto valid frozen layouts."""
+    plan_dir = _plan_dir(tmp_path)
+    _make(plan_dir, e2e="playwright test e2e/")
+    verify_contracts(plan_dir)

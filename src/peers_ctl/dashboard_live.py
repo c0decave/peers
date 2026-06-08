@@ -8,11 +8,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TextIO
 
-from peers.safe_io import open_text_read_no_symlink, read_text_no_symlink
+from peers.safe_io import (
+    read_bytes_under_root_no_follow,
+    read_text_under_root_no_follow,
+)
 from peers_ctl.store import Project, Store, reconcile
 
 
 _DASHBOARD_STATE_MAX_BYTES = 5 * 1024 * 1024
+_DASHBOARD_RUNS_MAX_BYTES = 32 * 1024 * 1024
 
 
 class DashboardProjectNotFound(ValueError):
@@ -36,27 +40,28 @@ class DashboardRow:
 
 
 def _project_rollup(repo: Path) -> tuple[int, int, str]:
-    log = repo / ".peers" / "log" / "runs.jsonl"
     ticks = 0
     last = "-"
-    if log.is_file():
+    try:
+        raw = read_text_under_root_no_follow(
+            repo, (".peers", "log", "runs.jsonl"),
+            max_bytes=_DASHBOARD_RUNS_MAX_BYTES,
+        )
+    except (OSError, ValueError):
+        raw = ""
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
         try:
-            with open_text_read_no_symlink(log) as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(entry, dict):
-                        continue
-                    if entry.get("event") != "exit":
-                        ticks += 1
-                    if entry.get("ts"):
-                        last = str(entry["ts"])
-        except OSError:
-            pass
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("event") != "exit":
+            ticks += 1
+        if entry.get("ts"):
+            last = str(entry["ts"])
     try:
         from peers.bug_hunt import summarize
         blocking = summarize(repo).open_blocking_count
@@ -66,21 +71,28 @@ def _project_rollup(repo: Path) -> tuple[int, int, str]:
 
 
 def _load_dashboard_state(repo: Path) -> dict:
-    path = repo / ".peers" / "state.json"
-    if not path.exists():
-        return {}
     try:
-        data = json.loads(
-            read_text_no_symlink(
-                path, max_bytes=_DASHBOARD_STATE_MAX_BYTES + 1
-            )
+        raw = read_text_under_root_no_follow(
+            repo, (".peers", "state.json"),
+            max_bytes=_DASHBOARD_STATE_MAX_BYTES + 1,
         )
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(raw)
+    except (OSError, ValueError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
 def _dashboard_soft_goal_passed(goal, status: dict, n_peers: int) -> bool:
+    def consensus_reached(entry: object) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        count = entry.get("consensus_count", 0)
+        return (
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and count >= goal.consensus_needed
+        )
+
     mode = goal.reviewer or "other"
     if mode == "quorum":
         if not goal.quorum_num or not goal.quorum_den:
@@ -91,25 +103,37 @@ def _dashboard_soft_goal_passed(goal, status: dict, n_peers: int) -> bool:
         recent = history[-goal.quorum_den:]
         if len(recent) < goal.quorum_den:
             return False
-        return sum(1 for entry in recent if entry.get("pass")) >= goal.quorum_num
+        return (
+            sum(
+                1 for entry in recent
+                if isinstance(entry, dict) and entry.get("pass") is True
+            )
+            >= goal.quorum_num
+        )
     if mode == "both":
         per_peer = status.get("per_peer", {})
+        if not isinstance(per_peer, dict):
+            per_peer = {}
         reviewers_needed = max(n_peers, 1)
         sufficient = sum(
             1 for entry in per_peer.values()
-            if entry.get("consensus_count", 0) >= goal.consensus_needed
+            if consensus_reached(entry)
         )
         return sufficient >= reviewers_needed
-    return status.get("consensus_count", 0) >= goal.consensus_needed
+    return consensus_reached(status)
 
 
 def _dashboard_goal_counts(repo: Path) -> tuple[str, str]:
-    goals_path = repo / ".peers" / "goals.yaml"
-    if not goals_path.exists():
+    try:
+        from peers.goals import _GOALS_YAML_MAX_BYTES, _parse_goals_yaml_bytes
+        raw = read_bytes_under_root_no_follow(
+            repo, (".peers", "goals.yaml"),
+            max_bytes=_GOALS_YAML_MAX_BYTES + 1,
+        )
+    except (OSError, ValueError):
         return "-", "-"
     try:
-        from peers.goals import load_goals
-        goals = load_goals(goals_path)
+        goals = _parse_goals_yaml_bytes(raw)
     except Exception:
         return "?", "?"
     state = _load_dashboard_state(repo)
@@ -147,12 +171,12 @@ def _dashboard_container_name(project: Project) -> str:
 
 
 def _read_last_stop_reason(repo: Path) -> str:
-    path = repo / ".peers" / "last-stop-reason.txt"
-    if not path.is_file():
-        return ""
     try:
-        text = read_text_no_symlink(path, max_bytes=4096)
-    except OSError:
+        text = read_text_under_root_no_follow(
+            repo, (".peers", "last-stop-reason.txt"),
+            max_bytes=4096,
+        )
+    except (OSError, ValueError):
         return ""
     return text.strip().split(None, 1)[0] if text.strip() else ""
 
@@ -160,7 +184,13 @@ def _read_last_stop_reason(repo: Path) -> str:
 def _dashboard_alert(repo: Path, project: Project, state: dict) -> str:
     if project.state in {"crashed", "unknown"}:
         return project.state.upper()
-    if (repo / ".peers" / "HALTED.md").is_file():
+    try:
+        read_bytes_under_root_no_follow(
+            repo, (".peers", "HALTED.md"), max_bytes=1,
+        )
+    except (OSError, ValueError):
+        pass
+    else:
         return "HALTED"
     reason = _read_last_stop_reason(repo)
     if reason.startswith("budget:"):
@@ -290,23 +320,23 @@ def render_live(rows: list[DashboardRow]) -> str:
 
 
 def _recent_run_lines(repo: Path, *, limit: int = 8) -> list[str]:
-    path = repo / ".peers" / "log" / "runs.jsonl"
-    if not path.is_file():
-        return ["- no runs recorded"]
     entries: list[dict] = []
     try:
-        with open_text_read_no_symlink(path) as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(entry, dict):
-                    entries.append(entry)
-    except OSError as e:
-        return [f"- unable to read runs.jsonl: {e}"]
+        raw = read_text_under_root_no_follow(
+            repo, (".peers", "log", "runs.jsonl"),
+            max_bytes=_DASHBOARD_RUNS_MAX_BYTES,
+        )
+    except (OSError, ValueError):
+        return ["- no runs recorded"]
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
     if not entries:
         return ["- no runs recorded"]
     lines: list[str] = []

@@ -1,6 +1,7 @@
 """Audit scaffold templates for `peers init` / `peers-ctl new`."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import yaml
@@ -98,6 +99,60 @@ def test_audit_templates_tests_pass_uses_exit_code_not_passed_regex(
         f"{tests_pass['pass_when']!r}; switch to exit_code == 0 for "
         "robustness under pytest 9.0+ -q output suppression."
     )
+
+
+def test_audit_templates_lint_type_preserve_tool_exit_codes_BUG_259(
+    tmp_path, monkeypatch,
+):
+    """BUG-259: missing ruff/mypy must fail closed, not pass because the
+    shell output lacks the word "error"."""
+    monkeypatch.setenv("PEERS_PROJECTS_ROOT", str(tmp_path))
+    cmd_new(Path("test-audit"), audit_templates=True, config_dir=tmp_path / "ctl")
+
+    goals = yaml.safe_load(
+        (tmp_path / "test-audit" / ".peers" / "goals.yaml").read_text()
+    )
+
+    for gate_id in ("lint-clean", "type-clean"):
+        gate = next(g for g in goals["goals"] if g["id"] == gate_id)
+        assert "|| true" not in gate["cmd"], (
+            f"{gate_id} masks missing-tool or finding exit codes: "
+            f"{gate['cmd']!r}"
+        )
+        assert gate["pass_when"] == "exit_code == 0"
+
+
+def test_audit_templates_host_init_ignores_stale_path_peers_BUG_260(
+    tmp_path, monkeypatch,
+):
+    """BUG-260 sad path: a stale installed `peers` executable on
+    PATH must not supply old bundled templates during host scaffolding."""
+    monkeypatch.setenv("PEERS_PROJECTS_ROOT", str(tmp_path))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_peers = bin_dir / "peers"
+    fake_peers.write_text(
+        "#!/bin/sh\n"
+        "printf 'stale peers executable should not run\\n' >&2\n"
+        "exit 42\n",
+        encoding="utf-8",
+    )
+    fake_peers.chmod(0o755)
+    monkeypatch.setenv(
+        "PATH",
+        f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+    )
+
+    rc = cmd_new(Path("test-audit"), audit_templates=True,
+                 config_dir=tmp_path / "ctl")
+
+    assert rc == 0
+    goals = yaml.safe_load(
+        (tmp_path / "test-audit" / ".peers" / "goals.yaml").read_text()
+    )
+    lint = next(g for g in goals["goals"] if g["id"] == "lint-clean")
+    assert lint["cmd"] == "ruff check ."
+    assert lint["pass_when"] == "exit_code == 0"
 
 
 def test_audit_templates_without_flag_uses_default_goals(tmp_path, monkeypatch):

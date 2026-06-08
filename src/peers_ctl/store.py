@@ -17,9 +17,11 @@ from typing import Any, Iterator
 import yaml
 
 from peers.safe_io import (
+    atomic_write_text_in_dir_no_symlink,
     open_text_in_dir_no_symlink,
     open_text_no_symlink,
     read_bytes_no_symlink,
+    read_bytes_under_root_no_follow,
 )
 
 
@@ -269,9 +271,14 @@ class Store:
                     f"projects registry too large: {self.path}: "
                     f"max {_PROJECTS_REGISTRY_MAX_BYTES} bytes"
                 )
-            data = yaml.safe_load(
-                raw_bytes.decode("utf-8", errors="replace")
-            ) or {}
+            try:
+                text = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError as e:
+                raise RuntimeError(
+                    f"projects registry corrupt: {self.path}: "
+                    f"invalid UTF-8: {e}"
+                ) from e
+            data = yaml.safe_load(text) or {}
         except OSError as e:
             raise RuntimeError(
                 f"projects registry unreadable or unsafe: {self.path}: {e}"
@@ -378,36 +385,32 @@ class Store:
         return project
 
     def _write_atomic(self, raw: dict[str, Any]) -> None:
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open_text_no_symlink(tmp, "w") as f:
-            yaml.safe_dump(raw, f, sort_keys=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.path)
-        # the rename is atomic but its
-        # *metadata* isn't durable until the directory inode flushes.
-        # On power loss between os.replace() and the implicit dir
-        # flush, the projects.yaml update can be lost despite the
-        # syscall returning success. Mirror StateStore.save's
-        # parent-fsync. Suppress OSError for filesystems (FAT/NFS)
-        # that don't support directory fsync.
-        try:
-            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(dir_fd)
-        except OSError:
-            pass
-        finally:
-            try:
-                os.close(dir_fd)
-            except OSError:
-                pass
+        atomic_write_text_in_dir_no_symlink(
+            self.path,
+            yaml.safe_dump(raw, sort_keys=False),
+        )
+
+
+def _proc_state(pid: int) -> str | None:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return None
+    rest = data[rparen + 1:].split()
+    if not rest:
+        return None
+    try:
+        return rest[0].decode("ascii")
+    except UnicodeDecodeError:
+        return None
 
 
 def is_pid_alive(pid: int | None) -> bool:
-    """True iff the OS still has a process with this PID."""
+    """True iff PID still names a running or signalable non-zombie process."""
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return False
     try:
@@ -417,7 +420,7 @@ def is_pid_alive(pid: int | None) -> bool:
     except PermissionError:
         # Process exists but isn't ours — still "alive" from our POV.
         return True
-    return True
+    return _proc_state(pid) not in {"Z", "X"}
 
 
 _CLEAN_STOP_REASONS_PREFIXES = (
@@ -434,10 +437,10 @@ def _read_stop_reason(project: Project) -> str | None:
     budget exhausted, max_ticks) from a hard process death — fixed v6/v7
     showing up as "crashed" despite running to convergence-complete.
     """
-    sentinel = Path(project.path) / ".peers" / "last-stop-reason.txt"
     try:
-        raw = read_bytes_no_symlink(
-            sentinel, max_bytes=_STOP_REASON_MAX_BYTES + 1,
+        raw = read_bytes_under_root_no_follow(
+            Path(project.path), [".peers", "last-stop-reason.txt"],
+            max_bytes=_STOP_REASON_MAX_BYTES + 1,
         )
     except (OSError, ValueError):
         return None

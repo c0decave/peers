@@ -45,6 +45,23 @@ class Goal:
     # in templates as `Goal.timeout_s`; before BUG-146 the field was
     # missing so the override was silently dropped.
     timeout_s: int | None = None
+    # Tier-1 idle reduction: when True, this gate's verdict is expected to be a
+    # pure function of the checked-out code, so the engine may reuse a prior
+    # PASS while both the working tree and HEAD are unchanged. Only set on
+    # gates that do not depend on runtime/meta state (peer health, convergence
+    # counters, wall clock, external services). Default False = always run.
+    cacheable: bool = False
+    # Flake tolerance: re-run this gate up to N more times if it fails, and
+    # report PASS if any attempt passes. Set on gates that shell out to a
+    # timing-sensitive suite (pytest), where a single load-induced flake would
+    # otherwise turn the gate red and trip the `stuck:<gate>` halt. A genuine
+    # failure still fails after the retries. Default 0 = no retry.
+    retry_on_fail: int = 0
+    # Tier-1 Part B: when True, this (pytest/coverage-backed) gate is run
+    # asynchronously on a frozen-SHA worktree so its multi-minute eval overlaps
+    # the next peer turn. Cheap gates (not expensive) run synchronously each
+    # tick so the peer always sees fresh status. Default False.
+    expensive: bool = False
 
 
 def _parse_quorum(raw: Any, gid: str) -> tuple[int | None, int | None]:
@@ -81,16 +98,17 @@ def _positive_int(raw: Any, field: str, gid: str) -> int:
     return raw
 
 
-def load_goals(path: Path) -> list[Goal]:
-    try:
-        data = read_bytes_no_symlink(
-            Path(path), max_bytes=_GOALS_YAML_MAX_BYTES + 1
+def _parse_goals_yaml_bytes(data: bytes) -> list[Goal]:
+    if len(data) > _GOALS_YAML_MAX_BYTES:
+        raise ValueError(
+            f"goals.yaml: file too large (max {_GOALS_YAML_MAX_BYTES} bytes)"
         )
-        if len(data) > _GOALS_YAML_MAX_BYTES:
-            raise ValueError(
-                f"goals.yaml: file too large (max {_GOALS_YAML_MAX_BYTES} bytes)"
-            )
-        raw = yaml.safe_load(data.decode("utf-8", errors="replace"))
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"goals.yaml: invalid UTF-8: {e}") from e
+    try:
+        raw = yaml.safe_load(text)
     except yaml.YAMLError as e:
         raise ValueError(f"goals.yaml: invalid YAML: {e}") from e
     if raw is None:
@@ -171,6 +189,9 @@ def load_goals(path: Path) -> list[Goal]:
             quorum_num=quorum_num,
             quorum_den=quorum_den,
             timeout_s=timeout_s,
+            cacheable=bool(entry.get("cacheable", False)),
+            expensive=bool(entry.get("expensive", False)),
+            retry_on_fail=max(0, int(entry.get("retry_on_fail", 0) or 0)),
         )
         if g.type == "hard":
             if not isinstance(g.cmd, str) or not g.cmd.strip():
@@ -209,6 +230,13 @@ def load_goals(path: Path) -> list[Goal]:
             )
         out.append(g)
     return out
+
+
+def load_goals(path: Path) -> list[Goal]:
+    data = read_bytes_no_symlink(
+        Path(path), max_bytes=_GOALS_YAML_MAX_BYTES + 1
+    )
+    return _parse_goals_yaml_bytes(data)
 
 
 # --- DSL ---------------------------------------------------------------

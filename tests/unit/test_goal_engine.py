@@ -1,4 +1,5 @@
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -248,6 +249,23 @@ def test_evaluate_hard_gates_can_refresh_selected_subset(tmp_path: Path):
     assert engine.all_green() is False
 
 
+def test_tree_key_sad_path_does_not_use_mktemp(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "tracked.txt").write_text("content", encoding="utf-8")
+
+    def forbidden_mktemp(*_args, **_kwargs):
+        raise AssertionError("tempfile.mktemp leaves a raceable path")
+
+    monkeypatch.setattr("peers.goal_engine.tempfile.mktemp", forbidden_mktemp)
+
+    key = GoalEngine([], cwd=tmp_path)._tree_key()
+
+    assert key is not None
+    assert len(key) == 40
+
+
 def test_all_green_true_when_all_pass(tmp_path: Path):
     g = _hard_goal("ok", "true", "exit_code == 0")
     engine = GoalEngine([g], cwd=tmp_path)
@@ -326,3 +344,71 @@ def test_all_green_true_when_only_soft_goals(tmp_path: Path):
     soft = Goal(id="docs", type="soft", prompt="check", reviewer="other")
     engine = GoalEngine([soft], cwd=tmp_path)
     assert engine.all_green() is True
+
+
+def test_bug_hunt_clean_cache_invalidates_on_empty_bug_report_BUG_272(
+    tmp_path: Path,
+):
+    """BUG-272: bug-hunt-clean is configured cacheable: true but its
+    underlying check (peers.bug_hunt) reads git log, which is NOT part
+    of the GoalEngine tree-key. An empty Bug-Report commit changes the
+    gate verdict without changing the tree, so the cache serves a stale
+    PASS. The fix must invalidate the cached PASS when git history
+    advances — either by dropping cacheable for log-sensitive gates or
+    by folding HEAD sha into the cache key.
+
+    This reproducer drives a cacheable gate whose command depends only
+    on git log (counting commits with a particular trailer): zero
+    matching commits → exit 0 → PASS; one matching commit → exit 1 →
+    FAIL. The tree is unchanged between the two evals; the only
+    difference is an empty commit added to the log.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path,
+                   check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"],
+                   cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"],
+                   cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path,
+                   check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path,
+                   check=True, capture_output=True)
+
+    # Goal command: count log lines carrying the Bug-Report-272 trailer
+    # token; exit 0 iff zero matches. Tree-pure? NO — it depends on git
+    # log only.
+    cmd = (
+        "test \"$(git log --grep=BUG272-marker --format=%H | wc -l)\" = 0"
+    )
+    g = Goal(id="log-sensitive", type="hard", cmd=cmd,
+             pass_when="exit_code == 0", cacheable=True)
+    engine = GoalEngine([g], cwd=tmp_path, timeout_s=30)
+
+    first = engine.evaluate_hard_gates(["log-sensitive"])
+    assert first["log-sensitive"].state == "pass"
+
+    # Add an empty commit that carries the trailer token but leaves the
+    # working tree byte-identical.
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-q",
+         "-m", "BUG272-marker: synthetic open bug"],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+
+    second = engine.evaluate_hard_gates(["log-sensitive"])
+    # Ground truth: a fresh subprocess sees one matching commit.
+    ground = subprocess.run(
+        ["/bin/sh", "-c", cmd], cwd=tmp_path, capture_output=True,
+    )
+    assert ground.returncode != 0, (
+        "Sanity check: log-sensitive cmd must be failing after the empty "
+        "commit; otherwise this test cannot detect the bug."
+    )
+    assert second["log-sensitive"].state == "fail", (
+        f"BUG-272 cache poisoning: gate verdict is {second['log-sensitive'].state!r} "
+        f"(diag={second['log-sensitive'].diagnostic!r}) "
+        "after an empty commit changed git log; the cache should not have "
+        "served the stale PASS from the prior tree state. Same reproduction "
+        "applies to bug-hunt-clean in .peers/goals.yaml."
+    )

@@ -24,51 +24,106 @@ from pathlib import Path
 
 import yaml
 
-from peers.safe_io import read_text_no_symlink
+
+# When this template script is executed directly from a source checkout,
+# prefer the checkout package over any older globally installed `peers`.
+for _parent in Path(__file__).resolve().parents:
+    if (_parent / "peers" / "__init__.py").is_file():
+        sys.path.insert(0, str(_parent))
+        break
+
+from peers.safe_io import read_text_under_root_no_follow  # noqa: E402
 
 DEFAULT_N = 3
 _MAX_CONFIG_BYTES = 512 * 1024
 
 
+def _read_non_negative_int(value: object, label: str) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        print(
+            f"convergence_reached FAIL: {label} must be a non-negative "
+            f"integer: {value!r}"
+        )
+        return None
+    return value
+
+
 def main(root: str = ".") -> int:
-    state_path = Path(root) / ".peers" / "state.json"
-    cfg_path = Path(root) / ".peers" / "config.yaml"
-    if not state_path.is_file():
+    root_path = Path(root)
+    try:
+        # BUG-102/103/257: read via safe_io — refuse a symlinked state.json
+        # (CWE-59) and fail closed on invalid UTF-8 before JSON parsing.
+        # walk every component under <root> with O_DIRECTORY|
+        # O_NOFOLLOW so a symlinked ``.peers`` ancestor (BUG-185 family) is
+        # rejected too — leaf-only O_NOFOLLOW let a same-UID peer redirect
+        # the gate to attacker-staged state.json by swapping the .peers
+        # directory itself.
+        raw_state = read_text_under_root_no_follow(
+            root_path, (".peers", "state.json"),
+        )
+    except FileNotFoundError:
         print("convergence_reached: no state.json yet (no ticks ran)")
         return 1
-    try:
-        # BUG-102/103: read via safe_io — refuse a symlinked state.json
-        # (CWE-59) and decode with replacement so non-UTF-8 bytes fail the
-        # gate via JSONDecodeError instead of an uncaught UnicodeDecodeError.
-        state = json.loads(read_text_no_symlink(state_path))
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError) as e:
         print(f"convergence_reached FAIL: state.json unreadable: {e}")
         return 1
+    try:
+        state = json.loads(raw_state)
+    except json.JSONDecodeError as e:
+        print(f"convergence_reached FAIL: state.json unreadable: {e}")
+        return 1
+    if not isinstance(state, dict):
+        print(
+            "convergence_reached FAIL: state.json root is not a mapping "
+            f"(got {type(state).__name__})"
+        )
+        return 1
     n_needed = DEFAULT_N
-    if cfg_path.is_file():
+    try:
+        cfg_text = read_text_under_root_no_follow(
+            root_path, (".peers", "config.yaml"),
+            max_bytes=_MAX_CONFIG_BYTES,
+        )
+    except FileNotFoundError:
+        cfg_text = None
+    except (OSError, ValueError) as e:
+        print(f"convergence_reached FAIL: config.yaml unreadable: {e}")
+        return 1
+    if cfg_text is not None:
         try:
-            cfg = yaml.safe_load(
-                read_text_no_symlink(cfg_path, max_bytes=_MAX_CONFIG_BYTES)
-            ) or {}
-        except (OSError, yaml.YAMLError) as e:
+            cfg = yaml.safe_load(cfg_text) or {}
+        except yaml.YAMLError as e:
             print(f"convergence_reached FAIL: config.yaml unreadable: {e}")
             return 1
-        raw_n = (cfg.get("goals") or {}).get("convergence_n", DEFAULT_N)
-        try:
-            n_needed = int(raw_n)
-        except (ValueError, TypeError):
+        if cfg is None:
+            cfg = {}
+        if not isinstance(cfg, dict):
             print(
-                "convergence_reached FAIL: goals.convergence_n is not an "
-                f"integer: {raw_n!r}"
+                "convergence_reached FAIL: config.yaml root is not a "
+                f"mapping (got {type(cfg).__name__})"
             )
             return 1
-        if n_needed < 0:
+        goals = cfg.get("goals", {})
+        if goals is None:
+            goals = {}
+        if not isinstance(goals, dict):
             print(
-                "convergence_reached FAIL: goals.convergence_n must be "
-                f">= 0 (got {raw_n!r})"
+                "convergence_reached FAIL: goals config is not a mapping "
+                f"(got {type(goals).__name__})"
             )
             return 1
-    n_have = int(state.get("consecutive_clean_ticks", 0))
+        raw_n = goals.get("convergence_n", DEFAULT_N)
+        parsed_n = _read_non_negative_int(raw_n, "goals.convergence_n")
+        if parsed_n is None:
+            return 1
+        n_needed = parsed_n
+    parsed_have = _read_non_negative_int(
+        state.get("consecutive_clean_ticks", 0),
+        "state.consecutive_clean_ticks",
+    )
+    if parsed_have is None:
+        return 1
+    n_have = parsed_have
     if n_have >= n_needed:
         print(f"convergence_reached: clean ({n_have}/{n_needed})")
         return 0

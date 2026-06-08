@@ -247,6 +247,20 @@ def test_load_goals_accepts_file_at_size_cap(tmp_path: Path):
     assert load_goals(p) == []
 
 
+def test_load_goals_rejects_invalid_utf8_BUG_261(tmp_path: Path):
+    p = tmp_path / "g.yaml"
+    p.write_bytes(
+        b"goals:\n"
+        b"  - id: bad\xffid\n"
+        b"    type: hard\n"
+        b"    cmd: 'true'\n"
+        b"    pass_when: 'exit_code == 0'\n"
+    )
+
+    with pytest.raises(ValueError, match="UTF-8|utf-8"):
+        load_goals(p)
+
+
 def test_load_goals_wraps_pass_when_syntax_error(tmp_path: Path):
     p = tmp_path / "g.yaml"
     p.write_text(

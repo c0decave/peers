@@ -21,25 +21,49 @@ import json
 import sys
 from pathlib import Path
 
-from peers.safe_io import read_text_no_symlink
+
+# When this template script is executed directly from a source checkout,
+# prefer the checkout package over any older globally installed `peers`.
+for _parent in Path(__file__).resolve().parents:
+    if (_parent / "peers" / "__init__.py").is_file():
+        sys.path.insert(0, str(_parent))
+        break
+
+from peers.safe_io import read_text_under_root_no_follow  # noqa: E402
 
 
 def main(root: str = ".") -> int:
-    state_path = Path(root) / ".peers" / "state.json"
-    if not state_path.is_file():
+    try:
+        # BUG-102/103/257: read via safe_io — refuse a symlinked state.json
+        # (CWE-59) and fail closed on invalid UTF-8 before JSON parsing.
+        # walk every component under <root> with O_DIRECTORY|
+        # O_NOFOLLOW so a symlinked ``.peers`` ancestor (BUG-185 family)
+        # is rejected too — leaf-only O_NOFOLLOW let a same-UID peer
+        # redirect the gate to attacker-forged peers[].state='healthy'
+        # by swapping the .peers directory itself.
+        raw_state = read_text_under_root_no_follow(
+            Path(root), (".peers", "state.json"),
+        )
+    except FileNotFoundError:
         # No ticks yet → trivially healthy. Same convention as
         # convergence_reached.
         print("all_peers_healthy: no state.json yet (no ticks ran)")
         return 0
-    try:
-        # BUG-102/103: read via safe_io — refuse a symlinked state.json
-        # (CWE-59) and decode with replacement so non-UTF-8 bytes fail the
-        # gate via JSONDecodeError instead of an uncaught UnicodeDecodeError.
-        state = json.loads(read_text_no_symlink(state_path))
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError) as e:
         print(f"all_peers_healthy FAIL: state.json unreadable: {e}")
         return 1
-    peers = state.get("peers") or {}
+    try:
+        state = json.loads(raw_state)
+    except json.JSONDecodeError as e:
+        print(f"all_peers_healthy FAIL: state.json unreadable: {e}")
+        return 1
+    if not isinstance(state, dict):
+        print(
+            "all_peers_healthy FAIL: state.json root is not a mapping "
+            f"(got {type(state).__name__})"
+        )
+        return 1
+    peers = state.get("peers", {})
     if not isinstance(peers, dict):
         print(
             "all_peers_healthy FAIL: state.peers is not a mapping "
@@ -49,18 +73,30 @@ def main(root: str = ".") -> int:
     unavailable: list[str] = []
     for name, info in peers.items():
         if not isinstance(info, dict):
-            continue
+            print(
+                "all_peers_healthy FAIL: "
+                f"state.peers.{name} is not a mapping "
+                f"(got {type(info).__name__})"
+            )
+            return 1
         if info.get("state") == "unavailable":
             reason = info.get("unavailable_reason", "no reason recorded")
             at_iter = info.get("unavailable_at_iter", "?")
             snippet = info.get("unavailable_snippet", "")
             line = f"{name} @iter={at_iter}: {reason}"
             if snippet:
-                line += f" snippet={snippet[:120]!r}"
+                line += f" snippet={str(snippet)[:120]!r}"
             unavailable.append(line)
     # Also surface exit_events with `peer-unavailable:` so a halted
     # run shows the gate as red on the next `peers verify`.
-    for ev in state.get("exit_events") or []:
+    exit_events = state.get("exit_events", [])
+    if not isinstance(exit_events, list):
+        print(
+            "all_peers_healthy FAIL: state.exit_events is not a list "
+            f"(got {type(exit_events).__name__})"
+        )
+        return 1
+    for ev in exit_events:
         if not isinstance(ev, dict):
             continue
         reason = ev.get("reason", "")

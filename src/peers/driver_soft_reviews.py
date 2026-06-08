@@ -15,6 +15,79 @@ def _looks_like_git_sha(value: str) -> bool:
     return bool(_GIT_SHA_RE.fullmatch(value.strip()))
 
 
+def _default_soft_status() -> dict[str, Any]:
+    return {
+        "consensus_count": 0,
+        "last_pass": None,
+        "history": [],
+        "alt_cursor": 0,
+        "per_peer": {},
+    }
+
+
+def _soft_status_map(state: dict[str, Any]) -> dict[str, Any]:
+    soft_status = state.get("soft_status", {})
+    if isinstance(soft_status, dict):
+        return soft_status
+    return {}
+
+
+def _mutable_soft_status_map(state: dict[str, Any]) -> dict[str, Any]:
+    soft_status = state.get("soft_status")
+    if isinstance(soft_status, dict):
+        return soft_status
+    soft_status = {}
+    state["soft_status"] = soft_status
+    return soft_status
+
+
+def _soft_goal_status(soft_status: dict[str, Any], goal_id: str) -> dict[str, Any]:
+    status = soft_status.get(goal_id, {})
+    if isinstance(status, dict):
+        return status
+    return {}
+
+
+def _config_goals_map(state: dict[str, Any]) -> dict[str, Any]:
+    config = state.get("config", {})
+    if not isinstance(config, dict):
+        return {}
+    goals = config.get("goals", {})
+    if isinstance(goals, dict):
+        return goals
+    return {}
+
+
+def _mutable_soft_goal_status(
+    soft_status: dict[str, Any],
+    goal_id: str,
+) -> dict[str, Any]:
+    status = soft_status.get(goal_id)
+    if isinstance(status, dict):
+        return status
+    status = _default_soft_status()
+    soft_status[goal_id] = status
+    return status
+
+
+def _valid_consensus_count(entry: object, need: int) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    count = entry.get("consensus_count", 0)
+    return (
+        isinstance(count, int)
+        and not isinstance(count, bool)
+        and count >= need
+    )
+
+
+def _next_consensus_count(entry: dict[str, Any]) -> int:
+    count = entry.get("consensus_count", 0)
+    if isinstance(count, int) and not isinstance(count, bool):
+        return count + 1
+    return 1
+
+
 def soft_consensus_required_for_convergence(state: dict[str, Any]) -> bool:
     """Item 8: operators can disable the soft-consensus convergence gate
     via .peers/config.yaml -> goals.soft_consensus_required: false.
@@ -25,7 +98,7 @@ def soft_consensus_required_for_convergence(state: dict[str, Any]) -> bool:
     many ticks. Operators who want hard-gate-driven convergence can opt
     out. Default True preserves legacy strict semantics.
     """
-    cfg_goals = ((state.get("config") or {}).get("goals") or {})
+    cfg_goals = _config_goals_map(state)
     raw = cfg_goals.get("soft_consensus_required", True)
     if isinstance(raw, bool):
         return raw
@@ -50,11 +123,11 @@ class DriverSoftReviewsMixin:
         """
         order = state["peer_order"]
         out: list[Goal] = []
-        soft_status = state.get("soft_status", {})
+        soft_status = _soft_status_map(state)
         for g in self.goals:
             if g.type != "soft":
                 continue
-            sg = soft_status.get(g.id, {})
+            sg = _soft_goal_status(soft_status, g.id)
             if self._soft_goal_passed(g, sg, n_peers=len(order)):
                 continue  # already green
             mode = g.reviewer or "other"
@@ -78,29 +151,39 @@ class DriverSoftReviewsMixin:
         in state['soft_status'][g.id]['alt_cursor']. Advances after
         each successful review (see _record_soft_review_from_commit).
         """
-        sg = state.setdefault("soft_status", {}).setdefault(
-            g.id,
-            {"consensus_count": 0, "last_pass": None,
-             "history": [], "alt_cursor": 0},
-        )
+        soft_status = _mutable_soft_status_map(state)
+        sg = _mutable_soft_goal_status(soft_status, g.id)
         cursor = sg.get("alt_cursor", 0)
         n = len(state["peer_order"])
         if n <= 0:
             return None
+        if not isinstance(cursor, int) or isinstance(cursor, bool):
+            cursor = 0
         return cursor % n
 
     def _soft_goal_passed(self, g: Goal, sg: dict[str, Any],
                           n_peers: int) -> bool:
         """Centralizes "is this soft goal considered green" given the
         reviewer mode."""
+        if not isinstance(sg, dict):
+            return False
         mode = g.reviewer or "other"
         if mode == "quorum":
             assert g.quorum_num and g.quorum_den, "quorum without N/M"
             # Last `quorum_den` reviews must contain ≥ quorum_num pass.
-            recent = sg.get("history", [])[-g.quorum_den:]
+            history = sg.get("history", [])
+            if not isinstance(history, list):
+                history = []
+            recent = history[-g.quorum_den:]
             if len(recent) < g.quorum_den:
                 return False
-            return sum(1 for r in recent if r.get("pass")) >= g.quorum_num
+            return (
+                sum(
+                    1 for r in recent
+                    if isinstance(r, dict) and r.get("pass") is True
+                )
+                >= g.quorum_num
+            )
         if mode == "both":
             # Every peer must have submitted `consensus_needed`
             # consecutive pass:true reviews. With n=2 that literally
@@ -108,15 +191,17 @@ class DriverSoftReviewsMixin:
             # reviewed" (the mode's name is preserved but its semantics
             # generalise to n peers).
             per_peer = sg.get("per_peer", {})
+            if not isinstance(per_peer, dict):
+                per_peer = {}
             need = g.consensus_needed
             reviewers_needed = max(n_peers, 1)
             sufficient_reviewers = sum(
                 1 for v in per_peer.values()
-                if v.get("consensus_count", 0) >= need
+                if _valid_consensus_count(v, need)
             )
             return sufficient_reviewers >= reviewers_needed
         # other / alternating: a single rolling counter.
-        return sg.get("consensus_count", 0) >= g.consensus_needed
+        return _valid_consensus_count(sg, g.consensus_needed)
 
     def _all_green_including_soft(self, state: dict[str, Any]) -> bool:
         """All hard gates pass AND (optionally) all soft goals have consensus.
@@ -132,10 +217,11 @@ class DriverSoftReviewsMixin:
         if not soft_consensus_required_for_convergence(state):
             return True
         n = len(state["peer_order"])
+        soft_status = _soft_status_map(state)
         for g in self.goals:
             if g.type != "soft":
                 continue
-            sg = state.get("soft_status", {}).get(g.id, {})
+            sg = _soft_goal_status(soft_status, g.id)
             if not self._soft_goal_passed(g, sg, n_peers=n):
                 return False
         return True
@@ -209,11 +295,8 @@ class DriverSoftReviewsMixin:
             )
             return False
         passed = bool(payload.get("pass"))
-        soft = state.setdefault("soft_status", {}).setdefault(
-            goal_id,
-            {"consensus_count": 0, "last_pass": None,
-             "history": [], "alt_cursor": 0, "per_peer": {}},
-        )
+        soft_status = _mutable_soft_status_map(state)
+        soft = _mutable_soft_goal_status(soft_status, goal_id)
         mode = target_goal.reviewer or "other"
 
         # Rolling counter (used ONLY by other/alternating). Bumping it
@@ -222,9 +305,7 @@ class DriverSoftReviewsMixin:
         if mode in ("other", "alternating"):
             if passed:
                 if soft.get("last_pass") is True:
-                    soft["consensus_count"] = (
-                        soft.get("consensus_count", 0) + 1
-                    )
+                    soft["consensus_count"] = _next_consensus_count(soft)
                 else:
                     soft["consensus_count"] = 1
                 soft["last_pass"] = True
@@ -233,12 +314,18 @@ class DriverSoftReviewsMixin:
                 soft["last_pass"] = False
 
         # Per-peer counter (used by `both`).
-        per_peer = soft.setdefault("per_peer", {})
+        per_peer = soft.get("per_peer", {})
+        if not isinstance(per_peer, dict):
+            per_peer = {}
+            soft["per_peer"] = per_peer
         pp = per_peer.setdefault(reviewer, {"consensus_count": 0,
                                             "last_pass": None})
+        if not isinstance(pp, dict):
+            pp = {"consensus_count": 0, "last_pass": None}
+            per_peer[reviewer] = pp
         if passed:
             if pp.get("last_pass") is True:
-                pp["consensus_count"] = pp.get("consensus_count", 0) + 1
+                pp["consensus_count"] = _next_consensus_count(pp)
             else:
                 pp["consensus_count"] = 1
             pp["last_pass"] = True
@@ -251,14 +338,20 @@ class DriverSoftReviewsMixin:
         if mode == "alternating":
             n = len(state.get("peer_order") or [])
             if n > 0:
-                soft["alt_cursor"] = (soft.get("alt_cursor", 0) + 1) % n
+                cursor = soft.get("alt_cursor", 0)
+                if not isinstance(cursor, int) or isinstance(cursor, bool):
+                    cursor = 0
+                soft["alt_cursor"] = (cursor + 1) % n
 
-        soft.setdefault("history", []).append({
+        history = soft.get("history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append({
             "pass": passed,
             "reviewer": reviewer,
             "sha": commit.sha,
             "notes": payload.get("notes", ""),
         })
         # Keep history bounded.
-        soft["history"] = soft["history"][-20:]
+        soft["history"] = history[-20:]
         return True

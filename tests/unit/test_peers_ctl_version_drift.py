@@ -120,6 +120,27 @@ def test_enforce_drift_ok_passes_through(monkeypatch):
     assert level == "ok"
 
 
+def test_modes_applied_reader_refuses_symlinked_file_BUG_242(tmp_path):
+    """BUG-242: unsafe mode trails must not downgrade audit drift checks."""
+    import peers_ctl.runner as runner_mod
+
+    repo = tmp_path / "repo"
+    peers = repo / ".peers"
+    peers.mkdir(parents=True)
+    forged = tmp_path / "forged-modes-applied.txt"
+    forged.write_text("2026-06-07T00:00:00  implement  v1  sha256=abc\n")
+    (peers / "modes-applied.txt").symlink_to(forged)
+    project = SimpleNamespace(path=str(repo))
+
+    try:
+        runner_mod._read_project_modes_applied(project)
+    except (OSError, RuntimeError, ValueError):
+        return
+    raise AssertionError(
+        "symlinked modes-applied.txt was parsed instead of refused"
+    )
+
+
 def test_image_version_query_uses_explicit_network(monkeypatch):
     import peers_ctl.runner as runner_mod
 

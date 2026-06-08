@@ -199,3 +199,36 @@ def test_checkpoint_flag_writes_marker_on_start(tmp_path):
     # error — never an argparse-level "unrecognized arguments" complaint.
     assert "unrecognized arguments" not in res.stderr.lower()
     assert "--checkpoint" not in res.stderr.lower() or res.returncode == 0
+
+
+def test_start_checkpoint_refuses_symlinked_peers_dir_BUG_235(
+    tmp_path, monkeypatch, capsys,
+):
+    """BUG-235: --checkpoint must not write through a symlinked .peers dir."""
+    from peers_ctl import cli as cli_mod
+    from peers_ctl.store import Project, Store
+
+    cfg = tmp_path / "ctl"
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    outside = tmp_path / "outside-peers"
+    outside.mkdir()
+    (repo / ".peers").symlink_to(outside, target_is_directory=True)
+    Store(cfg).add(Project(name="proj", path=str(repo)))
+
+    started: list[bool] = []
+
+    def fake_start_project(*args, **kwargs):
+        started.append(True)
+        return 12345
+
+    monkeypatch.setattr(cli_mod, "start_project", fake_start_project)
+
+    rc = cli_mod.cmd_start("proj", checkpoint=True, config_dir=cfg)
+
+    assert rc != 0
+    assert started == []
+    assert not (outside / "checkpoint_requested").exists()
+    err = capsys.readouterr().err.lower()
+    assert "checkpoint" in err
+    assert "symlink" in err or "refus" in err or "not a directory" in err

@@ -50,6 +50,11 @@ import sys
 from pathlib import Path
 
 from peers.attest import attested_peer
+from peers_ctl.justifications import (
+    JustificationError,
+    signers_for_file,
+    verify_log_chain,
+)
 from peers_ctl.plan_parser import PlanValidationError, parse_plan
 
 
@@ -100,10 +105,13 @@ def _find_checkoff_commit(project_root: Path, step_id: str) -> str | None:
 
     The transition is identified by a single commit's diff containing
     both an ``+- [x] [STEP-N]`` line AND an ``-- [ ] [STEP-N]`` line
-    (i.e. the same step removed unchecked and re-added checked). The
-    first commit (oldest-first) with that pattern is the checkoff
-    commit — later flips/re-flips are not Task 3.2's concern.
+    (i.e. the same step removed unchecked and re-added checked). BUG-007:
+    return the LATEST such transition (not the first), so a peer can
+    correct a wrong-author checkoff by unchecking and re-attesting — the
+    gate then evaluates the CURRENT checkoff identity, not a stale one
+    that would latch the step into a permanent failure.
     """
+    latest: str | None = None
     for sha in _plan_commits(project_root):
         diff = _commit_plan_diff(project_root, sha)
         removed_open = False
@@ -119,8 +127,8 @@ def _find_checkoff_commit(project_root: Path, step_id: str) -> str | None:
             elif sign == "+" and mark == "x":
                 added_done = True
         if removed_open and added_done:
-            return sha
-    return None
+            latest = sha
+    return latest
 
 
 # Each peer's commits carry a `Peer: <name>` trailer in the message body,
@@ -239,6 +247,34 @@ def _last_impl_identity(
     return _commit_identity(project_root, impl_sha)
 
 
+def _has_independent_review(
+    plan_dir: Path, path: str, impl_id: CommitIdentity
+) -> bool:
+    """True when a signed justification for ``path`` was made by a peer OTHER
+    than the file's implementer — i.e. an independent review exists, satisfying
+    the two-key rule for a co-implemented file the checkoff peer also authored.
+
+    Only honored when the implementer has a peer identity (the normal
+    attested/``Peer:``-trailer case). For legacy email-only commits we cannot
+    reliably attribute a peer-name reviewer, so no justification escape applies
+    (the step must then be checked off by a genuinely different peer).
+
+    NB (FU-2, docs/plans/2026-06-07-justification-baseline-integrity-followups):
+    the justifications.log reviewer field is keyless-chain-signed, so it is
+    tamper-evident but not authorship-bound — a peer could forge an entry naming
+    the other peer. This escape runs at the subsystem's established trust level
+    (same as no_shortcut/no_skipped); the gate's PRIMARY identity check stays the
+    unforgeable peers-attest note. Authorship binding is tracked separately.
+    """
+    impl_peer = impl_id[0]
+    if not impl_peer:
+        return False
+    return any(
+        f"peer:{signer.lower()}" != impl_peer
+        for signer in signers_for_file(plan_dir, path)
+    )
+
+
 def main(project_dir: str = ".") -> int:
     """Verify all step checkoffs were done by a different peer than the
     implementer of the step's ``touches:`` files.
@@ -267,6 +303,16 @@ def main(project_dir: str = ".") -> int:
         print("checkoff-by-other-peer: clean (no enforceable checkoffs)")
         return 0
 
+    # A tampered justifications log must not silently bless a self-checkoff: if
+    # the chain is broken we proceed as if there were NO justifications (fail
+    # closed — self-blessed files then surface as violations).
+    plan_dir = project_root / ".peers"
+    try:
+        verify_log_chain(plan_dir)
+        justifications_ok = True
+    except JustificationError:
+        justifications_ok = False
+
     violations: list[str] = []
     for step in checked_with_touches:
         checkoff_sha = _find_checkoff_commit(project_root, step.id)
@@ -284,13 +330,24 @@ def main(project_dir: str = ".") -> int:
                 # File was new in checkoff commit, or untracked before:
                 # plan-step-traceable handles that class of failure.
                 continue
-            if _identity_matches(impl_id, checkoff_id):
-                violations.append(
-                    f"  {step.id}: checkoff by "
-                    f"{_identity_label(checkoff_id)} matches "
-                    f"implementation author {_identity_label(impl_id)} "
-                    f"for {tf}"
-                )
+            if not _identity_matches(impl_id, checkoff_id):
+                # Checked off by a DIFFERENT peer than the file's author =
+                # independently reviewed by the checkoff itself. OK.
+                continue
+            # the same peer implemented AND checked off this file (the
+            # norm for co-implemented steps). Valid only if the OTHER peer
+            # signed an independent review of the file in
+            # .peers/justifications.log — otherwise it is a self-bless.
+            if justifications_ok and _has_independent_review(
+                plan_dir, tf, impl_id
+            ):
+                continue
+            violations.append(
+                f"  {step.id}: {tf} implemented and checked off by the same "
+                f"peer ({_identity_label(impl_id)}) with no independent "
+                f"review — the other peer must sign off in "
+                f".peers/justifications.log"
+            )
 
     if violations:
         print(

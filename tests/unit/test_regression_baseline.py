@@ -113,3 +113,68 @@ def test_run_check_forwards_extra_args(tmp_path: Path) -> None:
     rc = cmd_run_check(repo, "no_regression", ("--snapshot",))
     assert rc == 0
     assert (repo / ".peers" / "passing-baseline.txt").is_file()
+
+
+# --- skip-baseline snapshot (no-skipped-tests gate-scoping) ---------------
+#
+# Mirrors the no-prior-regression baseline above: snapshot the skips present
+# at run-start ONCE so inherited / pre-baseline skips are grandfathered and
+# don't block a fresh implement-mode run, while NEW skips still fail.
+
+
+def _make_repo_with_inherited_skip(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_skips.py").write_text(
+        "import pytest\n\n\n@pytest.mark.skip(reason='inherited')\n"
+        "def test_old():\n    pass\n"
+    )
+    (repo / ".peers").mkdir()
+    return repo
+
+
+def test_ensure_skip_baseline_creates_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    from peers.regression_baseline import ensure_skip_baseline
+    repo = _make_repo_with_inherited_skip(tmp_path)
+    peer_dir = repo / ".peers"
+    baseline = peer_dir / "skip-baseline.txt"
+
+    msg = ensure_skip_baseline(repo, peer_dir, ["no-skipped-tests"])
+    assert msg is not None
+    assert baseline.is_file()
+    assert "test_skips.py" in baseline.read_text()
+
+    # second call: baseline already present → no-op, file untouched
+    before = baseline.read_text()
+    assert ensure_skip_baseline(repo, peer_dir, ["no-skipped-tests"]) is None
+    assert baseline.read_text() == before
+
+
+def test_ensure_skip_baseline_noop_without_gate(tmp_path: Path) -> None:
+    from peers.regression_baseline import ensure_skip_baseline
+    repo = _make_repo_with_inherited_skip(tmp_path)
+    peer_dir = repo / ".peers"
+    assert ensure_skip_baseline(repo, peer_dir, ["tests-pass"]) is None
+    assert not (peer_dir / "skip-baseline.txt").exists()
+
+
+def test_ensure_skip_baseline_grandfathers_inherited_skip(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: after the snapshot, the gate passes on the inherited
+    skip but still fails a newly added one."""
+    from peers.regression_baseline import ensure_skip_baseline
+    from peers.cli import cmd_run_check
+    repo = _make_repo_with_inherited_skip(tmp_path)
+    peer_dir = repo / ".peers"
+
+    assert ensure_skip_baseline(repo, peer_dir, ["no-skipped-tests"])
+    # inherited skip is grandfathered → gate clean
+    assert cmd_run_check(repo, "no_skipped_tests", ()) == 0
+    # a brand-new unsigned skip is still a violation
+    (repo / "tests" / "test_new.py").write_text(
+        "import pytest\n@pytest.mark.skip\ndef test_new():\n    pass\n"
+    )
+    assert cmd_run_check(repo, "no_skipped_tests", ()) == 1

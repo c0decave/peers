@@ -322,11 +322,16 @@ def test_phase1_goal_mutation_allowed_when_paired_with_src_change(
     assert drv._goal_mutation_reason() is None
 
     # Peer simulates a paired feature commit:
-    #  - edits goals.yaml AND
+    #  - edits goals.yaml (a VALID new goal) AND
     #  - edits src/x.py
     # then commits BOTH together (single commit, two files).
+    # NB: the new goal must be well-formed — BUG-275 (v21 internal testing) makes the
+    # paired-mutation guard fail closed when the edited goals.yaml cannot be
+    # reloaded, so a malformed goal here would (correctly) halt. The
+    # invalid-reload case is covered by BUG-275's own reproducer.
     (pd / "goals.yaml").write_text(
-        "goals:\n  - id: new\n    type: hard\n    timeout_s: 300\n"
+        "goals:\n  - id: new\n    type: hard\n    cmd: \"true\"\n"
+        "    pass_when: \"exit_code == 0\"\n    timeout_s: 300\n"
     )
     (repo / "src" / "x.py").write_text("y = 1\ntimeout_s = 300\n")
     _git(repo, "add", ".peers/goals.yaml", "src/x.py")
@@ -392,6 +397,230 @@ def test_phase1_goal_mutation_halts_when_companion_is_inside_peers(
     _git(repo, "commit", "-q", "-m", "control-plane only")
     reason = drv._goal_mutation_reason()
     assert reason is not None
+
+
+# --- BUG-274: paired mutation acceptance must refresh engine.goals ---
+
+def test_BUG_274_paired_mutation_reloads_engine_goals(tmp_path: Path):
+    """Happy path: when _goal_mutation_reason accepts a paired
+    goals.yaml + src/ commit (no halt reason), the in-memory
+    self.goals AND self.engine.goals must be refreshed from disk so
+    subsequent gate evaluations execute the NEW cmd, not the one
+    frozen at OrchestratorDriver.__init__.
+
+    Reproduces the root cause that this run's stale ruff / mypy
+    gates surfaced: the orchestrator accepted commit 3dbf805 (which
+    swapped lint-clean / type-clean cmds to the stdlib fallbacks)
+    yet kept executing the original 'ruff check .' / 'mypy src/',
+    leaving both gates red on exit_code=127 for the rest of the
+    run.
+    """
+    from peers.goals import Goal
+    repo = _init_repo(tmp_path / "r")
+    pd = repo / ".peers"
+    pd.mkdir()
+    old_yaml = (
+        "goals:\n"
+        "  - id: x\n"
+        "    type: hard\n"
+        "    cmd: 'exit 1'\n"
+        "    pass_when: 'exit_code == 0'\n"
+    )
+    (pd / "goals.yaml").write_text(old_yaml)
+    (repo / "src").mkdir()
+    (repo / "src" / "x.py").write_text("y = 1\n")
+    _git(repo, "add", ".peers/goals.yaml", "src/x.py")
+    _git(repo, "commit", "-q", "-m", "init goals + src")
+
+    old_goal = Goal(
+        id="x", type="hard", cmd="exit 1", pass_when="exit_code == 0",
+    )
+    drv = OrchestratorDriver(
+        repo=repo, peer_dir=pd, goals=[old_goal],
+        peer_specs=_specs("claude", "codex"),
+    )
+    # Sanity: with OLD cmd, the gate fails.
+    res_before = drv.engine.evaluate_hard_gates()
+    assert res_before["x"].state == "fail"
+
+    # Peer commits a paired goals.yaml + src/ edit that swaps the
+    # cmd to one that passes.
+    new_yaml = (
+        "goals:\n"
+        "  - id: x\n"
+        "    type: hard\n"
+        "    cmd: 'exit 0'\n"
+        "    pass_when: 'exit_code == 0'\n"
+    )
+    (pd / "goals.yaml").write_text(new_yaml)
+    (repo / "src" / "x.py").write_text("y = 2\n")
+    _git(repo, "add", ".peers/goals.yaml", "src/x.py")
+    _git(repo, "commit", "-q", "-m", "swap gate cmd + apply")
+
+    # (e) accepts the paired mutation — no halt reason.
+    assert drv._goal_mutation_reason() is None
+    # the engine must now reflect the NEW cmd on disk.
+    assert drv.engine.goals[0].cmd == "exit 0"
+    assert drv.goals[0].cmd == "exit 0"
+    res_after = drv.engine.evaluate_hard_gates()
+    assert res_after["x"].state == "pass", (
+        f"BUG-274: after paired goals.yaml mutation accepted, the "
+        f"engine should run the NEW cmd 'exit 0' (pass); got "
+        f"state={res_after['x'].state}, "
+        f"diagnostic={res_after['x'].diagnostic!r}"
+    )
+
+
+def test_BUG_274_paired_mutation_adds_and_removes_goals(tmp_path: Path):
+    """Edge: a paired commit can ADD a new goal id and REMOVE an old
+    one. After acceptance, the engine's goal set must match disk:
+    the dropped id no longer evaluates, and the added id does."""
+    from peers.goals import Goal
+    repo = _init_repo(tmp_path / "r")
+    pd = repo / ".peers"
+    pd.mkdir()
+    old_yaml = (
+        "goals:\n"
+        "  - id: dropped\n"
+        "    type: hard\n"
+        "    cmd: 'exit 1'\n"
+        "    pass_when: 'exit_code == 0'\n"
+    )
+    (pd / "goals.yaml").write_text(old_yaml)
+    (repo / "src").mkdir()
+    (repo / "src" / "x.py").write_text("y = 1\n")
+    _git(repo, "add", ".peers/goals.yaml", "src/x.py")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    old_goal = Goal(
+        id="dropped", type="hard", cmd="exit 1",
+        pass_when="exit_code == 0",
+    )
+    drv = OrchestratorDriver(
+        repo=repo, peer_dir=pd, goals=[old_goal],
+        peer_specs=_specs("claude", "codex"),
+    )
+
+    # Paired commit: drop `dropped`, add `added`.
+    new_yaml = (
+        "goals:\n"
+        "  - id: added\n"
+        "    type: hard\n"
+        "    cmd: 'exit 0'\n"
+        "    pass_when: 'exit_code == 0'\n"
+    )
+    (pd / "goals.yaml").write_text(new_yaml)
+    (repo / "src" / "x.py").write_text("y = 2\n")
+    _git(repo, "add", ".peers/goals.yaml", "src/x.py")
+    _git(repo, "commit", "-q", "-m", "rotate goal id")
+
+    assert drv._goal_mutation_reason() is None
+    ids = {g.id for g in drv.engine.goals}
+    assert ids == {"added"}, (
+        f"BUG-274 edge: goal set must reflect disk; got {ids!r}"
+    )
+    res = drv.engine.evaluate_hard_gates()
+    assert "dropped" not in res
+    assert res["added"].state == "pass"
+
+
+def test_BUG_274_unpaired_mutation_does_not_reload_goals(tmp_path: Path):
+    """Sad: a pure goals.yaml edit (no companion src/ change) MUST
+    NOT trigger a reload — _goal_mutation_reason returns a halt
+    string and the in-memory goals stay frozen, preserving the anti-
+    gaming guarantee. If a peer could mutate goals.yaml alone and
+    have it take effect, the entire mutation lock collapses."""
+    from peers.goals import Goal
+    repo = _init_repo(tmp_path / "r")
+    pd = repo / ".peers"
+    pd.mkdir()
+    old_yaml = (
+        "goals:\n"
+        "  - id: strict\n"
+        "    type: hard\n"
+        "    cmd: 'exit 1'\n"
+        "    pass_when: 'exit_code == 0'\n"
+    )
+    (pd / "goals.yaml").write_text(old_yaml)
+    (repo / "src").mkdir()
+    (repo / "src" / "x.py").write_text("y = 1\n")
+    _git(repo, "add", ".peers/goals.yaml", "src/x.py")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    strict = Goal(
+        id="strict", type="hard", cmd="exit 1",
+        pass_when="exit_code == 0",
+    )
+    drv = OrchestratorDriver(
+        repo=repo, peer_dir=pd, goals=[strict],
+        peer_specs=_specs("claude", "codex"),
+    )
+
+    # Pure goals.yaml edit (no paired src/ change).
+    relaxed_yaml = (
+        "goals:\n"
+        "  - id: strict\n"
+        "    type: hard\n"
+        "    cmd: 'exit 0'\n"
+        "    pass_when: 'exit_code == 0'\n"
+    )
+    (pd / "goals.yaml").write_text(relaxed_yaml)
+    _git(repo, "add", ".peers/goals.yaml")
+    _git(repo, "commit", "-q", "-m", "loosen gate (unpaired)")
+
+    reason = drv._goal_mutation_reason()
+    assert reason is not None  # halt
+    # Anti-gaming: engine must keep OLD cmd, not pick up the
+    # loosened one from disk.
+    assert drv.engine.goals[0].cmd == "exit 1"
+    assert drv.goals[0].cmd == "exit 1"
+
+
+def test_BUG_275_malformed_paired_mutation_halts_without_snapshot_advance(
+    tmp_path: Path,
+):
+    """Sad: a paired goals.yaml + src/ commit whose goals file is malformed
+    must fail closed. The old in-memory goals stay active and the hash
+    snapshot is NOT advanced, so the next tick can retry after repair."""
+    from peers.goals import Goal
+    repo = _init_repo(tmp_path / "r")
+    pd = repo / ".peers"
+    pd.mkdir()
+    old_yaml = (
+        "goals:\n"
+        "  - id: strict\n"
+        "    type: hard\n"
+        "    cmd: 'exit 1'\n"
+        "    pass_when: 'exit_code == 0'\n"
+    )
+    (pd / "goals.yaml").write_text(old_yaml)
+    (repo / "src").mkdir()
+    (repo / "src" / "x.py").write_text("y = 1\n")
+    _git(repo, "add", ".peers/goals.yaml", "src/x.py")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    strict = Goal(
+        id="strict", type="hard", cmd="exit 1",
+        pass_when="exit_code == 0",
+    )
+    drv = OrchestratorDriver(
+        repo=repo, peer_dir=pd, goals=[strict],
+        peer_specs=_specs("claude", "codex"),
+    )
+    snapshot_before = drv._goal_hash_snapshot
+
+    (pd / "goals.yaml").write_text("goals: [\n")
+    (repo / "src" / "x.py").write_text("y = 2\n")
+    _git(repo, "add", ".peers/goals.yaml", "src/x.py")
+    _git(repo, "commit", "-q", "-m", "bad paired goals")
+
+    reason = drv._goal_mutation_reason()
+
+    assert reason is not None
+    assert "reload" in reason.lower() or "invalid" in reason.lower()
+    assert drv._goal_hash_snapshot == snapshot_before
+    assert drv.engine.goals[0].cmd == "exit 1"
+    assert drv.goals[0].cmd == "exit 1"
 
 
 # --- G8: test-tampering detector --------------------------------------
@@ -565,6 +794,154 @@ def test_reviewer_both_requires_per_peer_consensus(tmp_path: Path):
         reviewer="codex",
     )
     assert drv._soft_goal_passed(soft, sg, n_peers=2)
+
+
+@pytest.mark.parametrize(
+    ("goal_kwargs", "status"),
+    [
+        (
+            {"id": "other-bool", "reviewer": "other", "consensus_needed": 1},
+            {"consensus_count": True},
+        ),
+        (
+            {"id": "both-bool", "reviewer": "both", "consensus_needed": 1},
+            {
+                "per_peer": {
+                    "claude": {"consensus_count": True},
+                    "codex": {"consensus_count": True},
+                },
+            },
+        ),
+        (
+            {"id": "quorum-string", "reviewer": "quorum", "quorum": (1, 1)},
+            {"history": [{"pass": "yes"}]},
+        ),
+        (
+            {"id": "both-bad-container", "reviewer": "both", "consensus_needed": 1},
+            {"per_peer": ["not", "a", "mapping"]},
+        ),
+    ],
+)
+def test_runtime_soft_consensus_rejects_malformed_state_BUG_258(
+    tmp_path: Path,
+    goal_kwargs: dict,
+    status: dict,
+):
+    """BUG-258: corrupted runtime soft_status must not pass or crash.
+
+    Dashboard-only hardening already ignores malformed soft-goal state, but the
+    live orchestrator convergence path should apply the same fail-closed rule:
+    malformed counters/containers are insufficient consensus, not green state.
+    """
+    from peers.goals import Goal
+
+    repo = _init_repo(tmp_path / "r")
+    pd = repo / ".peers"
+    pd.mkdir()
+    quorum = goal_kwargs.get("quorum")
+    fields = {k: v for k, v in goal_kwargs.items() if k != "quorum"}
+    soft = Goal(
+        type="soft",
+        prompt="p",
+        quorum_num=quorum[0] if quorum else None,
+        quorum_den=quorum[1] if quorum else None,
+        **fields,
+    )
+    drv = OrchestratorDriver(
+        repo=repo, peer_dir=pd, goals=[soft],
+        peer_specs=_specs("claude", "codex"),
+    )
+    state = copy.deepcopy(DEFAULT_STATE)
+    state["soft_status"] = {soft.id: status}
+
+    assert drv._all_green_including_soft(state) is False
+
+
+def test_soft_review_pending_treats_malformed_status_root_as_empty_BUG_258(
+    tmp_path: Path,
+):
+    """BUG-258 adjacent edge: root soft_status corruption should schedule
+    the review as still-open rather than crashing the tick."""
+    from peers.goals import Goal
+
+    repo = _init_repo(tmp_path / "r")
+    pd = repo / ".peers"
+    pd.mkdir()
+    soft = Goal(
+        id="root-bad",
+        type="soft",
+        prompt="p",
+        reviewer="other",
+        consensus_needed=1,
+    )
+    drv = OrchestratorDriver(
+        repo=repo,
+        peer_dir=pd,
+        goals=[soft],
+        peer_specs=_specs("claude", "codex"),
+    )
+    state = copy.deepcopy(DEFAULT_STATE)
+    state["soft_status"] = ["not", "a", "mapping"]
+
+    assert [g.id for g in drv._soft_reviews_pending(state, "claude")] == [
+        "root-bad",
+    ]
+
+
+def test_soft_review_record_repairs_malformed_goal_status_BUG_258(
+    tmp_path: Path,
+):
+    """BUG-258 adjacent sad path: a valid incoming review should overwrite
+    malformed mutable slots instead of failing before the handoff can finish."""
+    from peers.goals import Goal
+
+    repo = _init_repo(tmp_path / "r")
+    pd = repo / ".peers"
+    pd.mkdir()
+    soft = Goal(
+        id="repair",
+        type="soft",
+        prompt="p",
+        reviewer="alternating",
+        consensus_needed=1,
+    )
+    drv = OrchestratorDriver(
+        repo=repo,
+        peer_dir=pd,
+        goals=[soft],
+        peer_specs=_specs("claude", "codex"),
+    )
+    state = copy.deepcopy(DEFAULT_STATE)
+    state["soft_status"] = {
+        "repair": {
+            "consensus_count": "bad",
+            "last_pass": True,
+            "per_peer": {"claude": ["bad"]},
+            "history": {"not": "a list"},
+            "alt_cursor": "bad",
+        },
+    }
+
+    assert drv._record_soft_review_from_commit(
+        state,
+        _Commit('{"pass": true, "notes": "ok"}',
+                {"Peer-Review-Of": "repair", "Peer": "claude"},
+                "c" * 40),
+        reviewer="claude",
+    ) is True
+
+    repaired = state["soft_status"]["repair"]
+    assert repaired["consensus_count"] == 1
+    assert repaired["per_peer"]["claude"]["consensus_count"] == 1
+    assert repaired["history"] == [
+        {
+            "pass": True,
+            "reviewer": "claude",
+            "sha": "c" * 40,
+            "notes": "ok",
+        },
+    ]
+    assert repaired["alt_cursor"] == 1
 
 
 def test_reviewer_alternating_picks_correct_peer(tmp_path: Path):

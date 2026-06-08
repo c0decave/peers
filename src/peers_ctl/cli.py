@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.resources
+import io
 from collections import deque
 import datetime as _dt
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -26,10 +29,13 @@ from peers.help_man import (
 )
 from peers.peer_spec import apply_peer_field_overrides
 from peers.safe_io import (
+    atomic_write_text_in_dir_no_symlink,
     open_text_in_dir_no_symlink,
     open_text_read_no_symlink,
     read_bytes_no_symlink,
+    read_bytes_under_root_no_follow,
     read_text_no_symlink,
+    read_text_under_root_no_follow,
     write_text_no_symlink,
 )
 from peers_ctl.contracts import (
@@ -48,6 +54,12 @@ from peers_ctl.store import (
 
 _DEFAULT_PROJECTS_ROOT = Path.home() / "c0de" / "peers-c0de"
 _DASHBOARD_STATE_MAX_BYTES = 5 * 1024 * 1024
+_CLI_STATE_MAX_BYTES = 5 * 1024 * 1024
+_ACK_BLOCK_PLAN_MAX_BYTES = 2 * 1024 * 1024
+# cap runs.jsonl reads from dashboard/report paths the same way
+# compare does (32 MB). Truncating the tail of a malicious runs.jsonl is
+# harmless: the dashboard is a forensic snapshot, not transactional.
+_CLI_RUNS_MAX_BYTES = 32 * 1024 * 1024
 
 
 def projects_root() -> Path:
@@ -741,21 +753,30 @@ def cmd_new(path: Path, name: str | None = None,
                   file=sys.stderr)
             return 1
     else:
-        init_argv = ["peers", "-C", str(target), "init"]
-        if force:
-            init_argv.append("--force")
-        if driver != "orchestrator":
-            init_argv += ["--driver", driver]
-        if init_modes:
-            init_argv += ["--modes", ",".join(init_modes)]
-            init_argv += ["--lang", lang]
-        r = subprocess.run(init_argv, capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"peers init failed: {r.stderr.strip()}",
-                  file=sys.stderr)
+        # Run host init through the imported package, not the first
+        # `peers` executable on PATH. In source checkouts/tests the PATH
+        # script can point at an older installed wheel with stale templates.
+        from peers.cli import cmd_init as _peers_cmd_init
+
+        init_stdout = io.StringIO()
+        init_stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(init_stdout),
+            contextlib.redirect_stderr(init_stderr),
+        ):
+            rc = _peers_cmd_init(
+                target,
+                force=force,
+                driver=driver,
+                modes=init_modes,
+                lang=lang,
+            )
+        stderr_text = init_stderr.getvalue().strip()
+        if rc != 0:
+            print(f"peers init failed: {stderr_text}", file=sys.stderr)
             return 1
-        if r.stderr.strip():
-            print(r.stderr.strip(), file=sys.stderr)
+        if stderr_text:
+            print(stderr_text, file=sys.stderr)
 
     if peer_model or peer_reasoning or peer_provider:
         cfg_path = target / ".peers" / "config.yaml"
@@ -920,12 +941,28 @@ def cmd_ack_block(
         print(f"peers-ctl: invalid step id {step_id!r} "
               "(expected STEP-N)", file=sys.stderr)
         return 2
-    # Read current PLAN.md and locate the target step line. We allow
-    # any current state marker so that we can give a precise error
-    # message ("not blocked") rather than a generic "not found".
+    # Read current PLAN.md and locate the target step line. PLAN.md is
+    # peer-writable, so read through the no-follow helper with a hard cap
+    # before decoding; otherwise a corrupted plan can crash the host
+    # controller or a symlinked/huge plan can be parsed unexpectedly.
     try:
-        plan_text = plan_path.read_text(encoding="utf-8")
-    except OSError as e:
+        plan_bytes = read_bytes_no_symlink(
+            plan_path, max_bytes=_ACK_BLOCK_PLAN_MAX_BYTES + 1
+        )
+        if len(plan_bytes) > _ACK_BLOCK_PLAN_MAX_BYTES:
+            raise ValueError(
+                "PLAN.md too large "
+                f"(max {_ACK_BLOCK_PLAN_MAX_BYTES} bytes)"
+            )
+        plan_text = plan_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        print(
+            f"peers-ctl: cannot read {plan_path}: "
+            f"PLAN.md is not valid UTF-8: {e}",
+            file=sys.stderr,
+        )
+        return 1
+    except (OSError, ValueError) as e:
         print(f"peers-ctl: cannot read {plan_path}: {e}", file=sys.stderr)
         return 1
     step_marker_re = re.compile(
@@ -959,14 +996,6 @@ def cmd_ack_block(
               f"(current marker: [{found_state}])", file=sys.stderr)
         return 1
     new_text = "".join(new_lines)
-    # Write back via the safe helper to avoid symlink-swap races on
-    # the operator-visible PLAN.md path.
-    try:
-        write_text_no_symlink(plan_path, new_text)
-    except OSError as e:
-        print(f"peers-ctl: cannot rewrite PLAN.md safely: {e}",
-              file=sys.stderr)
-        return 1
     # Append hash-chained audit entry to .peers/blocks.log. Mirrors
     # the contracts.log chain format (16-char sha256 prefix per line).
     plan_dir = proj_dir / ".peers"
@@ -981,35 +1010,51 @@ def cmd_ack_block(
         f"{timestamp} ack-block {step_id} | reason: {reason}\n"
     )
     prev = "genesis"
-    # read/append must refuse symlinks at .peers/blocks.log
-    # so a project-controlled symlink cannot redirect the operator's
-    # audit-log append outside the project or poison the chain prev.
-    if not log_path.is_symlink() and log_path.is_file():
-        try:
-            with open_text_read_no_symlink(log_path) as f:
-                for log_line in f:
-                    log_line = log_line.rstrip("\n")
-                    if not log_line:
-                        continue
-                    prefix, _, _ = log_line.partition(" ")
-                    prev = prefix
-        except OSError as e:
-            print(f"peers-ctl: cannot read {log_path}: {e}", file=sys.stderr)
-            return 1
-    elif log_path.is_symlink():
+    # BUG-165/237: read/append must refuse symlinks at .peers/blocks.log
+    # and at the .peers ancestor before PLAN.md is rewritten. Otherwise a
+    # failed audit-log append can leave an unaudited [BLOCKED-ACK] marker.
+    if log_path.is_symlink():
         print(
             f"peers-ctl: refusing to follow symlink at {log_path}",
             file=sys.stderr,
         )
         return 1
+    try:
+        log_text = read_text_under_root_no_follow(
+            proj_dir, (".peers", "blocks.log"),
+        )
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        print(f"peers-ctl: cannot read {log_path}: {e}", file=sys.stderr)
+        return 1
+    else:
+        for log_line in log_text.splitlines():
+            if not log_line:
+                continue
+            prefix, _, _ = log_line.partition(" ")
+            prev = prefix
     chain_prefix = hashlib.sha256(
         (prev + entry_text).encode("utf-8")
     ).hexdigest()[:16]
     try:
         with open_text_in_dir_no_symlink(plan_dir, "blocks.log", "a") as f:
+            # opening the audit file is not enough. Commit the
+            # hash-chain entry before PLAN.md can change, otherwise a late
+            # buffered write failure leaves an unaudited [BLOCKED-ACK].
             f.write(f"{chain_prefix} {entry_text}")
+            f.flush()
+            os.fsync(f.fileno())
     except OSError as e:
         print(f"peers-ctl: cannot append to {log_path}: {e}",
+              file=sys.stderr)
+        return 1
+    # Write back via the safe helper to avoid symlink-swap races on
+    # the operator-visible PLAN.md path.
+    try:
+        write_text_no_symlink(plan_path, new_text)
+    except OSError as e:
+        print(f"peers-ctl: cannot rewrite PLAN.md safely: {e}",
               file=sys.stderr)
         return 1
     print(f"peers-ctl: {step_id} acknowledged "
@@ -1078,19 +1123,79 @@ def _resolve_project_dir(name: str, config_dir: Path | None = None) -> Path:
     return projects_root() / name
 
 
-def _read_project_budget_cap(proj_dir: Path) -> int:
-    state_path = proj_dir / ".peers" / "state.json"
-    if not state_path.is_file():
-        return 0
+def _open_project_peers_dir_no_symlink(proj_dir: Path) -> int:
+    peers_dir = proj_dir / ".peers"
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(str(peers_dir), flags)
     try:
-        data = json.loads(state_path.read_text())
-    except (OSError, ValueError):
+        st = os.fstat(fd)
+        lst = peers_dir.lstat()
+        if stat.S_ISLNK(lst.st_mode):
+            raise OSError(f"refusing symlinked .peers directory: {peers_dir}")
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"refusing non-directory .peers path: {peers_dir}")
+        if (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino):
+            raise OSError(f"refusing swapped .peers directory: {peers_dir}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _clear_resume_markers(peers_dir: Path, peers_fd: int) -> list[str]:
+    cleared: list[str] = []
+    for marker_name in ("checkpoint_requested", "awaiting_user"):
+        marker = peers_dir / marker_name
+        try:
+            st = os.stat(
+                marker_name, dir_fd=peers_fd, follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            raise OSError(f"refusing to remove symlinked marker: {marker}")
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"refusing to remove non-regular marker: {marker}")
+        os.unlink(marker_name, dir_fd=peers_fd)
+        cleared.append(marker_name)
+    return cleared
+
+
+def _read_project_state_for_cli(proj_dir: Path) -> dict | None:
+    try:
+        raw = read_bytes_under_root_no_follow(
+            proj_dir, [".peers", "state.json"],
+            max_bytes=_CLI_STATE_MAX_BYTES + 1,
+        )
+        if len(raw) > _CLI_STATE_MAX_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_project_budget_cap(proj_dir: Path) -> int:
+    data = _read_project_state_for_cli(proj_dir)
+    if data is None:
         return 0
     budget = data.get("budget") if isinstance(data, dict) else None
     if not isinstance(budget, dict):
         return 0
     cap = budget.get("max_runtime_s")
     return cap if isinstance(cap, int) and cap > 0 else 0
+
+
+def _resume_budget_mapping(state: dict) -> dict:
+    budget = state.get("budget")
+    if isinstance(budget, dict):
+        return budget
+    budget = {}
+    state["budget"] = budget
+    return budget
 
 
 def _apply_resume_budget(
@@ -1102,17 +1207,10 @@ def _apply_resume_budget(
     if max_runtime is None and not reset_budget:
         return None
     state_path = proj_dir / ".peers" / "state.json"
-    if not state_path.is_file():
-        return None
-    try:
-        state = json.loads(read_text_no_symlink(state_path))
-    except (OSError, ValueError):
-        return None
+    state = _read_project_state_for_cli(proj_dir)
     if not isinstance(state, dict):
         return None
-    budget = state.setdefault("budget", {})
-    if not isinstance(budget, dict):
-        return None
+    budget = _resume_budget_mapping(state)
     if reset_budget:
         for key in (
             "spent_runtime_s", "spent_iterations", "spent_tokens",
@@ -1126,8 +1224,9 @@ def _apply_resume_budget(
         current = _read_project_budget_cap(proj_dir) if additive else 0
         new_cap = current + delta_s if additive else delta_s
         budget["max_runtime_s"] = new_cap
-    write_text_no_symlink(state_path, json.dumps(state, indent=2,
-                                                sort_keys=True))
+    atomic_write_text_in_dir_no_symlink(
+        state_path, json.dumps(state, indent=2, sort_keys=True),
+    )
     return new_cap
 
 
@@ -1162,25 +1261,24 @@ def cmd_resume(
         print(f"peers-ctl: no such project: {name}", file=sys.stderr)
         return 1
     plan_dir = proj_dir / ".peers"
-    if not plan_dir.is_dir():
+    try:
+        plan_dir_fd = _open_project_peers_dir_no_symlink(proj_dir)
+    except FileNotFoundError:
         print(f"peers-ctl: {name!r} has no .peers/ directory "
               "(unscaffolded?)", file=sys.stderr)
         return 1
-    cleared: list[str] = []
-    for marker_name in ("checkpoint_requested", "awaiting_user"):
-        marker = plan_dir / marker_name
-        if marker.is_symlink():
-            print(f"peers-ctl: refusing to remove symlinked marker: {marker}",
+    except OSError as e:
+        print(f"peers-ctl: {e}", file=sys.stderr)
+        return 1
+    try:
+        try:
+            cleared = _clear_resume_markers(plan_dir, plan_dir_fd)
+        except OSError as e:
+            print(f"peers-ctl: cannot clear checkpoint markers safely: {e}",
                   file=sys.stderr)
             return 1
-        if marker.exists():
-            try:
-                marker.unlink()
-                cleared.append(marker_name)
-            except OSError as e:
-                print(f"peers-ctl: cannot remove {marker}: {e}",
-                      file=sys.stderr)
-                return 1
+    finally:
+        os.close(plan_dir_fd)
     if cleared:
         print(f"peers-ctl: cleared marker(s): {', '.join(cleared)}")
     else:
@@ -1192,6 +1290,10 @@ def cmd_resume(
             )
         except ValueError as e:
             print(f"peers-ctl: --max-runtime: {e}", file=sys.stderr)
+            return 1
+        except OSError as e:
+            print(f"peers-ctl: cannot update budget safely: {e}",
+                  file=sys.stderr)
             return 1
         if new_cap is not None:
             print(f"peers-ctl: max_runtime_s now {new_cap}")
@@ -1239,27 +1341,31 @@ def cmd_list(config_dir: Path | None = None,
 
 
 def _project_rollup(repo: Path) -> tuple[int, int, str]:
-    log = repo / ".peers" / "log" / "runs.jsonl"
     ticks = 0
     last = "-"
-    if log.is_file():
+    # walk the project root with O_NOFOLLOW at every component
+    # so a project-controlled .peers (or .peers/log) symlink cannot
+    # redirect the rollup read off-tree.
+    try:
+        raw = read_text_under_root_no_follow(
+            repo, (".peers", "log", "runs.jsonl"),
+            max_bytes=_CLI_RUNS_MAX_BYTES,
+        )
+    except (OSError, ValueError):
+        raw = ""
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
         try:
-            with open_text_read_no_symlink(log) as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(entry, dict):
-                        continue
-                    if entry.get("event") != "exit":
-                        ticks += 1
-                    if entry.get("ts"):
-                        last = str(entry["ts"])
-        except OSError:
-            pass
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("event") != "exit":
+            ticks += 1
+        if entry.get("ts"):
+            last = str(entry["ts"])
     try:
         from peers.bug_hunt import summarize
         blocking = summarize(repo).open_blocking_count
@@ -1269,16 +1375,15 @@ def _project_rollup(repo: Path) -> tuple[int, int, str]:
 
 
 def _load_dashboard_state(repo: Path) -> dict:
-    path = repo / ".peers" / "state.json"
-    if not path.exists():
-        return {}
+    # root-relative no-follow walk so a symlinked .peers
+    # ancestor cannot spoof goal counts.
     try:
-        data = json.loads(
-            read_text_no_symlink(
-                path, max_bytes=_DASHBOARD_STATE_MAX_BYTES + 1
-            )
+        raw = read_text_under_root_no_follow(
+            repo, (".peers", "state.json"),
+            max_bytes=_DASHBOARD_STATE_MAX_BYTES + 1,
         )
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(raw)
+    except (OSError, ValueError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -1531,34 +1636,40 @@ def _state_budget_summary(state: dict) -> dict:
 
 
 def _load_project_state(repo: Path) -> dict:
-    path = repo / ".peers" / "state.json"
-    if not path.is_file():
-        return {}
+    # root-relative no-follow walk so a symlinked .peers
+    # ancestor cannot spoof report-json goal counts.
     try:
-        data = json.loads(read_text_no_symlink(path))
-    except (OSError, ValueError):
+        raw = read_text_under_root_no_follow(
+            repo, (".peers", "state.json"),
+            max_bytes=_CLI_STATE_MAX_BYTES + 1,
+        )
+        data = json.loads(raw)
+    except (OSError, ValueError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
 def _load_project_ticks(repo: Path) -> list[dict]:
-    path = repo / ".peers" / "log" / "runs.jsonl"
-    if not path.is_file():
+    # root-relative no-follow walk on every .peers/log/runs.jsonl
+    # component so a symlinked .peers (or .peers/log) ancestor cannot
+    # spoof report-json tick/stop-reason fields.
+    try:
+        raw = read_text_under_root_no_follow(
+            repo, (".peers", "log", "runs.jsonl"),
+            max_bytes=_CLI_RUNS_MAX_BYTES,
+        )
+    except (OSError, ValueError):
         return []
     out: list[dict] = []
-    try:
-        with open_text_read_no_symlink(path) as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(entry, dict):
-                    out.append(entry)
-    except OSError:
-        return []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            out.append(entry)
     return out
 
 
@@ -1590,8 +1701,12 @@ def _controller_report_json(
                 "reports": [],
                 "warnings": [],
             }
-        goals_status = state.get("goals_status") or {}
-        soft_status = state.get("soft_status") or {}
+        goals_status = state.get("goals_status", {})
+        if not isinstance(goals_status, dict):
+            goals_status = {}
+        soft_status = state.get("soft_status", {})
+        if not isinstance(soft_status, dict):
+            soft_status = {}
         out_projects.append({
             "project": project.name,
             "path": project.path,
@@ -1684,18 +1799,21 @@ def cmd_start(name: str, max_ticks: int | None = None,
     # its own clearer error rather than masking it here.
     if checkpoint:
         plan_dir = Path(p.path) / ".peers"
-        if plan_dir.is_dir():
-            try:
-                write_text_no_symlink(
-                    plan_dir / "checkpoint_requested",
+        try:
+            with open_text_in_dir_no_symlink(
+                plan_dir, "checkpoint_requested", "w"
+            ) as f:
+                f.write(
                     f"requested via `peers-ctl start {name} --checkpoint`\n"
                     "driver will exit after Phase 0 architecture tick; "
-                    "clear with `peers-ctl resume <project>`.\n",
+                    "clear with `peers-ctl resume <project>`.\n"
                 )
-            except OSError as e:
-                print(f"peers-ctl: cannot write checkpoint marker: {e}",
-                      file=sys.stderr)
-                return 1
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"peers-ctl: cannot write checkpoint marker: {e}",
+                  file=sys.stderr)
+            return 1
     extras: list[str] = []
     if without_recon:
         extras.append("--without-recon")
@@ -1718,19 +1836,7 @@ def cmd_start(name: str, max_ticks: int | None = None,
             print(f"peers-ctl: --max-runtime: {e}", file=sys.stderr)
             return 1
         if additive:
-            current = 0
-            state_path = Path(p.path) / ".peers" / "state.json"
-            if state_path.is_file():
-                try:
-                    state_data = json.loads(state_path.read_text())
-                except (OSError, ValueError):
-                    state_data = {}
-                if isinstance(state_data, dict):
-                    budget = state_data.get("budget") or {}
-                    if isinstance(budget, dict):
-                        cur_val = budget.get("max_runtime_s")
-                        if isinstance(cur_val, int) and cur_val > 0:
-                            current = cur_val
+            current = _read_project_budget_cap(Path(p.path))
             max_runtime_s = current + delta_s
         else:
             max_runtime_s = delta_s

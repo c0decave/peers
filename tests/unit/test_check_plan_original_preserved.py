@@ -102,6 +102,25 @@ def test_invalid_current_plan_md_fails(tmp_path, capsys):
     assert "invalid" in out.lower() or "PLAN.md" in out
 
 
+def test_symlinked_current_plan_fails_closed_BUG_255(tmp_path, capsys):
+    _setup(
+        tmp_path,
+        original_steps=["- [ ] [STEP-1] a"],
+        current_steps=["- [ ] [STEP-1] a"],
+    )
+    outside = tmp_path / "outside-plan.md"
+    outside.write_text((tmp_path / "PLAN.md").read_text(), encoding="utf-8")
+    (tmp_path / "PLAN.md").unlink()
+    (tmp_path / "PLAN.md").symlink_to(outside)
+
+    rc = plan_original_preserved.main(str(tmp_path))
+
+    assert rc == 1
+    out = capsys.readouterr().out.lower()
+    assert "plan.md" in out
+    assert "symlink" in out or "symbolic" in out or "unsafe" in out
+
+
 def test_multiple_missing_listed(tmp_path, capsys):
     _setup(tmp_path,
         original_steps=["- [ ] [STEP-1] a", "- [ ] [STEP-2] b", "- [ ] [STEP-3] c", "- [ ] [STEP-4] d"],

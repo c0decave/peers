@@ -38,18 +38,18 @@ goals:
     consensus_needed: 2
     review_interval: 1
     prompt: |
-      Du reviewst SPEC.md, ARCHITECTURE.md, DESIGN.md — nicht source-code.
-      Such SPEZIFISCH:
-        - Welche claims sind nicht durch source-evidence belegt? (etwa
-          "We use OAuth" — wo im code passiert das?)
-        - Welche tradeoffs werden nur einseitig dargestellt? ("Wir haben
-          X gewählt weil's einfacher ist" — gegen WAS?)
-        - Welche sections sind leer-formuliert? (Threat-model die nur
-          "wir validieren input" sagt ohne attack-surface zu nennen)
-        - Welche missing sections würden den doc-set komplettieren?
-      Reply {"pass": true, "notes": "describe-skeptic-pass: <konkrete reviews>"}
-      Pauschal-"sieht gut aus" wird rejected — der andere peer braucht
-      konkrete diffs/section-namen/zitierte-claims.
+      You are reviewing SPEC.md, ARCHITECTURE.md, DESIGN.md — not source code.
+      Look SPECIFICALLY for:
+        - Which claims are not backed by source evidence? (e.g.
+          "We use OAuth" — where in the code does that happen?)
+        - Which tradeoffs are presented one-sidedly? ("We chose
+          X because it's simpler" — simpler than WHAT?)
+        - Which sections are vacuously phrased? (a threat-model that only
+          says "we validate input" without naming the attack surface)
+        - Which missing sections would complete the doc-set?
+      Reply {"pass": true, "notes": "describe-skeptic-pass: <concrete reviews>"}
+      A blanket "looks good" is rejected — the other peer needs
+      concrete diffs/section-names/quoted-claims.
 
   - id: describe-tradeoff-honesty
     type: soft
@@ -57,14 +57,14 @@ goals:
     consensus_needed: 2
     review_interval: 2
     prompt: |
-      Strikte Tradeoff-Honesty in DESIGN.md. Für JEDE design-decision in
-      `## Decisions` muss `## Tradeoffs` mindestens 3 explizite tradeoffs
-      enthalten. Verboten ohne weitere Begründung:
+      Strict tradeoff honesty in DESIGN.md. For EVERY design decision in
+      `## Decisions`, `## Tradeoffs` must contain at least 3 explicit
+      tradeoffs. Forbidden without further justification:
         - "obviously the right choice"
         - "it just works"
         - "simple solution"
         - "industry standard"
-      Statt: nenne konkret was wir AUFGEBEN durch die Entscheidung, was
-      die ALTERNATIVE wäre, warum WIR die Kosten der Alternative höher
-      bewerten. Reply mit pass=true + Liste der geprüften decisions:
+      Instead: state concretely what we GIVE UP by the decision, what
+      the ALTERNATIVE would be, why WE judge the cost of the alternative
+      to be higher. Reply with pass=true + list of reviewed decisions:
       {"pass": true, "notes": "decisions reviewed: [D1, D2, ...], all have ≥3 tradeoffs each"}.

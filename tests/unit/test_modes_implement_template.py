@@ -102,3 +102,14 @@ def test_all_hard_gates_have_pass_when():
         if g.get("kind") == "hard" or g.get("type") == "hard":
             assert "pass_when" in g, f"hard gate {g['id']} missing pass_when"
             assert "cmd" in g, f"hard gate {g['id']} missing cmd"
+
+
+def test_implement_lint_gate_preserves_ruff_exit_code_BUG_259():
+    """BUG-259: implement-mode's reused lint gate must fail if ruff is
+    missing or reports findings."""
+    p = IMPLEMENT_DIR / "goals.yaml"
+    data = yaml.safe_load(p.read_text())
+    lint = next(g for g in data["goals"] if g["id"] == "lint-clean")
+
+    assert "|| true" not in lint["cmd"]
+    assert lint["pass_when"] == "exit_code == 0"

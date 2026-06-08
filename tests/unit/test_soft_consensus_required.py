@@ -48,6 +48,14 @@ def test_no_config_at_all_defaults_true() -> None:
     assert soft_consensus_required_for_convergence(state) is True
 
 
+def test_malformed_config_containers_default_true_sad_path() -> None:
+    for state in (
+        {"config": ["not-a-mapping"]},
+        {"config": {"goals": ["not-a-mapping"]}},
+    ):
+        assert soft_consensus_required_for_convergence(state) is True
+
+
 def test_empty_string_value_treated_as_false_edge() -> None:
     # edge: explicit empty-string in YAML is in _SOFT_CONSENSUS_FALSY
     # alongside "false"/"0"/"no"/"off" — so a half-written config like

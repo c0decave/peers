@@ -245,6 +245,22 @@ def test_load_raises_on_corrupt_json(tmp_path: Path):
     assert str(path) in str(exc.value)
 
 
+def test_load_rejects_invalid_utf8_state_file_BUG_262(tmp_path: Path):
+    path = tmp_path / "state.json"
+    path.write_bytes(
+        b'{"schema_version": 2,'
+        b'"peer_order": ["claude", "co\xffdex"],'
+        b'"turn_index": 0,'
+        b'"peers": {'
+        b'  "claude": {"state": "healthy"},'
+        b'  "co\xffdex": {"state": "healthy"}'
+        b'}}'
+    )
+
+    with pytest.raises(RuntimeError, match="UTF-8|utf-8"):
+        StateStore(path).load()
+
+
 def test_load_rejects_oversized_state_file(tmp_path: Path):
     from peers.state_store import _STATE_FILE_MAX_BYTES
 
@@ -281,6 +297,33 @@ def test_load_rejects_invalid_turn_index(tmp_path: Path):
                   "codex": {"state": "healthy"}},
     }))
     with pytest.raises(RuntimeError, match="turn_index"):
+        StateStore(path).load()
+
+
+def test_load_rejects_non_list_peer_order_BUG_253(tmp_path: Path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": SCHEMA_VERSION,
+        "peer_order": 123,
+        "turn_index": 0,
+        "peers": {"claude": {"state": "healthy"},
+                  "codex": {"state": "healthy"}},
+    }))
+
+    with pytest.raises(RuntimeError, match="peer_order"):
+        StateStore(path).load()
+
+
+def test_load_rejects_non_mapping_peers_BUG_253(tmp_path: Path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": SCHEMA_VERSION,
+        "peer_order": ["claude", "codex"],
+        "turn_index": 0,
+        "peers": ["not", "a", "mapping"],
+    }))
+
+    with pytest.raises(RuntimeError, match="peers must be a mapping"):
         StateStore(path).load()
 
 

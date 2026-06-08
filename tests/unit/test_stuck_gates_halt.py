@@ -29,6 +29,19 @@ def test_stuck_gate_at_threshold_returns_reason() -> None:
     assert reason == "stuck:tests-pass"
 
 
+def test_malformed_config_containers_use_default_stuck_settings_sad_path() -> None:
+    from peers.driver_tick_hooks import compute_stuck_gate_halt_reason
+
+    for state in (
+        {"stuck_counter": {"tests-pass": 5}, "config": ["not-a-mapping"]},
+        {
+            "stuck_counter": {"tests-pass": 5},
+            "config": {"goals": ["not-a-mapping"]},
+        },
+    ):
+        assert compute_stuck_gate_halt_reason(state) == "stuck:tests-pass"
+
+
 def test_stuck_gate_above_threshold_returns_reason() -> None:
     from peers.driver_tick_hooks import compute_stuck_gate_halt_reason
     state = {

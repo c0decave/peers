@@ -125,6 +125,118 @@ def test_shared_identity_same_peer_trailer_fails(tmp_path, capsys):
     assert "peer:claude" in capsys.readouterr().out
 
 
+def _co_impl_setup(tmp_path: Path) -> None:
+    """STEP-1 touches two files: a.py last-authored by claude, b.py by codex
+    (a co-implemented step). codex checks the step off."""
+    _init_git(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("a")
+    (tmp_path / "src" / "b.py").write_text("b")
+    _write_plan(tmp_path,
+                "- [ ] [STEP-1] co\n  - touches: src/a.py, src/b.py\n")
+    _commit_as(tmp_path, _SHARED, "dash", ["src/a.py", "PLAN.md"],
+               "impl a\n\nPeer: claude")
+    _commit_as(tmp_path, _SHARED, "dash", ["src/b.py"], "impl b\n\nPeer: codex")
+    _write_plan(tmp_path,
+                "- [x] [STEP-1] co\n  - touches: src/a.py, src/b.py\n")
+    _commit_as(tmp_path, _SHARED, "dash", ["PLAN.md"], "checkoff\n\nPeer: codex")
+
+
+def test_co_impl_step_without_independent_review_fails(tmp_path, capsys):
+    # BUG-009 guard: codex checked off; b.py is codex's own file with no
+    # independent reviewer -> self-bless -> still a violation (the rule is
+    # preserved per-file, not silently relaxed).
+    _co_impl_setup(tmp_path)
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 1
+    assert "src/b.py" in capsys.readouterr().out
+
+
+def test_co_impl_step_passes_with_independent_justification(tmp_path, capsys):
+    # BUG-009 fix (A2): the co-implemented step converges once the OTHER peer
+    # signs an independent review of the self-authored file. a.py is reviewed
+    # by the checkoff (claude!=codex); b.py is reviewed via claude's signed
+    # justification -> every file independently reviewed -> PASS.
+    from peers_ctl.justifications import append_justification
+    _co_impl_setup(tmp_path)
+    append_justification(tmp_path / ".peers", "src/b.py", 1,
+                         "reviewed codex's impl", "claude")
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 0
+
+
+def test_reattest_escapes_latch(tmp_path, capsys):
+    # BUG-007 fix: a wrong (self) checkoff can be corrected by re-attestation.
+    # claude self-checks-off (FAIL), then the step is unchecked and codex
+    # re-checks-off. The gate must honour the LATEST transition (codex) -> PASS.
+    _init_git(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("a")
+    _write_plan(tmp_path, "- [ ] [STEP-1] x\n  - touches: src/a.py\n")
+    _commit_as(tmp_path, _SHARED, "dash", ["src/a.py", "PLAN.md"],
+               "impl a\n\nPeer: claude")
+    _write_plan(tmp_path, "- [x] [STEP-1] x\n  - touches: src/a.py\n")
+    _commit_as(tmp_path, _SHARED, "dash", ["PLAN.md"],
+               "self checkoff\n\nPeer: claude")
+    # uncheck, then the other peer re-attests the checkoff
+    _write_plan(tmp_path, "- [ ] [STEP-1] x\n  - touches: src/a.py\n")
+    _commit_as(tmp_path, _SHARED, "dash", ["PLAN.md"], "uncheck\n\nPeer: codex")
+    _write_plan(tmp_path, "- [x] [STEP-1] x\n  - touches: src/a.py\n")
+    _commit_as(tmp_path, _SHARED, "dash", ["PLAN.md"],
+               "re-checkoff\n\nPeer: codex")
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 0
+
+
+def test_signers_for_file_returns_file_level_reviewers(tmp_path):
+    from peers_ctl.justifications import append_justification, signers_for_file
+    pd = tmp_path / ".peers"
+    append_justification(pd, "src/b.py", 1, "r1", "claude")
+    append_justification(pd, "src/b.py", 9, "r2", "claude")
+    append_justification(pd, "src/c.py", 1, "r3", "codex")
+    assert signers_for_file(pd, "src/b.py") == {"claude"}
+    assert signers_for_file(pd, "src/c.py") == {"codex"}
+    assert signers_for_file(pd, "src/missing.py") == set()
+
+
+# --- end-to-end via the production CLI path -------------------------------
+# Every test above calls the gate's main() in-process. Production invokes it
+# through `peers.cli run-check` (cmd_run_check resolves the script and runs it
+# as a subprocess with cwd=repo). These scenario tests exercise that real path
+# so a regression in resolution / cwd / exit-code forwarding is caught.
+
+def _cli_run_check(tmp_path: Path, name: str):
+    import os
+    import sys
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    env = {**os.environ, "PYTHONPATH": src}
+    return subprocess.run(
+        [sys.executable, "-m", "peers.cli", "run-check", name],
+        cwd=str(tmp_path), env=env, capture_output=True, text=True,
+    )
+
+
+def test_cli_run_check_co_impl_self_bless_rejected(tmp_path):
+    """Co-implemented step, codex blesses its own file with no independent
+    review → the gate fails through the real CLI path (BUG-009 guard)."""
+    _co_impl_setup(tmp_path)
+    r = _cli_run_check(tmp_path, "checkoff_by_other_peer")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "src/b.py" in (r.stdout + r.stderr)
+
+
+def test_cli_run_check_co_impl_independent_review_passes(tmp_path):
+    """Same co-implemented step converges once the OTHER peer signs an
+    independent review of the self-authored file (BUG-009 fix), proven
+    through the real CLI path."""
+    from peers_ctl.justifications import append_justification
+    _co_impl_setup(tmp_path)
+    append_justification(tmp_path / ".peers", "src/b.py", 1,
+                         "reviewed codex's impl", "claude")
+    r = _cli_run_check(tmp_path, "checkoff_by_other_peer")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
 def test_checkoff_without_touches_skipped(tmp_path, capsys):
     """A `trivial_step: true` step is exempt from the touches:
     requirement at parse time (Issue I4); the post-hoc gate has no

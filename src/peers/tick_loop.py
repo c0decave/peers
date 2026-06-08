@@ -32,6 +32,7 @@ class _HealthInvoker(Protocol):
         error_patterns: Sequence[str],
         halt_patterns: Sequence[str],
         buf_cap_bytes: int,
+        hang_kill_s: int | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> Any:
         ...
@@ -55,12 +56,16 @@ class TickLoopDriver(Protocol):
     health: _HealthInvoker
     idle_timeout_s: int
     absolute_max_runtime_s: int
+    hang_kill_s: int | None
     error_patterns: Sequence[str]
     halt_patterns: Sequence[str]
     buf_cap_bytes: int
     _head_before_invoke: str | None
 
     def _verify_peer_dir_identity(self) -> None:
+        ...
+
+    def _verify_no_control_symlinks(self) -> None:
         ...
 
     def _pre_tick_exit(
@@ -182,6 +187,7 @@ _REQUIRED_DRIVER_ATTRS = (
     "buf_cap_bytes",
     "_head_before_invoke",
     "_verify_peer_dir_identity",
+    "_verify_no_control_symlinks",
     "_pre_tick_exit",
     "_maybe_checkpoint_exit",
     "_prepare_tick_prompt",
@@ -204,6 +210,7 @@ _REQUIRED_DRIVER_ATTRS = (
     "_save_state",
     "_emit_tick_end",
     "_update_convergence_counter",
+    "_submit_gate_eval",
 )
 
 
@@ -315,6 +322,7 @@ class TickLoop:
             "prompt": prompt,
             "idle_timeout_s": driver.idle_timeout_s,
             "absolute_max_runtime_s": driver.absolute_max_runtime_s,
+            "hang_kill_s": driver.hang_kill_s,
             "prompt_mode": spec.prompt_mode,
             "error_patterns": driver.error_patterns,
             "halt_patterns": driver.halt_patterns,
@@ -328,6 +336,7 @@ class TickLoop:
             invoke_kwargs["extra_env"] = extra_env
         run = driver.health.invoke(peer_argv, **invoke_kwargs)
         driver._verify_peer_dir_identity()
+        driver._verify_no_control_symlinks()
         self._validate_run_result(run)
         tick_dt = int(time.monotonic() - tick_t0)
         pre_tick_failed_goal_ids = tuple(
@@ -429,6 +438,10 @@ class TickLoop:
             state, peer, run, success, invocation.tick_dt, head_after_sha,
         )
         driver._update_convergence_counter(state)
+        # Tier-1 Part B: kick off the expensive-gate eval for the SHA this tick
+        # just produced, so it runs (in a frozen-SHA worktree) during the next
+        # peer turn instead of blocking the loop. No-op when pipelining is off.
+        driver._submit_gate_eval(head_after_sha)
 
     def _apply_rate_limit_backoff(
         self, state: dict[str, Any], rate_limited: bool, peer: str,

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import peers_ctl.plan_parser as plan_parser_mod
 from peers_ctl.plan_parser import (
     Plan,
     PlanValidationError,
@@ -61,6 +62,36 @@ def test_minimal_valid_plan(tmp_path: Path) -> None:
     assert step.state == "open"
     assert step.trivial is False
     assert step.pure_refactor is False
+
+
+def test_rejects_symlinked_plan_BUG_254(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.md"
+    outside.write_text(MINIMAL, encoding="utf-8")
+    plan_path = tmp_path / "PLAN.md"
+    plan_path.symlink_to(outside)
+
+    with pytest.raises(PlanValidationError, match="symlink|symbolic|unsafe"):
+        parse_plan(plan_path)
+
+
+def test_rejects_invalid_utf8_plan_BUG_254(tmp_path: Path) -> None:
+    plan_path = tmp_path / "PLAN.md"
+    plan_path.write_bytes(b"\xff\xfe# not utf-8\n")
+
+    with pytest.raises(PlanValidationError, match="UTF-8"):
+        parse_plan(plan_path)
+
+
+def test_rejects_oversized_plan_BUG_254(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan_path = _write(tmp_path, MINIMAL)
+    monkeypatch.setattr(
+        plan_parser_mod, "_PLAN_MAX_BYTES", len(MINIMAL.encode("utf-8")) - 1
+    )
+
+    with pytest.raises(PlanValidationError, match="too large"):
+        parse_plan(plan_path)
 
 
 def test_missing_acceptance_fails(tmp_path: Path) -> None:

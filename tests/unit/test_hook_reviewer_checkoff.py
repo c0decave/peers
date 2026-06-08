@@ -349,3 +349,33 @@ def test_shared_identity_other_checkoff_allowed(tmp_path):
     _write_plan(tmp_path, "- [x] [STEP-1] add auth\n  - touches: src/auth.py\n")
     sha = _commit_peer(tmp_path, "codex", ["PLAN.md"], "review checkoff")
     assert sha  # ALLOWED
+
+
+def _co_impl(tmp_path: Path) -> None:
+    """STEP-1 co-implemented: a.py by claude, b.py by codex."""
+    _setup_repo_with_hook(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("a")
+    (tmp_path / "src" / "b.py").write_text("b")
+    _write_plan(tmp_path,
+                "- [ ] [STEP-1] co\n  - touches: src/a.py, src/b.py\n")
+    assert _commit_peer(tmp_path, "claude", ["src/a.py", "PLAN.md"], "impl a")
+    assert _commit_peer(tmp_path, "codex", ["src/b.py"], "impl b")
+    _write_plan(tmp_path,
+                "- [x] [STEP-1] co\n  - touches: src/a.py, src/b.py\n")
+
+
+def test_hook_co_impl_self_blessed_rejected(tmp_path):
+    # BUG-009 parity: codex checks off; b.py is codex's own file with no
+    # independent review -> hook rejects (must mirror the post-hoc gate).
+    _co_impl(tmp_path)
+    assert _commit_peer(tmp_path, "codex", ["PLAN.md"], "checkoff") == ""
+
+
+def test_hook_co_impl_with_justification_allowed(tmp_path):
+    # BUG-009 fix parity: claude signs an independent review of codex's file
+    # -> the co-implemented checkoff is allowed (the deadlock is escapable).
+    from peers_ctl.justifications import append_justification
+    _co_impl(tmp_path)
+    append_justification(tmp_path / ".peers", "src/b.py", 1, "reviewed", "claude")
+    assert _commit_peer(tmp_path, "codex", ["PLAN.md"], "checkoff")

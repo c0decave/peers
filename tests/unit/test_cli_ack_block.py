@@ -152,3 +152,127 @@ def test_ack_block_refuses_symlinked_blocks_log_on_read_BUG_165(tmp_path):
                      "--reason", "second", env=env)
     assert res.returncode != 0, (res.stdout, res.stderr)
     assert "attacker-controlled prev chain\n" == target.read_text()
+
+
+def test_ack_block_refuses_unsafe_blocks_log_before_rewriting_plan_BUG_237(
+    tmp_path,
+):
+    """BUG-237: audit-log failures must not leave a partial ACK in PLAN.md."""
+    proj = _setup_project(tmp_path, "- [BLOCKED] [STEP-1] x\n")
+    outside = tmp_path / "outside-peers"
+    outside.mkdir()
+    (outside / "blocks.log").write_text("deadbeefdeadbeef outside prev\n")
+    peers_dir = proj / ".peers"
+    peers_dir.rmdir()
+    peers_dir.symlink_to(outside, target_is_directory=True)
+    env = _make_env(tmp_path)
+
+    res = _peers_ctl("ack-block", "myfeature", "STEP-1",
+                     "--reason", "x", env=env)
+
+    assert res.returncode != 0, (res.stdout, res.stderr)
+    assert "[BLOCKED] [STEP-1] x" in (proj / "PLAN.md").read_text()
+    assert "[BLOCKED-ACK] [STEP-1]" not in (proj / "PLAN.md").read_text()
+    assert "deadbeefdeadbeef outside prev\n" == (
+        outside / "blocks.log"
+    ).read_text()
+
+
+def test_ack_block_append_failure_does_not_rewrite_plan_BUG_247(
+    tmp_path,
+    monkeypatch,
+):
+    """A late audit-log write failure must not leave an unaudited ACK."""
+    from peers_ctl import cli
+
+    proj = _setup_project(tmp_path, "- [BLOCKED] [STEP-1] x\n")
+    config_dir = tmp_path / "ctl"
+    cli._store(config_dir).add(cli.Project(name="myfeature", path=str(proj)))
+
+    class FailingAuditLog:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def write(self, _text):
+            raise OSError("simulated append failure")
+
+    monkeypatch.setattr(
+        cli,
+        "open_text_in_dir_no_symlink",
+        lambda *_args, **_kwargs: FailingAuditLog(),
+    )
+
+    rc = cli.cmd_ack_block(
+        "myfeature",
+        "STEP-1",
+        "operator accepted blocker",
+        config_dir=config_dir,
+    )
+
+    assert rc == 1
+    plan = (proj / "PLAN.md").read_text()
+    assert "[BLOCKED] [STEP-1] x" in plan
+    assert "[BLOCKED-ACK] [STEP-1]" not in plan
+    assert not (proj / ".peers" / "blocks.log").exists()
+
+
+def test_ack_block_rejects_invalid_utf8_plan_without_traceback(tmp_path):
+    """BUG-220 sad path: a peer-corrupted PLAN.md must be a clean CLI
+    error, not an uncaught UnicodeDecodeError traceback."""
+    proj = _setup_project(tmp_path, "- [BLOCKED] [STEP-1] x\n")
+    (proj / "PLAN.md").write_bytes(b"\xff\xfe not utf-8")
+    env = _make_env(tmp_path)
+
+    res = _peers_ctl("ack-block", "myfeature", "STEP-1",
+                     "--reason", "x", env=env)
+
+    combined = res.stdout + res.stderr
+    assert res.returncode != 0
+    assert "not valid UTF-8" in combined
+    assert "Traceback" not in combined
+
+
+def test_ack_block_refuses_symlinked_plan_on_read_BUG_220(tmp_path):
+    """BUG-220 edge/security path: PLAN.md is project-controlled; refuse
+    a symlink before parsing it instead of reading through and failing only
+    at the later no-follow write."""
+    proj = _setup_project(tmp_path, "- [BLOCKED] [STEP-1] x\n")
+    plan = proj / "PLAN.md"
+    plan.unlink()
+    target = tmp_path / "outside-plan.md"
+    target.write_text(
+        "# Outside\n## Meta\nsurfaces: [cli]\nacceptance: pytest\n"
+        "## Steps\n- [BLOCKED] [STEP-1] outside\n"
+    )
+    plan.symlink_to(target)
+    env = _make_env(tmp_path)
+
+    res = _peers_ctl("ack-block", "myfeature", "STEP-1",
+                     "--reason", "x", env=env)
+
+    combined = res.stdout + res.stderr
+    assert res.returncode != 0
+    assert "cannot read" in combined
+    lower = combined.lower()
+    assert "too many levels" in lower or "symbolic link" in lower
+    assert "[BLOCKED] [STEP-1] outside" in target.read_text()
+    assert not (proj / ".peers" / "blocks.log").exists()
+
+
+def test_ack_block_rejects_oversized_plan_BUG_220(tmp_path):
+    """BUG-220 resource edge: don't slurp an unbounded peer-controlled
+    PLAN.md into the host controller."""
+    proj = _setup_project(tmp_path, "- [BLOCKED] [STEP-1] x\n")
+    (proj / "PLAN.md").write_text("x" * (2 * 1024 * 1024 + 2))
+    env = _make_env(tmp_path)
+
+    res = _peers_ctl("ack-block", "myfeature", "STEP-1",
+                     "--reason", "x", env=env)
+
+    combined = res.stdout + res.stderr
+    assert res.returncode != 0
+    assert "too large" in combined
+    assert "Traceback" not in combined

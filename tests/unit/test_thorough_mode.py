@@ -423,6 +423,25 @@ def test_all_peers_healthy_fails_closed_on_non_utf8_state(tmp_path: Path):
     assert "Traceback" not in r.stderr
 
 
+def test_all_peers_healthy_fails_closed_on_invalid_utf8_inside_state_BUG_257(
+    tmp_path: Path,
+):
+    """BUG-257: invalid UTF-8 inside a JSON string is still corrupt state.
+
+    The gate must fail closed instead of replacement-decoding the byte,
+    loading JSON successfully, and missing the unavailable peer state.
+    """
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    (pd / "state.json").write_bytes(
+        b'{"peers":{"claude":{"state":"unavailable\xff"}},"exit_events":[]}'
+    )
+    r = _run_gate(tmp_path)
+    assert r.returncode == 1
+    assert "unreadable" in r.stdout
+    assert "Traceback" not in r.stderr
+
+
 def test_convergence_reached_refuses_symlinked_state(tmp_path: Path):
     """BUG-102: the convergence gate must not follow a symlinked state.json."""
     pd = tmp_path / ".peers"
@@ -444,3 +463,147 @@ def test_convergence_reached_fails_closed_on_non_utf8_state(tmp_path: Path):
     assert r.returncode == 1
     assert "unreadable" in r.stdout
     assert "Traceback" not in r.stderr
+
+
+def test_convergence_reached_fails_closed_on_invalid_utf8_inside_state_BUG_257(
+    tmp_path: Path,
+):
+    """BUG-257: embedded invalid UTF-8 must not be replacement-decoded."""
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    (pd / "state.json").write_bytes(
+        b'{"consecutive_clean_ticks":999,"note":"\xff"}'
+    )
+    r = _run_convergence(tmp_path)
+    assert r.returncode == 1
+    assert "unreadable" in r.stdout
+    assert "Traceback" not in r.stderr
+
+
+def test_convergence_reached_fails_closed_on_non_object_state_BUG_241(
+    tmp_path: Path,
+):
+    """BUG-241: valid JSON that is not a mapping is still malformed state."""
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    (pd / "state.json").write_text("[1, 2]\n")
+    r = _run_convergence(tmp_path)
+    assert r.returncode == 1
+    assert "FAIL" in r.stdout
+    assert "Traceback" not in r.stderr
+
+
+def test_convergence_reached_fails_closed_on_non_mapping_config_BUG_243(
+    tmp_path: Path,
+):
+    """BUG-243: truthy non-mapping YAML config shapes are malformed."""
+    for name, config_text in {
+        "top": "[1]\n",
+        "goals": "goals:\n  - 1\n",
+    }.items():
+        root = tmp_path / name
+        pd = root / ".peers"
+        pd.mkdir(parents=True)
+        (pd / "state.json").write_text(json.dumps(
+            {"schema_version": 2, "consecutive_clean_ticks": 0}
+        ))
+        (pd / "config.yaml").write_text(config_text)
+        r = _run_convergence(root)
+        assert r.returncode == 1
+        assert "FAIL" in r.stdout
+        assert "Traceback" not in r.stderr
+
+
+def test_convergence_reached_fails_closed_on_non_integer_counter_BUG_244(
+    tmp_path: Path,
+):
+    """BUG-244: malformed clean-tick counters should not traceback."""
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    (pd / "state.json").write_text(json.dumps(
+        {"schema_version": 2, "consecutive_clean_ticks": "abc"}
+    ))
+    r = _run_convergence(tmp_path)
+    assert r.returncode == 1
+    assert "FAIL" in r.stdout
+    assert "Traceback" not in r.stderr
+
+
+def test_all_peers_healthy_fails_closed_on_non_object_state_BUG_241(
+    tmp_path: Path,
+):
+    """BUG-241: all_peers_healthy must not traceback on non-mapping state."""
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    (pd / "state.json").write_text("[1, 2]\n")
+    r = _run_gate(tmp_path)
+    assert r.returncode == 1
+    assert "FAIL" in r.stdout
+    assert "Traceback" not in r.stderr
+
+
+def test_all_peers_healthy_fails_closed_on_non_mapping_peer_BUG_256(
+    tmp_path: Path,
+):
+    """BUG-256: malformed peer entries must not be counted as healthy."""
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    (pd / "state.json").write_text(json.dumps({
+        "peers": {
+            "claude": "unavailable",
+            "codex": {"state": "healthy"},
+        },
+        "exit_events": [],
+    }))
+    r = _run_gate(tmp_path)
+    assert r.returncode == 1
+    assert "all_peers_healthy FAIL" in r.stdout
+    assert "state.peers.claude is not a mapping" in r.stdout
+    assert "Traceback" not in r.stderr
+
+
+def test_all_peers_healthy_fails_closed_on_non_string_snippet_BUG_245(
+    tmp_path: Path,
+):
+    """BUG-245: malformed unavailable_snippet must not crash diagnostics."""
+    pd = tmp_path / ".peers"
+    pd.mkdir()
+    (pd / "state.json").write_text(json.dumps({
+        "peers": {
+            "codex": {
+                "state": "unavailable",
+                "unavailable_reason": "halt-pattern: auth failed",
+                "unavailable_at_iter": 5,
+                "unavailable_snippet": 123,
+            },
+        },
+        "exit_events": [],
+    }))
+    r = _run_gate(tmp_path)
+    assert r.returncode == 1
+    assert "all_peers_healthy FAIL" in r.stdout
+    assert "Traceback" not in r.stderr
+
+
+def test_all_peers_healthy_fails_closed_on_non_list_exit_events_BUG_248(
+    tmp_path: Path,
+):
+    """BUG-248: malformed exit_events should not traceback or pass."""
+    bad_values = [
+        123,
+        {"reason": "peer-unavailable:codex"},
+        "peer-unavailable:codex",
+    ]
+    for idx, exit_events in enumerate(bad_values):
+        root = tmp_path / f"case-{idx}"
+        pd = root / ".peers"
+        pd.mkdir(parents=True)
+        (pd / "state.json").write_text(json.dumps({
+            "peers": {},
+            "exit_events": exit_events,
+        }))
+        r = _run_gate(root)
+        assert r.returncode == 1
+        assert "all_peers_healthy FAIL" in r.stdout
+        assert "state.exit_events is not a list" in r.stdout
+        assert "Traceback" not in r.stderr

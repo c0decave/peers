@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import os
 import selectors
+import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -205,6 +207,100 @@ class GoalEngine:
         self.cwd = Path(cwd)
         self.timeout_s = timeout_s
         self._last: dict[str, GoalResult] = {}
+        # Tier-1 memoization: goal_id -> (working-tree + HEAD key, last GoalResult).
+        # Only populated for goals marked `cacheable`.
+        self._cache: dict[str, tuple[str, GoalResult]] = {}
+
+    def expensive_ids(self) -> set[str]:
+        """Hard gates marked `expensive` (pytest/coverage-backed) — eligible to
+        run async on a frozen SHA while the next peer thinks (Tier-1 Part B)."""
+        return {g.id for g in self.goals
+                if g.type == "hard" and getattr(g, "expensive", False)}
+
+    def cheap_ids(self) -> set[str]:
+        """Hard gates that are NOT expensive — run synchronously each tick so
+        the peer always sees fresh non-pytest gate status."""
+        return {g.id for g in self.goals
+                if g.type == "hard" and not getattr(g, "expensive", False)}
+
+    def _tree_key(self) -> str | None:
+        """Content hash of the ENTIRE working tree (tracked + untracked +
+        uncommitted), via `git add -A` into a throwaway index + `write-tree`.
+
+        Two evaluations with the same key see a byte-identical tree, so a
+        tree-pure gate's verdict is provably identical. Returns ``None`` on
+        any error (not a git repo, git missing, timeout) — callers MUST treat
+        ``None`` as "uncacheable, run the gate" (fail-safe). Note: `add -A`
+        honors .gitignore, which is correct — ignored paths (caches, .peers/
+        runtime state) don't determine a code-pure gate's verdict, and the
+        gates that DO depend on runtime state are not marked cacheable.
+        """
+        idx_dir: Path | None = None
+        try:
+            idx_dir = Path(tempfile.mkdtemp(prefix="peers-gatekey-"))
+            idx = str(idx_dir / "index")
+            env = {**os.environ, "GIT_INDEX_FILE": idx}
+            add = subprocess.run(
+                ["git", "-C", str(self.cwd), "add", "-A"],
+                env=env, capture_output=True, timeout=60, check=False,
+            )
+            if add.returncode != 0:
+                return None
+            wt = subprocess.run(
+                ["git", "-C", str(self.cwd), "write-tree"],
+                env=env, capture_output=True, text=True, timeout=60, check=False,
+            )
+            if wt.returncode != 0:
+                return None
+            key = (wt.stdout or "").strip()
+            return key or None
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+        finally:
+            if idx_dir is not None:
+                shutil.rmtree(idx_dir, ignore_errors=True)
+
+    def _head_key(self) -> str | None:
+        """Current commit identity for cache invalidation.
+
+        Some gates are accidentally or necessarily history-sensitive (for
+        example checks that parse `git log` trailers). Folding HEAD into the
+        cache key prevents an empty commit from reusing a cached PASS for a
+        byte-identical tree. If HEAD cannot be resolved, disable caching for
+        that evaluation rather than guessing.
+        """
+        try:
+            head = subprocess.run(
+                ["git", "-C", str(self.cwd), "rev-parse", "--verify", "HEAD"],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            if head.returncode != 0:
+                return None
+            key = (head.stdout or "").strip()
+            return key or None
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+
+    def _cache_key(self) -> str | None:
+        tree_key = self._tree_key()
+        if tree_key is None:
+            return None
+        head_key = self._head_key()
+        if head_key is None:
+            return None
+        return f"{tree_key}:{head_key}"
+
+    def _run_hard_retrying(self, g: Goal) -> GoalResult:
+        """Run a hard gate, re-running up to ``g.retry_on_fail`` more times if
+        it fails (returning the first PASS). Absorbs a transient flake before
+        it can turn the gate red and trip a `stuck:<gate>` halt; a genuine
+        failure still fails after the retries."""
+        res = self._run_hard(g)
+        attempts = getattr(g, "retry_on_fail", 0) or 0
+        while res.state == "fail" and attempts > 0:
+            res = self._run_hard(g)
+            attempts -= 1
+        return res
 
     def evaluate_hard_gates(
         self,
@@ -212,12 +308,45 @@ class GoalEngine:
     ) -> dict[str, GoalResult]:
         selected = set(goal_ids) if goal_ids is not None else None
         results: dict[str, GoalResult] = {}
+        # Compute the cache key at most once per call, and only if some
+        # selected gate is actually cacheable (the git add -A costs ~sub-second
+        # but is pointless when nothing can be cached).
+        cache_key: str | None = None
+        cache_key_done = False
         for g in self.goals:
             if g.type != "hard":
                 continue
             if selected is not None and g.id not in selected:
                 continue
-            results[g.id] = self._run_hard(g)
+            if getattr(g, "cacheable", False):
+                if not cache_key_done:
+                    cache_key = self._cache_key()
+                    cache_key_done = True
+                cached = self._cache.get(g.id)
+                if cache_key is not None and cached is not None \
+                        and cached[0] == cache_key:
+                    prev = cached[1]
+                    # Reuse the verdict; mark it as a cache hit (0ms) so logs
+                    # show the skip rather than a stale duration.
+                    results[g.id] = GoalResult(
+                        prev.goal_id, prev.state, 0,
+                        diagnostic=(prev.diagnostic
+                                    + f" [cached tree={cache_key[:10]}]").strip(),
+                        extras=prev.extras,
+                    )
+                    continue
+                res = self._run_hard_retrying(g)
+                # Only memoize PASS verdicts. A cached green on a byte-identical
+                # tree is provably still green AND stabilizes flaky checks
+                # (e.g. a timing-sensitive test) against spurious re-roll-to-red.
+                # A FAIL is never cached, so a flaky red always gets re-run and
+                # can clear, and a real red is re-surfaced every tick until the
+                # peer's fix changes the tree.
+                if cache_key is not None and res.state == "pass":
+                    self._cache[g.id] = (cache_key, res)
+                results[g.id] = res
+            else:
+                results[g.id] = self._run_hard_retrying(g)
         if selected is None:
             self._last = results
         else:

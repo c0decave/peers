@@ -32,6 +32,9 @@ from peers.bug_hunt import (
     as count_new_blocking_or_flag_bug_reports,
 )
 from peers.comm_layer import GitCommLayer, HybridCommLayer
+from peers.driver_gate_pipeline import (
+    DriverGatePipelineMixin as DriverGatePipelineMixin,
+)
 from peers.driver_helpers import (
     PHASE_IMPLEMENTATION as PHASE_IMPLEMENTATION,
     _AUTO_SKEPTIC_PROMPT_PREFIX as _AUTO_SKEPTIC_PROMPT_PREFIX,
@@ -58,7 +61,10 @@ from peers.recon import run_recon as _run_recon  # noqa: F401
 from peers.codemap_gen import run_codemap as _run_codemap  # noqa: F401
 from peers.codemap_gen import seed_repo_codemap as _seed_repo_codemap  # noqa: F401
 from peers.codemap_gen import seed_repo_architecture as _seed_repo_architecture  # noqa: F401
-from peers.regression_baseline import ensure_baseline_snapshot
+from peers.regression_baseline import (
+    ensure_baseline_snapshot,
+    ensure_skip_baseline,
+)
 from peers.safe_io import (
     _ensure_private_dir,
     _open_private_nested_dir_fd_no_symlink
@@ -86,6 +92,7 @@ from peers.turn_manager import TurnManager, sweep_legacy_handoff_msg
 
 
 class OrchestratorDriver(
+    DriverGatePipelineMixin,
     DriverTickHooksMixin,
     DriverSoftReviewsMixin,
     DriverPeerHealthMixin,
@@ -103,6 +110,7 @@ class OrchestratorDriver(
         state_store: StateStore | None = None,
         idle_timeout_s: int = 15 * 60,
         absolute_max_runtime_s: int = 2 * 3600,
+        hang_kill_s: int | None = None,
         cfg_budget: dict[str, Any] | None = None,
         error_patterns: Sequence[str] | None = None,
         halt_patterns: Sequence[str] | None = None,
@@ -114,6 +122,7 @@ class OrchestratorDriver(
         recon_enabled: bool = True,
         codemap_enabled: bool = True,
         auto_skeptic_enabled: bool = True,
+        pipeline_gates: bool = False,
     ) -> None:
         if len(peer_specs) < 2:
             raise ValueError(
@@ -134,6 +143,8 @@ class OrchestratorDriver(
         self.health = HealthGuard(self.repo)
         self.engine = GoalEngine(goals, cwd=self.repo,
                                  timeout_s=goals_timeout_s)
+        # Tier-1 Part B gate pipelining (mixin); off by default.
+        self._init_gate_pipeline(goals, pipeline_gates, goals_timeout_s)
         if comm_variant == "hybrid":
             self.comm = HybridCommLayer(self.repo, self.peer_dir)
         elif comm_variant == "git":
@@ -146,6 +157,9 @@ class OrchestratorDriver(
         self.comm_variant = comm_variant
         self.idle_timeout_s = idle_timeout_s
         self.absolute_max_runtime_s = absolute_max_runtime_s
+        # Tier-2 C3: opt-in faster composite-AND hang kill (default off →
+        # legacy idle/absolute timeout behaviour unchanged).
+        self.hang_kill_s = hang_kill_s
         self.error_patterns = list(error_patterns or [])
         # halt_patterns trigger an immediate peer-unavailable
         # exit instead of degraded-on-retry. Intended for AUTH/QUOTA.
@@ -256,6 +270,16 @@ class OrchestratorDriver(
             )
             if baseline_msg is not None:
                 print(f"peers: {baseline_msg}", file=sys.stderr, flush=True)
+
+            # Grandfather skips already present at run-start so the
+            # no-skipped-tests gate doesn't permanently block on inherited
+            # pre-baseline skips (mirrors the no-prior-regression baseline).
+            skip_baseline_msg = ensure_skip_baseline(
+                self.repo, self.peer_dir, [g.id for g in self.goals],
+            )
+            if skip_baseline_msg is not None:
+                print(f"peers: {skip_baseline_msg}", file=sys.stderr,
+                      flush=True)
 
             if self.recon_enabled:
                 self._run_recon_step()

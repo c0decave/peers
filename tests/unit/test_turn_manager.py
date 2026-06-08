@@ -84,6 +84,17 @@ def test_from_state_uses_default_when_config_missing():
     assert state["peer_order"][state["turn_index"]] == "codex"
 
 
+def test_from_state_uses_default_when_config_malformed_sad_path():
+    for bad_config in (["not-a-mapping"], "not-a-mapping"):
+        state = _fresh_state("claude")
+        state["config"] = bad_config
+        tm = TurnManager.from_state(state)
+        tm.advance(success=False)
+        assert state["peer_order"][state["turn_index"]] == "claude"
+        tm.advance(success=False)
+        assert state["peer_order"][state["turn_index"]] == "codex"
+
+
 def test_current_skips_degraded_peer_if_healthy_exists(monkeypatch):
     """degraded peer at turn_index → current() hops forward
     to the next healthy peer and pins turn_index there."""

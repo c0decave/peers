@@ -29,7 +29,7 @@ def compute_stuck_gate_halt_reason(state: dict[str, Any]) -> str | None:
     via state['config']['goals']['stuck_halt_gates'] (list of goal ids).
     A threshold of 0 disables the halt entirely (legacy behavior).
     """
-    cfg_goals = ((state.get("config") or {}).get("goals") or {})
+    cfg_goals = _config_goals_map(state)
     raw_n = cfg_goals.get("stuck_halt_after", _DEFAULT_STUCK_HALT_AFTER)
     try:
         threshold = int(raw_n)
@@ -69,6 +69,16 @@ _IMPLEMENT_PROGRESS_RESET_GATES = ("tests-pass",)
 _DONE_STEP_RE = re.compile(r"(?m)^[ \t]*-[ \t]*\[[xX]\]")
 
 
+def _config_goals_map(state: dict[str, Any]) -> dict[str, Any]:
+    config = state.get("config", {})
+    if not isinstance(config, dict):
+        return {}
+    goals = config.get("goals", {})
+    if isinstance(goals, dict):
+        return goals
+    return {}
+
+
 def count_done_plan_steps(plan_path: Path) -> int:
     """Count checked `- [x]`/`- [X]` checklist lines in PLAN.md.
 
@@ -95,7 +105,7 @@ def _resolve_progress_reset_gates(
     audit/security/thorough behavior is unchanged (there a red tests-pass
     IS a genuine stuck signal).
     """
-    cfg_goals = ((state.get("config") or {}).get("goals") or {})
+    cfg_goals = _config_goals_map(state)
     raw = cfg_goals.get("stuck_progress_reset_gates")
     if raw is not None:
         return tuple(str(g) for g in raw)

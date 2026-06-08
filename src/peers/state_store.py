@@ -257,7 +257,13 @@ class StateStore:
                     f"state file too large: {self.path}: "
                     f"max {_STATE_FILE_MAX_BYTES} bytes"
                 )
-            loaded = json.loads(data.decode("utf-8", errors="replace"))
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError as e:
+                raise RuntimeError(
+                    f"state file corrupt: {self.path}: invalid UTF-8: {e}"
+                ) from e
+            loaded = json.loads(text)
         except json.JSONDecodeError as e:
             raise RuntimeError(
                 f"state file corrupt: {self.path}: {e}"
@@ -308,14 +314,22 @@ class StateStore:
 
         # If the merge left `peer_order` empty (shouldn't, given defaults),
         # restore from defaults.
-        if not state.get("peer_order"):
+        order = state.get("peer_order")
+        if not order:
             state["peer_order"] = base["peer_order"]
             state["turn_index"] = 0
+            order = state["peer_order"]
 
         # Ensure a peers-health entry exists for every configured peer.
-        for name in state["peer_order"]:
-            if name not in state["peers"]:
-                state["peers"][name] = _default_peer_health()
+        peers = state.get("peers")
+        if (
+            isinstance(order, list)
+            and all(isinstance(name, str) and name for name in order)
+            and isinstance(peers, dict)
+        ):
+            for name in order:
+                if name not in peers:
+                    peers[name] = _default_peer_health()
 
         _validate_state(state, self.path)
         # Tag once so callers can know if a backup was just written.

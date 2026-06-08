@@ -4,6 +4,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import secrets
 import time
 import urllib.parse
 import urllib.request
@@ -279,6 +280,40 @@ def _replace_or_rewrite_token_file(tmp: Path, path: Path) -> None:
             ) from rewrite_error
 
 
+def _write_unique_token_tmp(path: Path, text: str) -> Path:
+    parent = path.parent
+    last_error: OSError | None = None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    for _ in range(100):
+        tmp = parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            fd = os.open(tmp, flags, 0o600)
+        except FileExistsError as e:
+            last_error = e
+            continue
+        except OSError as e:
+            raise OAuthRefreshError(
+                f"cannot write OAuth token tmp file {tmp}: {e}"
+            ) from e
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                fp.write(text)
+        except OSError as e:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise OAuthRefreshError(
+                f"cannot write OAuth token tmp file {tmp}: {e}"
+            ) from e
+        return tmp
+    raise OAuthRefreshError(
+        f"cannot allocate unique OAuth token tmp file in {parent}: "
+        f"{last_error}"
+    )
+
+
 def refresh_claude_config(
     path: Path,
     *,
@@ -296,19 +331,15 @@ def refresh_claude_config(
     expires_in = refreshed.get("expires_in") or refreshed.get("expiresIn")
     if isinstance(expires_in, (int, float)) and expires_in > 0:
         section[config.expires_key or "expires_at"] = int(now() + expires_in)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = _write_unique_token_tmp(
+        path, json.dumps(config.raw, indent=2, sort_keys=True) + "\n",
+    )
     try:
-        tmp.write_text(
-            json.dumps(config.raw, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-    except OSError as e:
-        raise OAuthRefreshError(
-            f"cannot write OAuth token tmp file {tmp}: {e}"
-        ) from e
-    try:
-        tmp.chmod(0o600)
-    except OSError:
-        pass
-    _replace_or_rewrite_token_file(tmp, path)
+        _replace_or_rewrite_token_file(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     return str(access)

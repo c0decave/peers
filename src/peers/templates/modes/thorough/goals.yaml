@@ -5,22 +5,22 @@ goals:
     consensus_needed: 2
     review_interval: 1
     prompt: |
-      Der vorige Audit kam zu "alles grün". Das ist verdächtig.
-      Gehe JEDES src-File nochmal durch und finde mind. 1 Bug den die
-      vorigen Rounds übersehen haben. Wenn nach gewissenhafter Suche
-      wirklich nichts:
-      - dokumentiere KONKRET welche 5 Failure-Modes du geprüft +
-        ausgeschlossen hast (pro Datei oder pro Modul)
+      The previous audit concluded "all green". That is suspicious.
+      Go through EVERY src file again and find at least 1 bug the
+      previous rounds missed. If, after a conscientious search,
+      there really is nothing:
+      - document CONCRETELY which 5 failure modes you checked +
+        ruled out (per file or per module)
       - reply {"pass": true, "notes": "skeptic-pass: <N files reviewed, M failure-modes excluded with rationale>"}
-      Pauschal-"sauber" wird vom anderen peer rejected.
+      A blanket "clean" is rejected by the other peer.
 
-      ZUSÄTZLICH: prüfe jeden @pytest.mark.skip / @pytest.mark.xfail im
-      tests/-Baum. Ist die `reason=` Begründung TATSÄCHLICH solide oder
-      versteckt sich da ein echter Bug der einfach silenced wurde? Wenn
-      verdächtig → file Bug-Report. „TODO"/„FIXME"/„flaky" als Begründung
-      ist immer verdächtig — der entsprechende hard-goal-check
-      `tests-no-unjustified-skip-or-fail` würde das eh rejecten, aber
-      du musst zusätzlich semantisch prüfen ob die Begründung *stimmt*.
+      ADDITIONALLY: check every @pytest.mark.skip / @pytest.mark.xfail in
+      the tests/ tree. Is the `reason=` justification ACTUALLY solid or
+      does it hide a real bug that was simply silenced? If
+      suspicious → file a Bug-Report. "TODO"/"FIXME"/"flaky" as a justification
+      is always suspicious — the corresponding hard-goal check
+      `tests-no-unjustified-skip-or-fail` would reject it anyway, but
+      you must additionally check semantically whether the justification *holds*.
 
   - id: aggressive-honesty
     type: soft
@@ -28,20 +28,20 @@ goals:
     consensus_needed: 2
     review_interval: 3
     prompt: |
-      Strengere Honesty-Variante. Du bist NICHT fertig solange du nicht
-      für JEDEN src-Top-Level-Pfad konkret begründen kannst:
-      - Welche 3+ Failure-Modes hast du dort geprüft?
-      - Welche 2+ Sicherheitslücken-Kategorien hast du geprüft?
-      - Welches Test-coverage-Loch hast du explizit als "nicht in
-        scope" markiert (statt es einfach zu übersehen)?
-      Bei jedem "keine Ahnung, hab ich nicht angeschaut": file
-      Bug-Report:investigate-<X> mit severity info JETZT.
-      Reply {"pass": true, "notes": "<pfad>: <findings> | ..."}.
-      Pauschal-"alles geprüft" wird rejected.
+      Stricter honesty variant. You are NOT done as long as you cannot
+      concretely justify, for EVERY src top-level path:
+      - Which 3+ failure modes did you check there?
+      - Which 2+ vulnerability categories did you check?
+      - Which test-coverage gap did you explicitly mark as "not in
+        scope" (instead of simply overlooking it)?
+      For every "no idea, didn't look at it": file
+      Bug-Report:investigate-<X> with severity info NOW.
+      Reply {"pass": true, "notes": "<path>: <findings> | ..."}.
+      A blanket "checked everything" is rejected.
 
   - id: convergence-reached
     type: hard
-    description: "N=3 consecutive ticks ohne neue blocking/shallow-Bug-Reports. Default N=3; override via .peers/config.yaml goals.convergence_n."
+    description: "N=3 consecutive ticks without new blocking/shallow Bug-Reports. Default N=3; override via .peers/config.yaml goals.convergence_n."
     cmd: "python3 .peers/checks/convergence_reached.py ."
     pass_when: "exit_code == 0"
 

@@ -416,9 +416,9 @@ def read_bytes_under_root_no_follow(
 def read_text_under_root_no_follow(
     root: Path, rel_parts: Sequence[str], max_bytes: int | None = None,
 ) -> str:
-    """UTF-8 text variant of :func:`read_bytes_under_root_no_follow`."""
+    """Strict UTF-8 text variant of :func:`read_bytes_under_root_no_follow`."""
     data = read_bytes_under_root_no_follow(root, rel_parts, max_bytes=max_bytes)
-    return data.decode("utf-8", errors="replace")
+    return data.decode("utf-8")
 
 
 def write_text_no_symlink(path: Path, text: str) -> None:

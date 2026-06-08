@@ -58,6 +58,7 @@ __all__ = [
     "JustificationError",
     "append_justification",
     "is_justified",
+    "signers_for_file",
     "verify_log_chain",
 ]
 
@@ -233,6 +234,28 @@ def is_justified(
         if fpath == file_path and lno == line_number:
             return (True, reviewer)
     return (False, None)
+
+
+def signers_for_file(plan_dir: Path, file_path: str) -> set[str]:
+    """Return the set of reviewer identities that signed ANY line of
+    ``file_path``. Pure lookup (does not verify the chain — the caller verifies
+    once at gate entry). Used by ``checkoff-by-other-peer`` to decide whether a
+    co-implemented, self-authored file carries an independent review."""
+    log_path = plan_dir / _LOG_FILENAME
+    text = _read_log_text_no_symlink(log_path)
+    if text is None:
+        return set()
+    out: set[str] = set()
+    for line in text.splitlines():
+        if not line:
+            continue
+        parsed = _parse_entry(line)
+        if parsed is None:
+            continue
+        _chain, fpath, _lno, reviewer, _reason = parsed
+        if fpath == file_path:
+            out.add(reviewer)
+    return out
 
 
 def verify_log_chain(plan_dir: Path) -> None:

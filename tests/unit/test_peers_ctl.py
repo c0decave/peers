@@ -139,6 +139,19 @@ def test_corrupt_registry_raises(tmp_path: Path):
         Store(cfg).list_projects()
 
 
+def test_registry_rejects_invalid_utf8_BUG_262(tmp_path: Path):
+    cfg = tmp_path / "ctl"
+    s = Store(cfg)
+    s.path.write_bytes(
+        b"projects:\n"
+        b"  - name: snake\n"
+        b"    path: /tmp/bad\xffpath\n"
+    )
+
+    with pytest.raises(RuntimeError, match="UTF-8|utf-8"):
+        s.list_projects()
+
+
 def test_oversized_registry_raises(tmp_path: Path):
     from peers_ctl.store import _PROJECTS_REGISTRY_MAX_BYTES
 
@@ -206,6 +219,30 @@ def test_reconcile_refuses_symlinked_stop_reason(tmp_path: Path):
     victim = tmp_path / "same-user-file.txt"
     victim.write_text("complete forged-by-symlink\n")
     (target / ".peers" / "last-stop-reason.txt").symlink_to(victim)
+    s.add(Project(name="x", path=str(target)))
+    s.update("x", state="running", pid=0x7fffffff)
+
+    reconcile(s)
+
+    p = s.get("x")
+    assert p.state == "crashed"
+    assert p.pid is None
+
+
+def test_reconcile_refuses_symlinked_peers_dir_stop_reason_BUG_223(
+    tmp_path: Path,
+):
+    """BUG-223: the no-follow stop-sentinel read must also reject a
+    symlinked .peers ancestor, not just a symlinked leaf file."""
+    s = Store(tmp_path / "ctl")
+    target = tmp_path / "p"
+    target.mkdir()
+    outside = tmp_path / "outside-peers"
+    outside.mkdir()
+    (outside / "last-stop-reason.txt").write_text(
+        "complete forged-through-parent\n",
+    )
+    (target / ".peers").symlink_to(outside, target_is_directory=True)
     s.add(Project(name="x", path=str(target)))
     s.update("x", state="running", pid=0x7fffffff)
 
@@ -550,6 +587,30 @@ def test_is_pid_alive_self():
     assert is_pid_alive(os.getpid())
 
 
+def test_is_pid_alive_treats_zombie_as_not_alive(monkeypatch):
+    import peers_ctl.store as store_mod
+
+    monkeypatch.setattr(store_mod.os, "kill", lambda _pid, _sig: None)
+    monkeypatch.setattr(
+        store_mod, "_proc_state", lambda _pid: "Z", raising=False
+    )
+
+    assert not store_mod.is_pid_alive(12345)
+
+
+def test_is_pid_alive_keeps_kill0_result_when_proc_state_unavailable(
+    monkeypatch,
+):
+    import peers_ctl.store as store_mod
+
+    monkeypatch.setattr(store_mod.os, "kill", lambda _pid, _sig: None)
+    monkeypatch.setattr(
+        store_mod, "_proc_state", lambda _pid: None, raising=False
+    )
+
+    assert store_mod.is_pid_alive(12345)
+
+
 def test_is_pid_alive_zero_false():
     assert not is_pid_alive(0)
     assert not is_pid_alive(None)
@@ -792,6 +853,134 @@ def test_signal_rejects_nonpositive_pgid_and_falls_back_to_pid(monkeypatch):
         ("kill", 999992, signal.SIGTERM),
         ("kill", 999993, signal.SIGKILL),
     ]
+
+
+def test_stop_project_rechecks_starttime_before_sigkill_BUG_214(
+    tmp_path: Path, monkeypatch,
+):
+    """BUG-214: a PID can be recycled after SIGTERM and before the
+    post-grace SIGKILL. stop_project must re-check the recorded starttime
+    before escalation instead of trusting the pre-TERM check.
+    """
+    import peers_ctl.runner as runner_mod
+
+    cfg = tmp_path / "ctl"
+    target = tmp_path / "target"
+    target.mkdir()
+    s = Store(cfg)
+    pid = 424242
+    pgid = 424242
+    s.add(Project(
+        name="snake", path=str(target), state="running", pid=pid,
+        notes="starttime=111",
+    ))
+    match_calls: list[int] = []
+    signals: list[tuple[int, int | None, int]] = []
+
+    def fake_pid_still_matches(project):
+        match_calls.append(project.pid or -1)
+        return len(match_calls) == 1
+
+    def fake_signal(pid_arg, pgid_arg, sig):
+        signals.append((pid_arg, pgid_arg, sig))
+
+    monkeypatch.setattr(runner_mod, "is_pid_alive", lambda pid_arg: True)
+    monkeypatch.setattr(
+        runner_mod, "_pid_still_matches_startup", fake_pid_still_matches
+    )
+    monkeypatch.setattr(runner_mod, "_safe_getpgid", lambda pid_arg: pgid)
+    monkeypatch.setattr(
+        runner_mod, "_alive_via_pgid_or_pid",
+        lambda pid_arg, pgid_arg: True,
+    )
+    monkeypatch.setattr(runner_mod, "_signal", fake_signal)
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runner_mod.os,
+        "waitpid",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ChildProcessError()),
+    )
+
+    runner_mod.stop_project(s, s.get("snake"), grace_s=0)
+
+    assert match_calls == [pid, pid]
+    assert signals == [(pid, pgid, signal.SIGTERM)]
+    assert s.get("snake").state == "stopped"
+
+
+def test_stop_project_sigkills_group_anchored_pgid_despite_starttime_mismatch_BUG_215(
+    tmp_path: Path, monkeypatch,
+):
+    """BUG-215: when the process group still has live non-zombie members
+    post-grace, killpg(pgid, SIGKILL) targets ONLY the original group
+    and is safe even if `_pid_still_matches_startup` trips. On Linux
+    the kernel anchors the leader PID via the pgid reference, so a
+    "recycled" leader PID cannot exist while the group has members. The
+    BUG-214 recycle gate must apply only to the single-PID fallback;
+    here it has been suppressing the legitimate group-scope escalation
+    that BUG-135 relies on.
+    """
+    import peers_ctl.runner as runner_mod
+
+    cfg = tmp_path / "ctl"
+    target = tmp_path / "target"
+    target.mkdir()
+    s = Store(cfg)
+    pid = 424243
+    pgid = 424243
+    s.add(Project(
+        name="snake", path=str(target), state="running", pid=pid,
+        notes="starttime=111",
+    ))
+
+    killpg_calls: list[tuple[int, int]] = []
+    signal_calls: list[tuple[int, int | None, int]] = []
+    match_calls: list[int] = []
+
+    def fake_killpg(pgid_arg: int, sig: int) -> None:
+        killpg_calls.append((pgid_arg, sig))
+
+    def fake_signal(pid_arg: int, pgid_arg: int | None, sig: int) -> None:
+        signal_calls.append((pid_arg, pgid_arg, sig))
+
+    def fake_pid_still_matches(project: Project) -> bool:
+        match_calls.append(project.pid or -1)
+        # Pre-TERM gate: True. Post-grace recycle gate: False (simulates
+        # a /proc race or genuine leader-reap+recycle window).
+        return len(match_calls) == 1
+
+    monkeypatch.setattr(runner_mod, "is_pid_alive", lambda pid_arg: True)
+    monkeypatch.setattr(
+        runner_mod, "_pid_still_matches_startup", fake_pid_still_matches
+    )
+    monkeypatch.setattr(runner_mod, "_safe_getpgid", lambda pid_arg: pgid)
+    # Group still has the TERM-ignoring grandchild — pgid is anchor-held.
+    monkeypatch.setattr(
+        runner_mod, "_process_group_has_live_members",
+        lambda pgid_arg: True,
+    )
+    monkeypatch.setattr(
+        runner_mod, "_alive_via_pgid_or_pid",
+        lambda pid_arg, pgid_arg: True,
+    )
+    monkeypatch.setattr(runner_mod, "_signal", fake_signal)
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runner_mod.os, "killpg", fake_killpg)
+    monkeypatch.setattr(
+        runner_mod.os,
+        "waitpid",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ChildProcessError()),
+    )
+
+    runner_mod.stop_project(s, s.get("snake"), grace_s=0)
+
+    # SIGTERM was sent through _signal (group-aware delivery).
+    assert signal_calls == [(pid, pgid, signal.SIGTERM)]
+    # SIGKILL was issued directly via os.killpg (bypassing the recycle
+    # gate that would otherwise suppress it), targeting the anchor-held
+    # pgid only.
+    assert killpg_calls == [(pgid, signal.SIGKILL)]
+    assert s.get("snake").state == "stopped"
 
 
 def test_alive_via_pgid_or_pid_catches_leader_outside_captured_group(monkeypatch):
@@ -1468,17 +1657,19 @@ def test_store_logs_skipped_malformed_registry_entry(tmp_path: Path, caplog):
     assert "skipping malformed project registry entry" in caplog.text
 
 
-def test_store_mutation_refuses_symlinked_tmp_file(tmp_path: Path):
+def test_store_mutation_ignores_legacy_predictable_tmp_symlink(tmp_path: Path):
+    """The writer uses a randomized O_EXCL temp name, so the old predictable
+    projects.yaml.tmp symlink bait is bypassed and left untouched."""
     cfg = tmp_path / "ctl"
     s = Store(cfg)
     bait = tmp_path / "bait.yaml"
     bait.write_text("keep me")
     s.path.with_suffix(s.path.suffix + ".tmp").symlink_to(bait)
 
-    with pytest.raises(OSError):
-        s.add(Project(name="x", path=str(tmp_path / "p")))
+    s.add(Project(name="x", path=str(tmp_path / "p")))
 
     assert bait.read_text() == "keep me"
+    assert [p.name for p in s.list_projects()] == ["x"]
 
 
 def test_store_mutation_refuses_symlinked_lock_file(tmp_path: Path):
@@ -1492,6 +1683,25 @@ def test_store_mutation_refuses_symlinked_lock_file(tmp_path: Path):
         s.add(Project(name="x", path=str(tmp_path / "p")))
 
     assert bait.read_text() == "keep me"
+
+
+def test_store_write_atomic_sad_refuses_swapped_config_dir_BUG_267(
+    tmp_path: Path,
+):
+    """BUG-267: a late symlink swap of the controller config dir must not
+    redirect projects.yaml writes outside the trusted registry directory."""
+    cfg = tmp_path / "ctl"
+    s = Store(cfg)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    shutil.rmtree(cfg)
+    cfg.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        s._write_atomic({"projects": []})
+
+    assert not (outside / "projects.yaml").exists()
+    assert not (outside / "projects.yaml.tmp").exists()
 
 
 def test_prune_logs_warns_on_unlink_failure(
@@ -1869,6 +2079,67 @@ def test_persist_budget_override_refuses_symlinked_overrides_BUG_196(
     )
 
 
+def test_persist_budget_override_refuses_symlinked_peers_ancestor_BUG_238(
+    tmp_path: Path,
+) -> None:
+    """BUG-238: same threat as BUG-198/BUG-224, ancestor side.
+
+    `_persist_budget_override` reads the prior sidecar via
+    `read_text_no_symlink`, which only carries O_NOFOLLOW on the leaf.
+    A same-UID adversary that symlinks `<proj>/.peers` to an outside
+    dir can have the controller open an attacker-chosen
+    `budget-overrides.json` and merge that JSON into the live
+    overrides dict before the safe write helper refuses the ancestor.
+
+    Expected after the fix: the merge-read walks every component with
+    O_NOFOLLOW (like `_read_state` after BUG-224), so a symlinked
+    `.peers` ancestor short-circuits the read to an empty dict and the
+    function raises a clean OSError/ValueError caught by `cmd_start`
+    instead of leaking JSON or leaving an uncaught traceback.
+    """
+    import json
+    import peers_ctl.runner as runner_mod
+    from peers.budget_accountant import OPERATOR_BUDGET_OVERRIDE_FILE
+
+    outside = tmp_path / "outside-peers"
+    outside.mkdir()
+    (outside / "config.yaml").write_text("driver: orchestrator\n")
+    attacker_payload = {
+        "max_runtime_s": 1,
+        "leaked_field": "attacker-controlled-key-via-symlinked-ancestor",
+    }
+    (outside / OPERATOR_BUDGET_OVERRIDE_FILE).write_text(
+        json.dumps(attacker_payload)
+    )
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / ".peers").symlink_to(outside, target_is_directory=True)
+    proj = Project(name="x", path=str(target))
+
+    captured: dict[str, dict] = {}
+    real_safe_write = runner_mod.atomic_write_text_in_dir_no_symlink
+
+    def _capture(path, text):
+        captured["merged"] = json.loads(text)
+        return real_safe_write(path, text)
+
+    runner_mod.atomic_write_text_in_dir_no_symlink = _capture
+    try:
+        try:
+            runner_mod._persist_budget_override(proj, max_runtime_s=43200)
+        except (OSError, ValueError):
+            pass
+    finally:
+        runner_mod.atomic_write_text_in_dir_no_symlink = real_safe_write
+
+    merged = captured.get("merged", {})
+    assert "leaked_field" not in merged, (
+        f"_persist_budget_override followed symlinked .peers ancestor "
+        f"and merged attacker keys into existing overrides: {merged!r}"
+    )
+
+
 def test_write_state_happy_path_writes_atomic_no_symlink_BUG_196(
     tmp_path: Path,
 ) -> None:
@@ -1889,3 +2160,75 @@ def test_write_state_happy_path_writes_atomic_no_symlink_BUG_196(
         json.loads((target / ".peers" / "state.json").read_text())["iteration"]
         == 8
     )
+
+
+# --- BUG-210 reproducers ----------------------------------------------------
+
+def test_acquire_start_lock_refuses_symlinked_path_BUG_210(
+    tmp_path: Path,
+) -> None:
+    """BUG-210 happy/sad reproducer: a pre-planted symlink at the lock
+    path must be refused, not silently followed-and-truncated.
+
+    Before the fix, Path.open("w") followed the symlink and truncated the
+    victim. The hardened helper must raise OSError BEFORE clobbering the
+    target, matching the safe_io discipline used by Store.mutate.
+    """
+    import peers_ctl.runner as runner_mod
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("DO NOT TRUNCATE\n")
+
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    lock_path = lock_dir / "snake.start.lock"
+    lock_path.symlink_to(victim)
+
+    with pytest.raises(OSError):
+        with runner_mod._acquire_start_lock(lock_path, timeout=0.2):
+            pass
+
+    # Victim content must be intact — the refusal must happen before
+    # the open() call truncates anything.
+    assert victim.read_text() == "DO NOT TRUNCATE\n", (
+        "symlinked lock path truncated the victim file before refusing"
+    )
+
+
+def test_acquire_start_lock_happy_creates_regular_file_BUG_210(
+    tmp_path: Path,
+) -> None:
+    """Happy path: a fresh lock path acquires cleanly and creates the
+    regular lock file. Regression-defence for the BUG-210 hardening: the
+    no-symlink check must not over-reach onto legitimate fresh files."""
+    import peers_ctl.runner as runner_mod
+
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    lock_path = lock_dir / "snake.start.lock"
+
+    with runner_mod._acquire_start_lock(lock_path, timeout=0.2):
+        assert lock_path.is_file()
+        assert not lock_path.is_symlink()
+
+
+def test_acquire_start_lock_edge_hardlink_refused_BUG_210(
+    tmp_path: Path,
+) -> None:
+    """Edge: a pre-existing HARD-LINKED lock leaf is also rejected,
+    mirroring the safe_io family's hardlink refusal. A multi-link file
+    means another path can be used to read the lock byte the controller
+    will write."""
+    import peers_ctl.runner as runner_mod
+
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    other = lock_dir / "other.txt"
+    other.write_text("twin\n")
+    lock_path = lock_dir / "snake.start.lock"
+    os.link(other, lock_path)
+    assert lock_path.stat().st_nlink == 2
+
+    with pytest.raises(OSError):
+        with runner_mod._acquire_start_lock(lock_path, timeout=0.2):
+            pass

@@ -40,6 +40,9 @@ from peers.safe_io import (
     _ensure_private_dir,
     atomic_write_text_in_dir_no_symlink,
     open_text_in_dir_no_symlink,
+    open_text_no_symlink,
+    read_bytes_under_root_no_follow,
+    read_text_under_root_no_follow,
     read_text_no_symlink,
 )
 from peers_ctl.store import Project, Store, is_pid_alive
@@ -110,9 +113,17 @@ AUTH_PROXY_URL = f"http://127.0.0.1:{AUTH_PROXY_PORT}"
 
 @contextmanager
 def _acquire_start_lock(lock_path: Path, timeout: float = 5.0):
-    """Serialize concurrent ``peers-ctl start`` calls for one project."""
+    """Serialize concurrent ``peers-ctl start`` calls for one project.
+
+    BUG-210: route the lock-file open through ``open_text_no_symlink`` so
+    a same-UID adversary cannot pre-plant a symlink at ``lock_path`` and
+    have ``peers-ctl start`` truncate an arbitrary writable file. This
+    matches the discipline ``Store.mutate`` already uses for its own lock
+    inode (st_nlink==1 + O_NOFOLLOW), keeping the controller's same-UID
+    threat model uniform.
+    """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fp = lock_path.open("w")
+    fp = open_text_no_symlink(lock_path, "w")
     deadline = time.time() + timeout
     while True:
         try:
@@ -202,6 +213,7 @@ def check_container_version_drift() -> tuple[str, str]:
 # substrate to be on the SAME minor version. Minor/patch drift escalates from
 # warn to error for these modes. Operator can override via PEERS_CTL_ALLOW_DRIFT=1.
 _DRIFT_REFUSE_MODES = frozenset({"audit", "thorough"})
+_MODES_APPLIED_MAX_BYTES = 512 * 1024
 
 
 def _read_project_modes_applied(project) -> list[str]:
@@ -212,9 +224,16 @@ def _read_project_modes_applied(project) -> list[str]:
     second whitespace-separated token.
     """
     try:
-        trail = Path(project.path) / ".peers" / "modes-applied.txt"
-        text = trail.read_text(encoding="utf-8", errors="replace")
-    except (OSError, AttributeError):
+        project_path = Path(project.path)
+    except AttributeError:
+        return []
+    try:
+        text = read_text_under_root_no_follow(
+            project_path,
+            (".peers", "modes-applied.txt"),
+            max_bytes=_MODES_APPLIED_MAX_BYTES,
+        )
+    except FileNotFoundError:
         return []
     names: list[str] = []
     for line in text.splitlines():
@@ -904,14 +923,41 @@ def _read_state(project: Project) -> dict[str, Any] | None:
     can't symlink ``.peers/state.json`` to a forged budget file and spoof
     ``spent_runtime_s`` / ``consecutive_failures`` past the controller's
     pre-flight budget-exhausted check. Symmetric to BUG-196 (write side).
-    A symlinked leaf makes ``read_text_no_symlink`` raise OSError, which
-    we treat as 'no state' (fail-safe) rather than trusting the forgery.
+    BUG-224: ``read_text_no_symlink`` only carries ``O_NOFOLLOW`` on the
+    leaf; the kernel still resolves a symlinked ``.peers`` ancestor.
+    Route through ``read_bytes_under_root_no_follow`` so every ancestor
+    is walked with ``O_DIRECTORY|O_NOFOLLOW`` — a symlinked ``.peers``
+    raises OSError and is treated as 'no state' (fail-safe) rather than
+    trusting attacker-controlled budget JSON from an outside directory.
     """
-    path = Path(project.path) / ".peers" / "state.json"
     try:
-        return json.loads(read_text_no_symlink(path))
+        raw = read_bytes_under_root_no_follow(
+            Path(project.path), [".peers", "state.json"],
+        )
+        state = json.loads(raw)
     except (OSError, ValueError):
         return None
+    return state if isinstance(state, dict) else None
+
+
+def _budget_mapping(state: dict[str, Any]) -> dict[str, Any]:
+    budget = state.get("budget")
+    if isinstance(budget, dict):
+        return budget
+    budget = {}
+    state["budget"] = budget
+    return budget
+
+
+def _budget_number(budget: dict[str, Any], key: str) -> int | float:
+    value = budget.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        return 0
+    return value
 
 
 def _write_state(project: Project, state: dict[str, Any]) -> None:
@@ -947,7 +993,11 @@ def _persist_budget_override(project: Project, **caps: int) -> None:
     path = _budget_override_path(project)
     existing: dict[str, object] = {}
     try:
-        loaded = json.loads(read_text_no_symlink(path))
+        loaded = json.loads(
+            read_bytes_under_root_no_follow(
+                Path(project.path), [".peers", OPERATOR_BUDGET_OVERRIDE_FILE],
+            )
+        )
         if isinstance(loaded, dict):
             existing = loaded
     except (OSError, ValueError):
@@ -994,7 +1044,7 @@ def _apply_budget_overrides(
         # exist yet. The sidecar above already carries the override; the
         # orchestrator applies it after building initial state.
         return
-    budget = state.setdefault("budget", {})
+    budget = _budget_mapping(state)
     if reset_budget:
         # Spent counters → 0; preserve caps and historic metadata.
         for k in ("spent_runtime_s", "spent_iterations",
@@ -1022,9 +1072,9 @@ def _check_budget_or_abort(project: Project, *, force: bool) -> None:
     state = _read_state(project)
     if state is None:
         return
-    budget = state.get("budget") or {}
-    spent = budget.get("spent_runtime_s") or 0
-    cap = budget.get("max_runtime_s") or 0
+    budget = _budget_mapping(state)
+    spent = _budget_number(budget, "spent_runtime_s")
+    cap = _budget_number(budget, "max_runtime_s")
     if cap <= 0 or spent < cap:
         return
     pct = (spent / cap) * 100 if cap else 0
@@ -1430,7 +1480,34 @@ def stop_project(store: Store, project: Project,
         time.sleep(0.2)
 
     if _alive_via_pgid_or_pid(pid, pgid):
-        _signal(pid, pgid, signal.SIGKILL)
+        # on Linux the kernel keeps the leader PID allocated for
+        # as long as its pgid is referenced by any live group member, so
+        # while `_process_group_has_live_members(pgid)` is True the leader
+        # PID cannot have been recycled to an unrelated process. In that
+        # case killpg targets ONLY the original group and is safe even
+        # though `_pid_still_matches_startup` could trip on a transient
+        # /proc read race (e.g. reaped leader, stat briefly empty). Only
+        # the single-PID fallback needs the BUG-214 recycle gate.
+        if _valid_pgid(pgid) and _process_group_has_live_members(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as e:
+                print(
+                    f"peers-ctl: cannot SIGKILL pgid {pgid}: {e}. "
+                    f"Process group may still be running.",
+                    file=sys.stderr,
+                )
+        elif _pid_safe_for_post_grace_signal(project, pid):
+            _signal(pid, pgid, signal.SIGKILL)
+        else:
+            print(
+                f"peers-ctl: refusing to escalate SIGKILL for pid {pid} "
+                f"for {project.name!r} — starttime mismatch after grace "
+                "(PID may have been recycled). Marking stopped.",
+                file=sys.stderr,
+            )
         # Brief sleep to let the kernel reap.
         time.sleep(0.2)
 
@@ -1448,6 +1525,20 @@ def stop_project(store: Store, project: Project,
                      _dt.timezone.utc
                  ).isoformat())
     return 0
+
+
+def _pid_safe_for_post_grace_signal(project: Project, pid: int) -> bool:
+    if _pid_still_matches_startup(project):
+        return True
+    if _has_missing_starttime_sentinel(project) and _is_current_child(pid):
+        print(
+            f"peers-ctl: warning: starttime unavailable for "
+            f"{project.name!r}; escalating current child pid {pid} "
+            "using same-process ownership.",
+            file=sys.stderr,
+        )
+        return True
+    return False
 
 
 def _safe_getpgid(pid: int) -> int | None:

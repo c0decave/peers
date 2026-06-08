@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import subprocess
@@ -7,7 +8,11 @@ import sys
 from typing import Any
 
 from peers.driver_helpers import _hash_goals_yaml
-from peers.safe_io import atomic_write_text_in_dir_no_symlink, read_text_no_symlink
+from peers.safe_io import (
+    atomic_write_text_in_dir_no_symlink,
+    read_bytes_no_symlink,
+    read_text_no_symlink,
+)
 
 
 def _driver_module() -> Any:
@@ -196,6 +201,105 @@ class DriverLifecycleMixin:
                         "refusing to operate (hybrid comm files would "
                         "otherwise write through). Remove it manually."
                     )
+        self._verify_checks_manifest()
+
+    def _verify_checks_manifest(self) -> None:
+        """Fail closed when installed gate scripts drift from checks.sha256.
+
+        ``peers init`` writes the manifest after hardening ``.peers/checks``.
+        The chmod is only advisory for same-UID peers, so the live driver must
+        re-hash the scripts before trusting any hard-gate evaluation.
+        """
+        checks_dir = self.peer_dir / "checks"
+        if not checks_dir.exists():
+            return
+        if not checks_dir.is_dir():
+            raise RuntimeError(
+                f"{checks_dir} is not a directory; refusing to operate."
+            )
+        manifest_path = self.peer_dir / "checks.sha256"
+        if not manifest_path.exists():
+            raise RuntimeError(
+                f"{manifest_path} is missing while {checks_dir} exists; "
+                "refusing to run unverifiable gate scripts."
+            )
+        try:
+            manifest_text = read_text_no_symlink(
+                manifest_path, max_bytes=256 * 1024,
+            )
+        except OSError as e:
+            raise RuntimeError(
+                f"failed to read {manifest_path}: {e}; refusing to operate."
+            ) from e
+
+        expected: dict[str, str] = {}
+        for lineno, raw_line in enumerate(manifest_text.splitlines(), 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                raise RuntimeError(
+                    f"{manifest_path}:{lineno}: malformed checks.sha256 line"
+                )
+            digest, name = parts[0].lower(), parts[1].strip()
+            if (
+                len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+            ):
+                raise RuntimeError(
+                    f"{manifest_path}:{lineno}: malformed sha256 digest"
+                )
+            if name in ("", ".", "..") or os.path.basename(name) != name:
+                raise RuntimeError(
+                    f"{manifest_path}:{lineno}: check name must be a "
+                    f"single path component, got {name!r}"
+                )
+            if not name.endswith(".py"):
+                raise RuntimeError(
+                    f"{manifest_path}:{lineno}: check manifest only supports "
+                    f"Python check scripts, got {name!r}"
+                )
+            if name in expected:
+                raise RuntimeError(
+                    f"{manifest_path}:{lineno}: duplicate check entry {name!r}"
+                )
+            expected[name] = digest
+
+        actual_names = {
+            p.name for p in checks_dir.iterdir()
+            if p.name.endswith(".py")
+        }
+        expected_names = set(expected)
+        missing = sorted(expected_names - actual_names)
+        extra = sorted(actual_names - expected_names)
+        if missing:
+            raise RuntimeError(
+                f"{manifest_path} lists missing check script(s): "
+                f"{', '.join(missing)}"
+            )
+        if extra:
+            raise RuntimeError(
+                f"{manifest_path} does not list installed check script(s): "
+                f"{', '.join(extra)}"
+            )
+
+        for name, expected_digest in expected.items():
+            check_path = checks_dir / name
+            try:
+                data = read_bytes_no_symlink(check_path)
+            except OSError as e:
+                raise RuntimeError(
+                    f"failed to read check script {check_path}: {e}; "
+                    "refusing to operate."
+                ) from e
+            actual_digest = hashlib.sha256(data).hexdigest()
+            if actual_digest != expected_digest:
+                raise RuntimeError(
+                    f"{manifest_path} mismatch for {name}: expected "
+                    f"{expected_digest}, got {actual_digest}; refusing to "
+                    "run tampered gate scripts."
+                )
 
     def _read_goal_hash_snapshot(self) -> str | None:
         """Read the goals.sha256 snapshot file ONCE at init time, or

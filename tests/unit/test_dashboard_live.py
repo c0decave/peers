@@ -453,6 +453,38 @@ def test_dashboard_soft_goal_passed_tolerates_non_list_history_BUG_205():
     assert dashboard_live._dashboard_soft_goal_passed(goal, status, 2) is False
 
 
+def test_dashboard_soft_goal_passed_tolerates_bad_history_entries_BUG_250():
+    """BUG-250 reproducer: malformed quorum history entries must be ignored
+    instead of aborting the dashboard render."""
+    from peers.goals import Goal
+
+    goal = Goal(
+        id="soft-quorum",
+        type="soft",
+        reviewer="quorum",
+        quorum_num=1,
+        quorum_den=2,
+    )
+
+    assert dashboard_live._dashboard_soft_goal_passed(
+        goal, {"history": [["bad"], {"pass": True}]}, 2,
+    ) is True
+    assert dashboard_live._dashboard_soft_goal_passed(
+        goal, {"history": [["bad"], "shape"]}, 2,
+    ) is False
+    assert dashboard_live._dashboard_soft_goal_passed(
+        Goal(
+            id="soft-quorum",
+            type="soft",
+            reviewer="quorum",
+            quorum_num=1,
+            quorum_den=1,
+        ),
+        {"history": [{"pass": "yes"}]},
+        2,
+    ) is False
+
+
 def test_dashboard_goal_counts_survives_corrupt_soft_history_BUG_205(tmp_path):
     """End-to-end: a corrupt non-list history in state.json must not crash
     the whole-registry dashboard render (load_dashboard_rows)."""
@@ -484,3 +516,155 @@ def test_dashboard_goal_counts_survives_corrupt_soft_history_BUG_205(tmp_path):
     assert any(row.name == "gamma" for row in rows), (
         "BUG-205: corrupt soft-goal history aborted the whole-registry render"
     )
+
+
+def test_dashboard_goal_counts_survives_bad_history_entries_BUG_250(tmp_path):
+    """End-to-end: corrupt quorum history entries should not abort the
+    whole-registry dashboard render."""
+    config_dir = tmp_path / "ctl"
+    project_path = _register_project(config_dir, tmp_path, "gamma-b")
+    peers_dir = project_path / ".peers"
+    (peers_dir / "goals.yaml").write_text(
+        "goals:\n"
+        "  - id: soft-quorum\n"
+        "    description: quorum soft goal\n"
+        "    type: soft\n"
+        "    reviewer: quorum\n"
+        "    quorum: 1/1\n"
+        "    prompt: 'review'\n"
+        "    pass_when: \"true\"\n",
+        encoding="utf-8",
+    )
+    (peers_dir / "state.json").write_text(
+        json.dumps({
+            "soft_status": {
+                "soft-quorum": {"history": [["bad"]]},
+            },
+            "peer_order": ["claude", "codex"],
+        }),
+        encoding="utf-8",
+    )
+
+    rows = load_dashboard_rows(config_dir, reconcile_first=False)
+
+    row = next(row for row in rows if row.name == "gamma-b")
+    assert row.soft_open == "1"
+
+
+def test_dashboard_soft_goal_passed_tolerates_malformed_per_peer_BUG_249():
+    """BUG-249 reproducer: reviewer='both' soft goals must treat malformed
+    per-peer consensus data as insufficient, not crash the dashboard."""
+    from peers.goals import Goal
+
+    goal = Goal(
+        id="soft-both",
+        type="soft",
+        reviewer="both",
+        consensus_needed=1,
+    )
+
+    assert dashboard_live._dashboard_soft_goal_passed(
+        goal, {"per_peer": ["not", "a", "mapping"]}, 2,
+    ) is False
+    assert dashboard_live._dashboard_soft_goal_passed(
+        goal, {"per_peer": {"claude": ["not", "a", "status"]}}, 2,
+    ) is False
+
+
+def test_dashboard_soft_goal_passed_tolerates_bad_consensus_count_BUG_251():
+    """BUG-251 reproducer: malformed consensus counters must be ignored."""
+    from peers.goals import Goal
+
+    both = Goal(
+        id="soft-both",
+        type="soft",
+        reviewer="both",
+        consensus_needed=1,
+    )
+    other = Goal(
+        id="soft-other",
+        type="soft",
+        reviewer="other",
+        consensus_needed=1,
+    )
+
+    assert dashboard_live._dashboard_soft_goal_passed(
+        both, {"per_peer": {"claude": {"consensus_count": ["bad"]}}}, 1,
+    ) is False
+    assert dashboard_live._dashboard_soft_goal_passed(
+        both, {"per_peer": {"claude": {"consensus_count": True}}}, 1,
+    ) is False
+    assert dashboard_live._dashboard_soft_goal_passed(
+        other, {"consensus_count": "2"}, 2,
+    ) is False
+    assert dashboard_live._dashboard_soft_goal_passed(
+        other, {"consensus_count": True}, 2,
+    ) is False
+    assert dashboard_live._dashboard_soft_goal_passed(
+        other, {"consensus_count": 1}, 2,
+    ) is True
+
+
+def test_dashboard_goal_counts_survives_corrupt_per_peer_BUG_249(tmp_path):
+    """End-to-end: corrupt reviewer='both' per_peer state should not abort
+    the whole-registry dashboard render."""
+    config_dir = tmp_path / "ctl"
+    project_path = _register_project(config_dir, tmp_path, "delta")
+    peers_dir = project_path / ".peers"
+    (peers_dir / "goals.yaml").write_text(
+        "goals:\n"
+        "  - id: soft-both\n"
+        "    description: both-reviewer soft goal\n"
+        "    type: soft\n"
+        "    reviewer: both\n"
+        "    prompt: 'review'\n"
+        "    pass_when: \"true\"\n",
+        encoding="utf-8",
+    )
+    (peers_dir / "state.json").write_text(
+        json.dumps({
+            "soft_status": {
+                "soft-both": {"per_peer": ["bad", "shape"]},
+            },
+            "peer_order": ["claude", "codex"],
+        }),
+        encoding="utf-8",
+    )
+
+    rows = load_dashboard_rows(config_dir, reconcile_first=False)
+
+    row = next(row for row in rows if row.name == "delta")
+    assert row.soft_open == "1"
+
+
+def test_dashboard_goal_counts_survives_bad_consensus_count_BUG_251(tmp_path):
+    """End-to-end: malformed consensus_count values should not abort
+    dashboard soft-goal accounting."""
+    config_dir = tmp_path / "ctl"
+    project_path = _register_project(config_dir, tmp_path, "epsilon")
+    peers_dir = project_path / ".peers"
+    (peers_dir / "goals.yaml").write_text(
+        "goals:\n"
+        "  - id: soft-other\n"
+        "    description: other-reviewer soft goal\n"
+        "    type: soft\n"
+        "    reviewer: other\n"
+        "    consensus_needed: 1\n"
+        "    prompt: 'review'\n"
+        "    pass_when: \"true\"\n",
+        encoding="utf-8",
+    )
+    (peers_dir / "state.json").write_text(
+        json.dumps({
+            "soft_status": {
+                "soft-other": {"consensus_count": ["bad"]},
+            },
+            "peer_order": ["claude", "codex"],
+        }),
+        encoding="utf-8",
+    )
+
+    rows = load_dashboard_rows(config_dir, reconcile_first=False)
+
+    row = next(row for row in rows if row.name == "epsilon")
+    assert row.soft_open == "1"

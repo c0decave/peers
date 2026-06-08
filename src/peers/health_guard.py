@@ -26,11 +26,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from peers.liveness import proc_state_alive, socket_active
 from peers.structured_halt import (
     classify_structured_halt,
     classify_structured_transient,
 )
 
+
+# Tier-2 C3: how often the composite hang probe re-reads /proc + jsonl once
+# stdout has gone silent past hang_kill_s. Bounds the /proc read rate during a
+# long quiet stretch without materially delaying the kill.
+_HANG_PROBE_INTERVAL_S = 2.0
+_HANG_DIAG_TAIL_BYTES = 16384
 
 _BUF_SOFT_CAP_BYTES = 2 * 1024 * 1024  # 2 MiB per stream (default)
 _BUF_KEEP_HEAD_LINES = 100
@@ -93,6 +100,36 @@ def jsonl_mtime_within(jsonl_dir: Path, within_seconds: int) -> bool:
         except OSError:
             continue
     return False
+
+
+def hung_tool_diagnostic(stdout_tail: str) -> str | None:
+    """Tier-2 C4 (light): when a hang-kill fires, surface the likely cause —
+    a ``tool_use`` event in the stdout tail with no matching ``tool_result``
+    (the peer hung waiting on a tool). Best-effort: scans JSONL-ish lines for
+    tool_use/tool_result ids; ignores anything unparseable. Returns a short
+    note naming the unmatched tool(s), or ``None``."""
+    import json
+
+    open_tools: dict[str, str] = {}
+    for line in stdout_tail.splitlines():
+        line = line.strip()
+        if "tool_use" not in line and "tool_result" not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        typ = obj.get("type")
+        if typ == "tool_use":
+            open_tools[obj.get("id") or ""] = obj.get("name") or "?"
+        elif typ == "tool_result":
+            open_tools.pop(obj.get("tool_use_id") or obj.get("id") or "", None)
+    if not open_tools:
+        return None
+    names = ", ".join(sorted(set(open_tools.values())))
+    return f"hung mid-tool-call (no tool_result for: {names})"
 
 
 def _utf8_size(text: str) -> int:
@@ -623,6 +660,7 @@ class HealthGuard:
         prompt: str,
         idle_timeout_s: int = 15 * 60,
         absolute_max_runtime_s: int = 2 * 3600,
+        hang_kill_s: int | None = None,
         prompt_mode: str = "stdin",
         error_patterns: Sequence[str] | None = None,
         halt_patterns: Sequence[str] | None = None,
@@ -749,6 +787,9 @@ class HealthGuard:
         # only catches them after we're already done — far too late
         # when claude bursts hundreds of helpers per tick.
         last_zombie_sweep = time.monotonic()
+        # Tier-2 C3: composite hang-kill probe throttle + fired flag.
+        last_hang_probe = time.monotonic()
+        hang_kill_fired = False
         try:
             while True:
                 rc = proc.poll()
@@ -799,6 +840,49 @@ class HealthGuard:
                 with shared_lock:
                     last_output = shared["last_output_t"]
                 now = time.monotonic()
+
+                # Tier-2 C3: faster composite-AND hang kill (opt-in via
+                # hang_kill_s). Kill a genuine hang sooner than the coarse idle
+                # timeout, but ONLY when EVERY liveness signal is silent for
+                # >= hang_kill_s: stdout cadence (last_output), session-jsonl
+                # mtime, AND an active API socket. Any one live signal keeps the
+                # peer alive — so rate-limit backoff (the CLI keeps writing the
+                # session jsonl while it retries) and slow first-token thinking
+                # are never mistaken for a hang. absolute_max stays the hard
+                # backstop. Probe is throttled so we don't read /proc each poll.
+                #
+                # FOUR keep-alive signals, all of which must be silent to kill:
+                # stdout cadence, session-jsonl mtime, an active API socket, AND
+                # process state (proc_state_alive). The 4th closes the
+                # awaiting-response blind spot the first three share: a model
+                # "thinking" before its first streamed token emits no stdout, no
+                # jsonl, and (through the local proxy) no queued socket bytes —
+                # but its thread is blocked in a recv/epoll syscall (or running),
+                # which proc_state_alive detects. Only a tree with no running and
+                # no I/O-wait thread (e.g. all in futex) reads as not-alive.
+                if (
+                    hang_kill_s is not None
+                    and hang_kill_s > 0
+                    and (now - last_output) > hang_kill_s
+                    and (now - last_hang_probe) >= _HANG_PROBE_INTERVAL_S
+                ):
+                    last_hang_probe = now
+                    jsonl_dir = claude_session_jsonl_path(self.cwd)
+                    jsonl_live = jsonl_dir is not None and jsonl_mtime_within(
+                        jsonl_dir, within_seconds=hang_kill_s
+                    )
+                    # Each signal can only PREVENT a kill (True keeps alive);
+                    # False/None never force a kill on their own.
+                    if (
+                        not jsonl_live
+                        and socket_active(proc.pid) is not True
+                        and proc_state_alive(proc.pid) is not True
+                    ):
+                        classification = "idle-timeout"
+                        hang_kill_fired = True
+                        self._terminate_and_reap(proc)
+                        rc = proc.returncode
+                        break
 
                 if (now - last_output) > idle_timeout_s:
                     jsonl_dir = claude_session_jsonl_path(self.cwd)
@@ -863,6 +947,18 @@ class HealthGuard:
 
         stdout = stdout_col.text()
         stderr = stderr_col.text()
+
+        # Tier-2 C4: if the composite hang-kill fired, attach a light
+        # diagnostic — an unmatched tool_use in the stdout tail points at the
+        # peer hanging mid-tool-call. Surfaced via config_error (-> stderr).
+        if hang_kill_fired:
+            diag = hung_tool_diagnostic(_take_utf8_suffix(
+                stdout, _HANG_DIAG_TAIL_BYTES))
+            note = "healthguard: hang-kill (stdout+jsonl+socket all silent)"
+            if diag:
+                note += f" — {diag}"
+            config_error = (config_error + "\n" + note).lstrip() \
+                if config_error else note
 
         # BUG-007 (2026-05-24): the in-loop scan reads incremental
         # `scan_buf` slices. If the child writes the pattern to a

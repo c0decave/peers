@@ -556,8 +556,8 @@ goals:
     type: hard
     description: |
       `ruff check` reports no errors. Reused verbatim from audit-mode.
-    cmd: "ruff check . 2>&1 || true"
-    pass_when: "regex('error', stdout + stderr) == None"
+    cmd: "ruff check ."
+    pass_when: "exit_code == 0"
 
   - id: tests-pass
     type: hard

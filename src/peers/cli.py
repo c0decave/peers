@@ -931,7 +931,11 @@ def _load_config_yaml(cfg_path: Path) -> dict:
             f"(max {_CONFIG_YAML_MAX_BYTES} bytes)"
         )
     try:
-        cfg = yaml.safe_load(raw.decode("utf-8", errors="replace"))
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"{cfg_path}: invalid UTF-8: {e}") from e
+    try:
+        cfg = yaml.safe_load(text)
     except yaml.YAMLError as e:
         raise ValueError(f"{cfg_path}: invalid YAML: {e}") from e
     if cfg is None:
@@ -1667,6 +1671,7 @@ def cmd_run(target: Path, max_ticks: int | None,
         peer_specs=peer_specs,
         idle_timeout_s=health.get("idle_timeout_s", 15 * 60),
         absolute_max_runtime_s=health.get("absolute_max_runtime_s", 2 * 3600),
+        hang_kill_s=health.get("hang_kill_s", None),
         error_patterns=health.get("error_patterns", []),
         halt_patterns=health.get("halt_patterns", []),
         cfg_budget=cfg_budget,
@@ -1678,6 +1683,7 @@ def cmd_run(target: Path, max_ticks: int | None,
         recon_enabled=not without_recon,
         codemap_enabled=not no_codemap,
         auto_skeptic_enabled=not without_post_convergence_skeptic,
+        pipeline_gates=bool(cfg.get("pipeline_gates", False)),
     )
     result = driver.run(max_ticks=max_ticks)
     print(f"Stopped: {result['reason']}")

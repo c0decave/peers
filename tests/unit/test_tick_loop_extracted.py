@@ -76,6 +76,7 @@ class _Driver:
         )
         self.idle_timeout_s = 1
         self.absolute_max_runtime_s = 2
+        self.hang_kill_s = None
         self.error_patterns = ["ERR"]
         self.halt_patterns = ["HALT"]
         self.buf_cap_bytes = 1024
@@ -91,6 +92,9 @@ class _Driver:
 
     def _verify_peer_dir_identity(self) -> None:
         self.events.append("verify")
+
+    def _verify_no_control_symlinks(self) -> None:
+        self.events.append("control_verify")
 
     def _pre_tick_exit(
         self, state: dict[str, Any], max_ticks: int | None, ticks: int,
@@ -223,6 +227,9 @@ class _Driver:
     def _update_convergence_counter(self, state: dict[str, Any]) -> None:
         self.events.append("convergence")
 
+    def _submit_gate_eval(self, sha: str) -> None:
+        pass
+
 
 def test_tick_loop_delegates_one_successful_tick_then_exits():
     state = {"iteration": 0}
@@ -240,6 +247,7 @@ def test_tick_loop_delegates_one_successful_tick_then_exits():
         "prompt_log:1:claude:prompt",
         "health_invoke",
         "verify",
+        "control_verify",
         "halt_check",
         "peer_logs:1:claude",
         "post_run",
@@ -286,6 +294,7 @@ def test_tick_loop_forwards_healthguard_invocation_arguments():
         "prompt": "prompt",
         "idle_timeout_s": 1,
         "absolute_max_runtime_s": 2,
+        "hang_kill_s": None,
         "prompt_mode": "stdin",
         "error_patterns": ["ERR"],
         "halt_patterns": ["HALT"],
@@ -417,6 +426,7 @@ def test_tick_loop_returns_halt_exit_before_finalizing_tick():
         "prompt_log:1:claude:prompt",
         "health_invoke",
         "verify",
+        "control_verify",
         "halt_check",
     ]
 

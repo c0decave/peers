@@ -46,6 +46,8 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from peers.safe_io import read_bytes_no_symlink
+
 
 _HEADING_RE = re.compile(r"^##\s+(.+?)\s*$")
 _TITLE_RE = re.compile(r"^#\s+(.+?)\s*$")
@@ -77,6 +79,7 @@ _LIST_INLINE_RE = re.compile(r"^\[(?P<inner>.*)\]$")
 # string 7..40 chars long; anything outside that range is treated as
 # ordinary parenthesised prose and left in the text untouched.
 _STEP_SHA_RE = re.compile(r"^(?P<text>.+?)\s*\((?P<sha>[0-9a-f]{7,40})\)\s*$")
+_PLAN_MAX_BYTES = 2 * 1024 * 1024
 
 
 class PlanValidationError(ValueError):
@@ -127,7 +130,23 @@ def parse_plan(path: Path) -> Plan:
 
     Raises PlanValidationError on any schema or semantic problem.
     """
-    text = Path(path).read_text(encoding="utf-8")
+    plan_path = Path(path)
+    try:
+        raw = read_bytes_no_symlink(
+            plan_path, max_bytes=_PLAN_MAX_BYTES + 1
+        )
+    except OSError as e:
+        raise PlanValidationError(
+            f"cannot read PLAN.md safely: {e}"
+        ) from e
+    if len(raw) > _PLAN_MAX_BYTES:
+        raise PlanValidationError(
+            f"PLAN.md too large (max {_PLAN_MAX_BYTES} bytes)"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise PlanValidationError(f"PLAN.md is not valid UTF-8: {e}") from e
     lines = text.splitlines()
 
     name = _extract_title(lines)

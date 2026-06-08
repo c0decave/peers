@@ -291,6 +291,42 @@ def test_refresh_claude_config_rewrites_file_bind_mount_when_replace_busy(
     assert not (tmp_path / ".claude.json.tmp").exists()
 
 
+def test_refresh_claude_config_ignores_preplanted_tmp_symlink_BUG_213(
+    tmp_path: Path,
+) -> None:
+    """BUG-213: the refresh writer must not use the predictable
+    ``<token>.tmp`` path. A same-UID peer can pre-plant that path as a
+    symlink; refresh must leave it untouched and replace only the token file.
+    """
+    token_file = tmp_path / ".claude.json"
+    token_file.write_text(json.dumps({
+        "oauthAccount": {
+            "accessToken": "old",
+            "refreshToken": "refresh",
+            "tokenUrl": "https://auth.example/token",
+        }
+    }), encoding="utf-8")
+    bait = tmp_path / "bait.json"
+    bait.write_text("do-not-touch", encoding="utf-8")
+    planted_tmp = tmp_path / ".claude.json.tmp"
+    planted_tmp.symlink_to(bait)
+
+    def opener(request, *, timeout):
+        return FakeResponse(
+            200,
+            json.dumps({"access_token": "new"}).encode("utf-8"),
+        )
+
+    token = refresh_claude_config(token_file, opener=opener)
+
+    data = json.loads(token_file.read_text(encoding="utf-8"))
+    assert token == "new"
+    assert data["oauthAccount"]["accessToken"] == "new"
+    assert bait.read_text(encoding="utf-8") == "do-not-touch"
+    assert planted_tmp.is_symlink()
+    assert not token_file.is_symlink()
+
+
 def test_refresh_claude_config_rejects_http_token_url_BUG_203(
     tmp_path: Path,
 ) -> None:

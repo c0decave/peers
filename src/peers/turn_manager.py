@@ -91,6 +91,8 @@ class TurnManager:
         so operator-supplied config.yaml settings reach the rotation logic.
         """
         cfg = state.get("config") or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
         raw = cfg.get("max_retries", cls.DEFAULT_MAX_RETRIES)
         try:
             mr = int(raw)

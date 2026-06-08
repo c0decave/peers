@@ -208,7 +208,7 @@ class DriverTickHooksMixin:
             self._save_state(state)
             self._append_exit_event(reason, ticks)
             return {"reason": reason, "state": state}, {}
-        results = self.engine.evaluate_hard_gates()
+        results = self._evaluate_gates_for_tick()
         self._record_results(state, results)
         # Forgive the watched terminal gate's red streak when a PLAN step
         # was completed this tick (implement-mode tests-pass false-halt
@@ -219,7 +219,7 @@ class DriverTickHooksMixin:
         # before consulting `_all_green_including_soft`. No-op for other
         # modes (strict backward-compat).
         self._update_two_phase_counters(state, results)
-        if self._all_green_including_soft(state):
+        if self._converged_after_fresh_recheck(state, results):
             if self.mode_name == "hunt-open-ended":
                 state.setdefault("warnings", []).append(
                     "hunt-open-ended: convergence signals are progress "
@@ -738,10 +738,8 @@ class DriverTickHooksMixin:
         # feature work, refresh the snapshot, and let the loop carry
         # on.
         if self._head_commit_pairs_goals_with_source(gfile):
-            # Refresh the snapshot so the *next* tick doesn't keep
-            # halting on the same delta.
-            self._goal_hash_snapshot = actual
-            return None
+            from peers.goal_reload import _reload_driver_goals  # BUG-274
+            return _reload_driver_goals(self, gfile, actual)
 
         return (
             f"goals.yaml hash changed since loop start "

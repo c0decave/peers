@@ -12,6 +12,7 @@ break unrelated checks.
 """
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -150,6 +151,60 @@ def test_verify_peer_dir_identity_detects_swap_under_us_edge(tmp_path):
 
     with pytest.raises(RuntimeError, match="changed while the loop"):
         drv._verify_peer_dir_identity()
+
+
+# --- _verify_no_control_symlinks / checks manifest ------------------------
+
+def _write_checks_manifest(peer_dir: Path, entries: dict[str, str]) -> None:
+    lines = []
+    for name, body in entries.items():
+        check = peer_dir / "checks" / name
+        check.parent.mkdir(parents=True, exist_ok=True)
+        check.write_text(body)
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        lines.append(f"{digest}  {name}")
+    (peer_dir / "checks.sha256").write_text("\n".join(sorted(lines)) + "\n")
+
+
+def test_verify_control_plane_happy_accepts_matching_checks_manifest(tmp_path):
+    peer_dir = tmp_path / ".peers"
+    peer_dir.mkdir()
+    _write_checks_manifest(peer_dir, {"ok.py": "print('ok')\n"})
+    drv = _FakeDriver(peer_dir)
+
+    drv._verify_no_control_symlinks()
+
+
+def test_verify_control_plane_edge_empty_checks_manifest(tmp_path):
+    peer_dir = tmp_path / ".peers"
+    (peer_dir / "checks").mkdir(parents=True)
+    (peer_dir / "checks.sha256").write_text("")
+    drv = _FakeDriver(peer_dir)
+
+    drv._verify_no_control_symlinks()
+
+
+def test_verify_control_plane_sad_rejects_tampered_check_script_BUG_271(
+    tmp_path,
+):
+    peer_dir = tmp_path / ".peers"
+    peer_dir.mkdir()
+    _write_checks_manifest(peer_dir, {"coverage_3class.py": "print('real')\n"})
+    (peer_dir / "checks" / "coverage_3class.py").write_text("print('forged')\n")
+    drv = _FakeDriver(peer_dir)
+
+    with pytest.raises(RuntimeError, match="checks.sha256.*coverage_3class.py"):
+        drv._verify_no_control_symlinks()
+
+
+def test_verify_control_plane_sad_rejects_missing_checks_manifest(tmp_path):
+    peer_dir = tmp_path / ".peers"
+    (peer_dir / "checks").mkdir(parents=True)
+    (peer_dir / "checks" / "verify_self_review.py").write_text("print('x')\n")
+    drv = _FakeDriver(peer_dir)
+
+    with pytest.raises(RuntimeError, match="checks.sha256"):
+        drv._verify_no_control_symlinks()
 
 
 # --- _dirty_worktree ------------------------------------------------------

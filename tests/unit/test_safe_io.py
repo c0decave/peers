@@ -13,6 +13,7 @@ from peers.safe_io import (
     append_text_no_symlink,
     open_text_in_dir_no_symlink,
     read_text_no_symlink,
+    read_text_under_root_no_follow,
     write_text_no_symlink,
 )
 
@@ -134,6 +135,43 @@ def test_read_refuses_hard_link(tmp_path: Path):
 
     with pytest.raises(OSError, match="hard-linked"):
         read_text_no_symlink(link)
+
+
+def test_read_text_under_root_no_follow_reads_valid_utf8(tmp_path: Path):
+    peers_dir = tmp_path / ".peers"
+    peers_dir.mkdir()
+    (peers_dir / "state.json").write_text(
+        '{"note":"healthy cafe"}', encoding="utf-8",
+    )
+
+    text = read_text_under_root_no_follow(
+        tmp_path, (".peers", "state.json"),
+    )
+
+    assert text == '{"note":"healthy cafe"}'
+
+
+def test_read_text_under_root_no_follow_honors_max_bytes_boundary(
+    tmp_path: Path,
+):
+    peers_dir = tmp_path / ".peers"
+    peers_dir.mkdir()
+    (peers_dir / "state.json").write_text("abcdef", encoding="utf-8")
+
+    text = read_text_under_root_no_follow(
+        tmp_path, (".peers", "state.json"), max_bytes=3,
+    )
+
+    assert text == "abc"
+
+
+def test_read_text_under_root_no_follow_rejects_invalid_utf8(tmp_path: Path):
+    peers_dir = tmp_path / ".peers"
+    peers_dir.mkdir()
+    (peers_dir / "state.json").write_bytes(b'{"state":"healthy\xff"}')
+
+    with pytest.raises(UnicodeDecodeError):
+        read_text_under_root_no_follow(tmp_path, (".peers", "state.json"))
 
 
 # control-plane prompt and peer-output logs are world-readable by

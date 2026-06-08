@@ -16,6 +16,18 @@ goals:
       it by adding empty/TODO/FIXME reasons.
     cmd: "python3 -m pytest"
     pass_when: "exit_code == 0"
+    # Tier-1: verdict is a pure function of the src/tests tree (no baseline),
+    # so a PASS is reused while the tree is byte-identical (skips re-running the
+    # whole suite on no-code-change ticks). Only-cache-pass also stabilizes the
+    # occasional timing flake. See goal_engine memoization.
+    cacheable: true
+    # Tier-1B: full pytest suite — overlap this eval under the next peer turn.
+    expensive: true
+    # Flake tolerance: a single load-induced flake in this timing-sensitive
+    # suite must NOT turn the gate red and trip `stuck:tests-pass` (which
+    # bricked the v19 internal testing at 7% budget, 2026-06-06). Retry once; a real
+    # failure still fails. Mirrors no-prior-regression's intent.
+    retry_on_fail: 1
     # Per-goal timeout (Goal.timeout_s) — overrides the engine-wide
     # goals.timeout_s default for this gate only. A large suite (e.g. the
     # substrate's own ~1700 tests, ~140s standalone) runs SLOWER under
@@ -37,22 +49,26 @@ goals:
       argument documents WHY, so any non-empty reason suffices.
     cmd: "python3 .peers/checks/tests_no_unjustified_skip_or_fail.py ."
     pass_when: "exit_code == 0"
+    cacheable: true   # tree-pure: scans the test files only
 
   - id: tests-cover-happy-edge-sad
     type: hard
     description: "Non-trivial code has happy, edge, and sad tests."
     cmd: "python3 .peers/checks/coverage_3class.py src tests"
     pass_when: "exit_code == 0"
+    cacheable: true   # tree-pure: analyzes src/tests only
 
   - id: lint-clean
     type: hard
-    cmd: "ruff check . 2>&1 || true"
-    pass_when: "regex('error', stdout + stderr) == None"
+    cmd: "ruff check ."
+    pass_when: "exit_code == 0"
+    cacheable: true   # tree-pure: deterministic lint over the tree
 
   - id: type-clean
     type: hard
-    cmd: "mypy src/ 2>&1 || true"
-    pass_when: "regex('error', stdout + stderr) == None"
+    cmd: "mypy src/"
+    pass_when: "exit_code == 0"
+    cacheable: true   # tree-pure: deterministic type-check over src/
 
   - id: bug-hunt-clean
     type: hard
@@ -70,6 +86,7 @@ goals:
     type: hard
     cmd: "python3 .peers/checks/scan_secrets.py ."
     pass_when: "exit_code == 0"
+    cacheable: true   # tree-pure: scans the tree for secrets
 
   - id: deps-justified
     type: hard
@@ -85,6 +102,10 @@ goals:
     type: hard
     cmd: "python3 .peers/checks/no_regression.py ."
     pass_when: "exit_code == 0"
+    # Tier-1B: full pytest suite (the per-tick idle floor) — overlap it.
+    expensive: true
+    # Also pytest-backed → same flake tolerance as tests-pass.
+    retry_on_fail: 1
     # Shells out to the full pytest suite (JUnit XML diff vs the run-start
     # baseline), so it carries the same large-suite-under-load timeout as
     # tests-pass — otherwise it flakes the ~240s default too (v16 internal testing).

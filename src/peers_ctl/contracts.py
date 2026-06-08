@@ -38,6 +38,7 @@ from pathlib import Path
 from peers.safe_io import (
     append_text_no_symlink,
     open_text_read_no_symlink,
+    read_bytes_no_symlink,
     read_text_no_symlink,
     write_text_no_symlink,
 )
@@ -274,9 +275,22 @@ def verify_contracts(plan_dir: Path) -> None:
     pins = _load_pins(plan_dir)
     for fname, expected_sha in pins.items():
         path = _resolve_contract_path(plan_dir, fname)
-        if not path.is_file():
-            raise ContractsMismatch(f"frozen file missing: {fname}")
-        actual = _sha256_hex(path.read_bytes())
+        # read_bytes_no_symlink lstats the leaf, refuses
+        # symlinks / hardlinks (st_nlink != 1) / non-regular files, and
+        # opens with O_NOFOLLOW. Path.is_file() and Path.read_bytes()
+        # both follow symlinks, so a same-UID adversary could swap the
+        # leaf for a symlink targeting a hash-matching file and silently
+        # pass the gate. The hash-chain audit (next step) doesn't catch
+        # this — the chain encodes the pin map, not the leaf inode.
+        try:
+            data = read_bytes_no_symlink(path)
+        except FileNotFoundError as e:
+            raise ContractsMismatch(f"frozen file missing: {fname}") from e
+        except OSError as e:
+            raise ContractsMismatch(
+                f"frozen file unreadable / non-regular: {fname}: {e}"
+            ) from e
+        actual = _sha256_hex(data)
         if actual != expected_sha:
             raise ContractsMismatch(f"frozen file tampered: {fname}")
     log_path = plan_dir / _LOG_FILENAME

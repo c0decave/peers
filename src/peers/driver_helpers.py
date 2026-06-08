@@ -13,29 +13,29 @@ from peers.safe_io import read_bytes_no_symlink
 _AUTO_SKEPTIC_PROMPT_PREFIX = """\
 === POST-CONVERGENCE SKEPTIC RE-AUDIT ===
 
-Der substrate hat soeben convergence-reached gemeldet: N consecutive
-clean ticks ohne neue blocking/shallow Bug-Reports. **Das ist verdächtig.**
-Dieser tick ist eine KRITISCHE WIEDERHOLUNG der eigenen Konvergenz:
+The substrate has just reported convergence-reached: N consecutive
+clean ticks without new blocking/shallow Bug-Reports. **That is suspicious.**
+This tick is a CRITICAL RE-EXAMINATION of your own convergence:
 
-- Hat der vorherige Audit wirklich alle relevanten Failure-Modes geprüft,
-  oder hat sich das peer-Paar in seiner eigenen Zusammenfassung beruhigt?
-- Welche src-Files wurden seit peers-baseline NIE oder zu oberflächlich
-  reviewt? Pick mindestens DREI und audit-e sie gewissenhaft jetzt.
-- Welche neuen src-Files entstanden während diesem run (z.B. recon.py, additions)? Wurden DIE selbst auditiert oder nur
-  passiv mit-gefixt?
-- Welche soft-reviews wurden mit "passed" abgesegnet, hätten aber bei
-  ehrlicher Prüfung ein FAIL verdient?
-- Welche Bug-Reports wurden weak-fix'd oder shallow-fix'd geschlossen?
+- Did the previous audit really check all relevant failure modes,
+  or did the peer pair reassure itself in its own summary?
+- Which src files were NEVER reviewed since the peers baseline, or only
+  too superficially? Pick at least THREE and audit them conscientiously now.
+- Which new src files appeared during this run (e.g. recon.py, additions)? Were THOSE themselves audited, or only
+  passively fixed along the way?
+- Which soft-reviews were waved through as "passed" but would have
+  deserved a FAIL under honest scrutiny?
+- Which Bug-Reports were closed weak-fix'd or shallow-fix'd?
 
-Wenn du in dieser Re-Audit-Phase MINDESTENS EINEN echten neuen Bug
-findest (crit/high/med, mit Repro), file ihn — der `consecutive_clean_
-ticks`-Counter resettet sich automatisch und der Loop läuft weiter.
-Wenn nach gewissenhafter Suche WIRKLICH nichts da ist, dokumentiere
-konkret welche 5+ Failure-Modes du in diesem Pass explizit ausgeschlossen
-hast (pro Modul). Pauschal-"sauber" gilt nicht.
+If in this re-audit phase you find AT LEAST ONE real new bug
+(crit/high/med, with repro), file it — the `consecutive_clean_ticks`
+counter resets automatically and the loop continues.
+If after a conscientious search there REALLY is nothing, document
+concretely which 5+ failure modes you explicitly ruled out in this pass
+(per module). A blanket "clean" does not count.
 
-Erst NACH diesem Skeptiker-Tick wird der run als terminal-success
-beendet. Ein einziger Tick — also ehrlicher als üblich.
+Only AFTER this skeptic tick is the run terminated as terminal-success.
+A single tick — so be more honest than usual.
 
 === END SKEPTIC HEADER ===
 """

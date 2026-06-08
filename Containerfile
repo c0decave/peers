@@ -18,7 +18,7 @@ RUN npm install -g opencode-ai || true
 # a stray top-level `pytest.py` shim, which pollutes the repo and slips
 # past every cleanliness gate (they scan `src/`). Provide the common
 # Python test stack so the acceptance command just works.
-RUN pip3 install --break-system-packages pytest pytest-timeout hypothesis
+RUN pip3 install --break-system-packages pytest pytest-timeout hypothesis ruff mypy
 
 COPY . /opt/peers
 RUN pip3 install --break-system-packages /opt/peers

@@ -159,6 +159,36 @@ def _impl_identity(path):
     return f"email:{ae}" if ae else ""
 
 
+def _file_signers(path):
+    """Reviewers who signed any line of ``path`` in .peers/justifications.log."""
+    out = set()
+    try:
+        text = pathlib.Path(".peers/justifications.log").read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        parts = line.split(" ", 3)
+        if len(parts) < 4:
+            continue
+        _chain, file_line, reviewer, _reason = parts
+        fpath, sep, _lno = file_line.rpartition(":")
+        if sep and fpath == path:
+            out.add(reviewer)
+    return out
+
+
+def _independently_reviewed(tf, impl_id):
+    """True if some justification signer for ``tf`` is a peer OTHER than the
+    file's implementer (mirrors the post-hoc gate's BUG-009 fix). Only honored
+    for peer-identified implementers; email-only legacy commits get no escape.
+    """
+    if not impl_id.startswith("peer:"):
+        return False
+    return any(
+        f"peer:{signer.lower()}" != impl_id for signer in _file_signers(tf)
+    )
+
+
 violations = []
 for sid in sorted(checkoffs):
     block = step_blocks.get(sid, [])
@@ -185,8 +215,15 @@ for sid in sorted(checkoffs):
         if not impl_id:
             # File new in this commit or not yet tracked — can't enforce
             continue
-        if impl_id in current_ids:
-            violations.append((sid, tf, impl_id, current_ids))
+        if impl_id not in current_ids:
+            # Committed by a different peer than the file's author = reviewed.
+            continue
+        # committer authored this file (the norm for co-implemented
+        # steps). Allow only if the OTHER peer signed an independent review in
+        # .peers/justifications.log — otherwise it is a self-bless.
+        if _independently_reviewed(tf, impl_id):
+            continue
+        violations.append((sid, tf, impl_id, current_ids))
 
 if violations:
     print("REJECTED: reviewer-only-checkoff violation", file=sys.stderr)
