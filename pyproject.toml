@@ -1,6 +1,6 @@
 [project]
 name = "peers"
-version = "1.6.8"
+version = "1.6.9"
 requires-python = ">=3.11"
 dependencies = ["pyyaml>=6.0"]
 
