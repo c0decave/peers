@@ -303,6 +303,9 @@ configured peer in `.peers/config.yaml` — run `peers init` once if it
 doesn't — drive that peer, and leave their result on your **current
 branch**: no controller, no long-lived run directory.
 
+> Full operator reference (stages, prerequisites, honesty contract):
+> [docs/WORKFLOWS_DEVELOP_RESEARCH.md](docs/WORKFLOWS_DEVELOP_RESEARCH.md).
+
 ### `peers develop` — autonomously improve this repo
 
 Audits the repo for the dimensions you name, **authors a frozen implement

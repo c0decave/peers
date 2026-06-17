@@ -164,6 +164,9 @@ das bereits einen konfigurierten Peer in `.peers/config.yaml` hat — sonst
 einmal `peers init` —, steuern diesen Peer und legen ihr Ergebnis auf deinem
 **aktuellen Branch** ab: kein Controller, kein langlebiges Run-Verzeichnis.
 
+> Vollständige Operator-Referenz (Stages, Voraussetzungen, Honesty-Contract):
+> [docs/WORKFLOWS_DEVELOP_RESEARCH_DE.md](docs/WORKFLOWS_DEVELOP_RESEARCH_DE.md).
+
 ### `peers develop` — dieses Repo autonom verbessern
 
 Auditiert das Repo entlang der genannten Dimensionen, **friert aus den
