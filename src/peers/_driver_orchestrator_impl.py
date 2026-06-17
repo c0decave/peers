@@ -64,6 +64,7 @@ from peers.codemap_gen import seed_repo_architecture as _seed_repo_architecture 
 from peers.regression_baseline import (
     ensure_baseline_snapshot,
     ensure_skip_baseline,
+    snapshot_baseline_digests,
 )
 from peers.safe_io import (
     _ensure_private_dir,
@@ -89,6 +90,17 @@ from peers.state_store import (
 )
 from peers.tick_loop import TickLoop
 from peers.turn_manager import TurnManager, sweep_legacy_handoff_msg
+
+
+def _tee_stream_env_enabled() -> bool:
+    """True iff the `PEERS_TEE_STREAM` env flag opts the live tee ON.
+
+    Wave-2 TUI (§5.1): an operator can enable the per-peer live-stream tee
+    without editing config by exporting `PEERS_TEE_STREAM=1` (also accepts
+    `true`/`yes`/`on`, case-insensitive). Default/unset/`0`/anything else →
+    OFF, so a normal launch is byte-identical."""
+    raw = os.environ.get("PEERS_TEE_STREAM", "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 class OrchestratorDriver(
@@ -123,6 +135,7 @@ class OrchestratorDriver(
         codemap_enabled: bool = True,
         auto_skeptic_enabled: bool = True,
         pipeline_gates: bool = False,
+        tee_stream: bool = False,
     ) -> None:
         if len(peer_specs) < 2:
             raise ValueError(
@@ -143,6 +156,11 @@ class OrchestratorDriver(
         self.health = HealthGuard(self.repo)
         self.engine = GoalEngine(goals, cwd=self.repo,
                                  timeout_s=goals_timeout_s)
+        # FU-1: run-start SHA-256 anchor of the agent-writable baseline files,
+        # captured in process memory at run start (see run()). The convergence
+        # decision refuses to converge if the live baseline diverged from this
+        # anchor — a forged baseline cannot reach the orchestrator's memory.
+        self._baseline_digests: dict[str, str] = {}
         # Tier-1 Part B gate pipelining (mixin); off by default.
         self._init_gate_pipeline(goals, pipeline_gates, goals_timeout_s)
         if comm_variant == "hybrid":
@@ -186,8 +204,16 @@ class OrchestratorDriver(
         # --without-post-convergence-skeptic for runs where false-
         # convergence is acceptable.
         self.auto_skeptic_enabled = bool(auto_skeptic_enabled)
+        # Wave-2 TUI live tee (§5.1): when enabled, health_guard mirrors each
+        # peer's live stdout/stderr into `.peers/log/peers/tick-<N>-<peer>
+        # .stream.jsonl` so codex/opencode are tail-able like claude. Resolved
+        # from config (`observability.tee_stream`) OR the env flag
+        # `PEERS_TEE_STREAM=1` (env wins when truthy). Default OFF →
+        # byte-identical launch. Fail-CLOSED in the reader (see _TeeWriter).
+        self.tee_stream = bool(tee_stream) or _tee_stream_env_enabled()
         self._head_before_invoke: str | None = None
         self._peer_dir_identity: tuple[int, int] | None = None
+        self._peer_dir_identity_fd: int | None = None
         # H1: snapshot the expected goals.yaml hash ONCE at driver
         # init, in memory. The per-tick mutation check compares the
         # live file hash against this snapshot — so a peer that
@@ -224,12 +250,17 @@ class OrchestratorDriver(
         self._verify_no_control_symlinks()
         # Open without truncating first: contenders must not erase the
         # currently-running PID before they know they own the flock.
-        self._peer_dir_identity = self._capture_peer_dir_identity()
-        lock_fp = open_text_no_symlink(lock_path, "a")
+        self._verify_peer_dir_identity()
+        try:
+            lock_fp = open_text_no_symlink(lock_path, "a")
+        except Exception:
+            self._close_peer_dir_identity_fd()
+            raise
         try:
             fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             lock_fp.close()
+            self._close_peer_dir_identity_fd()
             return {"reason": "lock-held", "state": None}
         lock_fp.seek(0)
         lock_fp.truncate(0)
@@ -280,6 +311,13 @@ class OrchestratorDriver(
             if skip_baseline_msg is not None:
                 print(f"peers: {skip_baseline_msg}", file=sys.stderr,
                       flush=True)
+
+            # FU-1: anchor the run-start baseline digests in process memory,
+            # AFTER seeding (so a freshly-snapshotted baseline is captured) and
+            # BEFORE any peer tick. The convergence decision re-derives the
+            # live digest and refuses to converge if a peer forged the
+            # agent-writable baseline mid-run (see _all_green_including_soft).
+            self._baseline_digests = snapshot_baseline_digests(self.peer_dir)
 
             if self.recon_enabled:
                 self._run_recon_step()
@@ -345,7 +383,10 @@ class OrchestratorDriver(
                 lock_fp.close()
             except Exception:
                 pass
-            release_run_lock(self.peer_dir)
+            try:
+                release_run_lock(self.peer_dir)
+            finally:
+                self._close_peer_dir_identity_fd()
 
     def _loop(self, state: dict[str, Any], tm: TurnManager,
               max_ticks: int | None, ticks: int) -> dict[str, Any]:

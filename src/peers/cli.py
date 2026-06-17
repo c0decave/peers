@@ -614,6 +614,40 @@ def cmd_init(target: Path, force: bool, driver: str = "orchestrator",
         except OSError:
             pass
 
+    # CAP-14 STEP-2 companion manifest recording the TEMPLATE SOURCE digest per
+    # deployed check (NOT the deployed copy's). checks.sha256 above is taken from
+    # the deployed bytes and so cannot detect template drift (it IS the deployed
+    # bytes). This companion freezes the template version at provision time; when
+    # a template is later fixed (e.g. a re-vendored no_skipped_tests.py) the live
+    # template bytes differ from the deployed copy and the tick-time guard reads
+    # it. The digest is taken from `check_files` (the canonical mode.path/"checks"
+    # source paths), not the deployed glob.
+    #
+    # FINDING-2 FIX: this companion write has its OWN try/except, OUTSIDE (and
+    # after) the dir-hardening block above. Previously it sat INSIDE that try,
+    # BEFORE `checks_dir.chmod(0o555)` — so a companion-write OSError jumped to
+    # `except OSError: pass` and SILENTLY SKIPPED the pre-existing dir read-only
+    # hardening (defense-in-depth control). Isolating it here guarantees a
+    # companion failure can NEVER disable the dir/per-file hardening. Best-effort:
+    # the companion is simply absent on failure (never a fabricated/partial
+    # digest); the stale-deploy guard stays inert when the companion is missing.
+    if checks_dir.is_dir():
+        try:
+            import hashlib as _hashlib
+            template_manifest = []
+            for src_check in check_files:
+                if not src_check.name.endswith(".py"):
+                    continue
+                tdigest = _hashlib.sha256(src_check.read_bytes()).hexdigest()
+                template_manifest.append(f"{tdigest}  {src_check.name}")
+            if template_manifest:
+                write_text_no_symlink(
+                    peers / "checks.template.sha256",
+                    "\n".join(sorted(template_manifest)) + "\n",
+                )
+        except OSError:
+            pass
+
     # G10: tag the target's current HEAD so a human can always roll
     # back to "before peers touched this". Surface the absence so the
     # user knows the rollback anchor isn't available.
@@ -847,7 +881,7 @@ def cmd_status(target: Path) -> int:
 def _refuse_symlink_write_target(path: Path) -> str | None:
     if path.is_symlink():
         try:
-            target = path.readlink()
+            target = str(path.readlink())
         except OSError:
             target = "<unreadable>"
         return (
@@ -860,7 +894,7 @@ def _refuse_symlink_write_target(path: Path) -> str | None:
 def _refuse_symlink_control_dir(peer_dir: Path) -> str | None:
     if peer_dir.is_symlink():
         try:
-            target = peer_dir.readlink()
+            target = str(peer_dir.readlink())
         except OSError:
             target = "<unreadable>"
         return (
@@ -915,6 +949,22 @@ def _positive_number_config(value: object, field: str) -> str | None:
         return f"`{field}` must be finite, got {value!r}"
     if value <= 0:
         return f"`{field}` must be positive, got {value}"
+    return None
+
+
+def _bool_config(value: object, field: str) -> str | None:
+    """BUG-761 (same class as BUG-760 in goals.py): the driver loader did
+    `bool(cfg.get(field, False))`, which truth-coerces non-empty strings
+    like the quoted `'false'` → True. Require an actual YAML boolean
+    (or absence/None for default); reject any other scalar with a
+    type-aware error mirroring `_positive_int_config`."""
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        return (
+            f"`{field}` must be a boolean, got "
+            f"{type(value).__name__} ({value!r})"
+        )
     return None
 
 
@@ -1068,7 +1118,7 @@ def _validate_config(cfg: object, cfg_path: Path) -> str | None:
             ):
                 return (
                     f"{cfg_path}: `budget.max_usd_mode` must be one of "
-                    "'auto', 'hard', 'warn', 'off', got {mode!r}"
+                    f"'auto', 'hard', 'warn', 'off', got {mode!r}"
                 )
     # validate optional goals.timeout_s. Reject bool BEFORE
     # int (bool is a subclass of int → `int(True) == 1` would silently
@@ -1083,6 +1133,27 @@ def _validate_config(cfg: object, cfg_path: Path) -> str | None:
             err = _positive_int_config(ts, "goals.timeout_s")
             if err is not None:
                 return f"{cfg_path}: {err}"
+    # same class as BUG-760 in goals.py. The driver loader
+    # took `bool(cfg.get('pipeline_gates', False))` and the same for
+    # `observability.tee_stream`, so a quoted YAML `'false'` silently
+    # ENABLED the opt-in feature (non-empty string is truthy).
+    # Validate as real bool here so the config error surfaces at load,
+    # not as a confusing runtime behavior flip.
+    err = _bool_config(cfg.get("pipeline_gates"), "pipeline_gates")
+    if err is not None:
+        return f"{cfg_path}: {err}"
+    observability = cfg.get("observability")
+    if observability is not None:
+        if not isinstance(observability, dict):
+            return (
+                f"{cfg_path}: `observability` must be a mapping, got "
+                f"{type(observability).__name__}"
+            )
+        err = _bool_config(
+            observability.get("tee_stream"), "observability.tee_stream",
+        )
+        if err is not None:
+            return f"{cfg_path}: {err}"
     return None
 
 
@@ -1664,6 +1735,15 @@ def cmd_run(target: Path, max_ticks: int | None,
     cfg_budget = dict(cfg.get("budget", {}) or {})
     if max_usd is not None:
         cfg_budget["max_usd"] = max_usd
+    # BRAIN-09: a budget cap is only enforceable when the peer argv emits
+    # parseable token/cost accounting; warn (don't fail) if it cannot.
+    from peers.budget_accountant import budget_argv_warnings
+    for _bw in budget_argv_warnings(
+        peer_specs,
+        max_tokens=cfg_budget.get("max_tokens"),
+        max_usd=cfg_budget.get("max_usd"),
+    ):
+        print(f"budget warning: {_bw}", file=sys.stderr)
     driver = OrchestratorDriver(
         repo=target,
         peer_dir=target / ".peers",
@@ -1684,8 +1764,26 @@ def cmd_run(target: Path, max_ticks: int | None,
         codemap_enabled=not no_codemap,
         auto_skeptic_enabled=not without_post_convergence_skeptic,
         pipeline_gates=bool(cfg.get("pipeline_gates", False)),
+        # Wave-2 TUI live tee (§5.1): opt-in via `observability.tee_stream:
+        # true` (or the PEERS_TEE_STREAM env flag, resolved in the driver).
+        # Default OFF → byte-identical launch.
+        tee_stream=bool(
+            (cfg.get("observability", {}) or {}).get("tee_stream", False)
+        ),
     )
-    result = driver.run(max_ticks=max_ticks)
+    try:
+        result = driver.run(max_ticks=max_ticks)
+    finally:
+        # orderly shutdown of the async-gate executor. Harmless on the
+        # current single-shot run path (the process exits straight after), but a
+        # future long-lived host would otherwise orphan the pool + any mid-eval
+        # gate worktree. Best-effort; never mask the run's own outcome.
+        _async_runner = getattr(driver, "async_runner", None)
+        if _async_runner is not None:
+            try:
+                _async_runner.shutdown()
+            except Exception:
+                pass
     print(f"Stopped: {result['reason']}")
     return 0 if result["reason"] in ("complete", "max_ticks") else 1
 
@@ -2123,6 +2221,121 @@ def build_parser() -> argparse.ArgumentParser:
              "`mode:name` (e.g. `audit:verify_self_review`).",
     )
 
+    # Phase 6: operator-runnable bring-up (corpus-driven observe-and-harden).
+    p_bringup = _add_help_man_subparser(
+        sub, "bring-up",
+        help_text=(
+            "corpus-driven observe-and-harden harness (operator-runnable). "
+            "Runs ONE escalate-only sweep over the manifest's corpus, "
+            "classifying every case (green / excluded / escalated) into the "
+            "run ledger. Requires a manifest YAML."
+        ),
+    )
+    p_bringup.add_argument(
+        "--manifest", required=True,
+        help="path to the bring-up manifest YAML "
+             "(target / corpus / driver / oracle / landing / memory / budget).",
+    )
+    p_bringup.add_argument(
+        "--fixer", default="escalate-only", choices=["escalate-only", "landing"],
+        help="fixer implementation. 'escalate-only' (default): one observe-and-"
+             "report sweep, never lands. 'landing': drive the autonomous "
+             "diagnose->verify->implement loop that LANDS + attests fixes into the "
+             "tool (uses the repo's configured peer; SPEC-07). NOTE: 'landing' "
+             "converges on the oracle verdict — use a runtime/test-suite oracle (or "
+             "a fully-regenerating differential driver), since a self-reported "
+             "differential verdict is not yet independent-evidence gated.",
+    )
+    p_bringup.add_argument(
+        "--peer", default=None,
+        help="which configured peer drives the landing fixer (default: the first "
+             "peer in .peers/config.yaml). Only used with --fixer landing.",
+    )
+
+    # Operator-runnable develop mode (audit -> author -> implement on one repo).
+    p_dev = _add_help_man_subparser(
+        sub, "develop",
+        help_text=(
+            "autonomous improve-this-repo mode (operator-runnable). Audits the "
+            "repo for the requested dimensions, authors a frozen implement "
+            "contract from survivors, and converges it to an attested commit. "
+            "Uses the repo's configured peer (.peers/config.yaml)."
+        ),
+    )
+    p_dev.add_argument("repo", help="path to the target git repository")
+    p_dev.add_argument(
+        "--dimensions", required=True,
+        help="comma-separated audit dimensions (e.g. correctness,security,perf)",
+    )
+    p_dev.add_argument(
+        "--peer", default=None,
+        help="which configured peer to drive the agent (default: the first peer)",
+    )
+    p_dev.add_argument(
+        "--convergence-budget", type=int, default=5,
+        help="max implement attempts per contract before giving up (default: 5)",
+    )
+
+    # Operator-runnable research mode (decompose -> sweep -> synthesize report).
+    p_res = _add_help_man_subparser(
+        sub, "research",
+        help_text=(
+            "autonomous research mode (operator-runnable). Decomposes the "
+            "operator-authored TOPIC.md (Scope + Questions) into sub-questions, "
+            "sweeps the enabled modalities for corroborating evidence, and "
+            "synthesizes a cited RESEARCH.md from confirmed claims. Uses the "
+            "repo's configured peer (.peers/config.yaml)."
+        ),
+    )
+    p_res.add_argument("repo", help="path to the target git repository (must hold TOPIC.md)")
+    p_res.add_argument(
+        "--modalities", default="codebase",
+        help="comma-separated evidence modalities (codebase[,web]); default: codebase",
+    )
+    p_res.add_argument(
+        "--peer", default=None,
+        help="which configured peer to drive the agent (default: the first peer)",
+    )
+
+    # Operator-runnable generic find-bugs:reproduce mode (reproduce a crashing seed
+    # against a buildable target via chitin; R1 / DEV-01).
+    p_fb = _add_help_man_subparser(
+        sub, "find-bugs",
+        help_text=(
+            "autonomous bug-REPRODUCTION mode (operator-runnable). Drives the chitin "
+            "backend to reproduce ONE operator-provided crashing-seed input against a "
+            "buildable target, refining via the configured peer (llm_assisted) until a "
+            "sanitizer twin CONFIRMS the crash, then commits + attests a reproduction "
+            "bundle. Requires chitin (CHITIN_BIN) + the repo's .peers/config.yaml."
+        ),
+    )
+    p_fb.add_argument("repo", help="path to the target git repository")
+    p_fb.add_argument(
+        "--input", required=True,
+        help="path to the crashing-seed input file to reproduce",
+    )
+    p_fb.add_argument(
+        "--fuzz-binary", required=True,
+        help="the chitin fuzz/ASAN harness binary the oracle drives",
+    )
+    p_fb.add_argument(
+        "--bug-id", default=None, help="a stable id for the finding (default: derived)",
+    )
+    p_fb.add_argument(
+        "--expected-function", default=None,
+        help="optional: only a crash in this function counts as a match (a crash "
+             "elsewhere is an honest new bug). Default: ANY sanitizer crash matches.",
+    )
+    p_fb.add_argument(
+        "--ladder", default="llm_assisted", choices=["llm_assisted", "llm_free"],
+        help="llm_assisted (default): refine the candidate via the configured peer. "
+             "llm_free: deterministic fuzz-only ladder (no peer).",
+    )
+    p_fb.add_argument(
+        "--peer", default=None,
+        help="which configured peer drives the refiner/skeptic (default: first peer)",
+    )
+
     # G3: tmux session wrappers.
     p_tmux = _add_help_man_subparser(
         sub, "tmux",
@@ -2134,6 +2347,510 @@ def build_parser() -> argparse.ArgumentParser:
     tmux_sub.add_parser("attach", help="attach to the peers tmux session")
 
     return parser
+
+
+def _bring_up_abort(ledger_path: Path, run_id: str, error: str) -> None:
+    """Best-effort honest terminal row for a bring-up that aborts before the
+    sweep (empty repo, dup case-ids, unbuildable oracle). The non-zero exit +
+    stderr is the primary signal; the ledger row is for the audit trail."""
+    from peers.spine.ledger import RunLedger
+    try:
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        RunLedger(ledger_path).append(
+            event="stop", status="aborted",
+            witness={"kind": "bringup-validation-error", "error": error},
+            mode_run=run_id)
+    except (OSError, ValueError):
+        pass
+
+
+def _build_landing_fixer_from_config(repo: Path, manifest, peer: str | None):
+    """Wire a real landing :class:`LandingFixer` from the repo's configured peer.
+
+    Mirrors ``_build_develop_frontend_from_config``: the run_agent / impl_run_agent
+    are bound to the configured peer spec, the runner + oracles are rebuilt from the
+    manifest (so the implement step's acceptance is the SAME judgment the loop's
+    sweep uses), and ``make_landing_fixer`` wraps the real ``verify_claim``. The
+    fix lands + attests via develop's AgentConvergenceRunner; the frontend
+    re-validates the sha as a second independent gate."""
+    from peers.agent_invoke import agent_runner_from_spec, run_agent_once
+    from peers.modes.bring_up.assembly import _build_oracle
+    from peers.modes.bring_up.landing_adapters import (
+        LLMDiagnoser,
+        LLMDiagnosisRefuter,
+        make_landing_implement,
+    )
+    from peers.modes.bring_up.oracle import adjudicate
+    from peers.modes.bring_up.runner import ToolRunner
+
+    # make_landing_fixer lives in the bring_up assembly alongside _build_oracle.
+    from peers.modes.bring_up.assembly import make_landing_fixer
+
+    cfg_path = repo / ".peers" / "config.yaml"
+    if not cfg_path.exists():
+        raise ValueError("missing .peers/config.yaml — run `peers init`")
+    cfg = _load_config_yaml(cfg_path)
+    specs = load_peer_specs(cfg)
+    if not specs:
+        raise ValueError("no peers configured in .peers/config.yaml")
+    if peer is not None:
+        spec = next((s for s in specs if s.name == peer), None)
+        if spec is None:
+            raise ValueError(f"peer {peer!r} not found in config")
+    else:
+        spec = specs[0]
+    run_agent = agent_runner_from_spec(spec, cwd=repo)
+    use_stdin = getattr(spec, "prompt_mode", "argv-substitute") == "stdin"
+
+    def impl_run_agent(prompt: str, workdir) -> str:
+        return run_agent_once(prompt, argv=spec.argv, cwd=workdir, stdin=use_stdin)
+
+    runner = ToolRunner(manifest.driver, target=repo)
+    oracles = [_build_oracle(s, root=repo) for s in manifest.oracle]
+
+    def sweep(case, workdir, run_id):
+        # The implement step's acceptance: re-run THIS case through the same
+        # runner + oracles the loop uses and adjudicate. workdir == run.tool
+        # (bring-up leases no worktree), so the runner's target picks up the
+        # agent's edits. run_id is the loop's run.mode_run (NOT a literal) so a
+        # {run}-templated driver is judged on the loop's identity (S3 review #4).
+        work = Path(workdir) / ".peers" / "bringup-work"
+        work.mkdir(parents=True, exist_ok=True)
+        obs = runner.run(case, work=work, run_id=run_id)
+        verdicts = [o.judge(case, obs, work=work) for o in oracles]
+        return adjudicate(case, verdicts)
+
+    implement = make_landing_implement(
+        impl_run_agent=impl_run_agent, sweep=sweep, attest_peer=spec.name,
+        budget=manifest.budget.per_case_fix_budget)
+    return make_landing_fixer(
+        diagnose=LLMDiagnoser(run_agent=run_agent).diagnose,
+        implement=implement,
+        refuter_factory=LLMDiagnosisRefuter(run_agent=run_agent).refuter_factory,
+    )
+
+
+def _mode_pkg_available(modname: str) -> bool:
+    """True if an optional mode-engine package is importable in this build.
+
+    Trimmed distributions (e.g. the public mirror) ship the CLI but not every
+    optional engine; the find-bugs / bring-up commands probe this so they can
+    degrade with a clean message instead of a ModuleNotFoundError traceback."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec(modname) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def cmd_bring_up(
+    manifest_path: str, fixer_kind: str = "escalate-only", *,
+    peer: str | None = None, _build_fixer=None,
+) -> int:
+    """Operator entry for bring-up. ``escalate-only`` (default): one observe-and-
+    report sweep, classifying every case into the run ledger. ``landing``: drive
+    the autonomous diagnose->verify->implement loop that LANDS + attests fixes.
+    Fails CLOSED (honest terminal row + non-zero exit) on a bad manifest, an empty
+    repo, duplicate case-ids, a non-CLI-constructible oracle, or (landing) a
+    missing/invalid peer config."""
+    if not _mode_pkg_available("peers.modes.bring_up"):
+        print("bring-up mode is not available in this build.", file=sys.stderr)
+        return 2
+
+    import yaml
+
+    from peers.modes.bring_up.assembly import (
+        make_bring_up_frontend,
+        validate_git_repo,
+    )
+    from peers.modes.bring_up.frontend import EscalateOnlyFixer
+    from peers.modes.bring_up.manifest import load_manifest
+    from peers.spine.mode_run import ModeRun, drive
+    from peers.spine.op_config import OpConfig, load_op_config
+
+    mpath = Path(manifest_path)
+    try:
+        raw = yaml.safe_load(mpath.read_text(encoding="utf-8"))
+        manifest = load_manifest(raw if isinstance(raw, dict) else {})
+    except (OSError, ValueError, yaml.YAMLError) as e:
+        print(f"peers bring-up: cannot load manifest {mpath}: {e}",
+              file=sys.stderr)
+        return 1
+    repo = Path(manifest.target.repo)
+    ledger_path = repo / ".peers" / "run.jsonl"
+    run_id = f"bringup-{mpath.stem}"
+
+    err = validate_git_repo(repo)
+    if err:
+        _bring_up_abort(ledger_path, run_id, err)
+        print(f"peers bring-up: {err}", file=sys.stderr)
+        return 1
+
+    # S3 review #6: ensure the ledger parent exists BEFORE load_op_config writes the
+    # run-start row (which runs OUTSIDE the run try/except). The escalate-only path
+    # never created .peers/ (memory is hints-only + does not mkdir), so a target with
+    # no .peers/ crashed with an uncaught FileNotFoundError and NO honest terminal
+    # row. Mirror develop/research (which mkdir the ledger parent first); fail CLOSED
+    # with an abort row on an un-creatable path.
+    try:
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        _bring_up_abort(ledger_path, run_id, f"cannot create .peers: {e}")
+        print(f"peers bring-up: cannot create .peers: {e}", file=sys.stderr)
+        return 1
+
+    if fixer_kind not in ("escalate-only", "landing"):
+        print(f"peers bring-up: unsupported --fixer {fixer_kind!r}; choose "
+              "'escalate-only' or 'landing'", file=sys.stderr)
+        return 2
+
+    try:
+        if fixer_kind == "landing":
+            fixer = (_build_fixer(repo, manifest) if _build_fixer is not None
+                     else _build_landing_fixer_from_config(repo, manifest, peer))
+        else:
+            fixer = EscalateOnlyFixer()
+        front = make_bring_up_frontend(manifest, repo, fixer=fixer)
+    except (ValueError, OSError) as e:
+        _bring_up_abort(ledger_path, run_id, str(e))
+        print(f"peers bring-up: {e}", file=sys.stderr)
+        return 1
+
+    op = OpConfig.from_dict({
+        "mode": "bring-up",
+        "budget": {"max_rounds": manifest.budget.max_rounds},
+        "dry_n": manifest.budget.dry_n,
+    })
+    run = ModeRun(tool=repo, op_config=op, ledger_path=ledger_path,
+                  mode_run=run_id)
+
+    if fixer_kind == "landing":
+        # The iterative loop: drive() calls prepare() then run() per round (sweep +
+        # fix one case), terminating on stop-on-dry once the corpus converges or
+        # genuinely stalls. NOT sweep_and_report (that is the escalate-only one-pass
+        # path whose stop-on-dry would cut a real fixing loop short). drive() writes
+        # the op-config first row itself, so DO NOT load_op_config here (that is the
+        # sweep_and_report path's job; double-writing it fails the "must be first").
+        try:
+            drive(run, front)
+        except Exception as e:  # noqa: BLE001 — a mid-run crash must fail CLOSED
+            _bring_up_abort(ledger_path, run_id, f"landing run crashed: {e}")
+            print(f"peers bring-up: landing run crashed: {e}", file=sys.stderr)
+            return 1
+        summary = front.interpret(run)
+        print(f"peers bring-up: landing run complete "
+              f"({summary}) (ledger: {ledger_path})")
+        return 0
+
+    load_op_config(op, run.ledger, mode_run=run_id)
+    try:
+        result = front.sweep_and_report(run)
+    except Exception as e:  # noqa: BLE001 — a mid-sweep crash must fail CLOSED
+        # A per-case driver/oracle/ledger failure can raise after some
+        # bringup-verdict rows are already written. Without this guard the
+        # exception propagates uncaught, leaving a partial ledger with NO
+        # terminal stop row — a ledger consumer could not tell a completed
+        # sweep from a crash. Emit the honest 'aborted' terminal row.
+        _bring_up_abort(ledger_path, run_id, f"sweep crashed: {e}")
+        print(f"peers bring-up: sweep crashed: {e}", file=sys.stderr)
+        return 1
+    print(
+        f"peers bring-up: swept {result['total']} case(s) — "
+        f"{result['green']} green / {result['excluded']} excluded / "
+        f"{result['escalated']} escalated (ledger: {ledger_path})"
+    )
+    # The sweep itself completed; a non-zero exit signals unresolved tool-bugs
+    # (escalated cases) so an operator / CI sees that work remains.
+    return 1 if result["escalated"] else 0
+
+
+def _build_develop_frontend_from_config(
+    repo: Path, dimensions: list[str], peer: str | None, budget: int,
+):
+    """Wire a real DevelopFrontend from the repo's configured peer spec."""
+    from peers.agent_invoke import agent_runner_from_spec, run_agent_once
+    from peers.develop.assembly import make_develop_frontend
+
+    cfg_path = repo / ".peers" / "config.yaml"
+    if not cfg_path.exists():
+        raise ValueError("missing .peers/config.yaml — run `peers init`")
+    cfg = _load_config_yaml(cfg_path)
+    specs = load_peer_specs(cfg)
+    if not specs:
+        raise ValueError("no peers configured in .peers/config.yaml")
+    if peer is not None:
+        spec = next((s for s in specs if s.name == peer), None)
+        if spec is None:
+            raise ValueError(f"peer {peer!r} not found in config")
+    else:
+        spec = specs[0]
+    run_agent = agent_runner_from_spec(spec, cwd=repo)
+    use_stdin = getattr(spec, "prompt_mode", "argv-substitute") == "stdin"
+
+    def impl_run_agent(prompt: str, workdir) -> str:
+        return run_agent_once(prompt, argv=spec.argv, cwd=workdir, stdin=use_stdin)
+
+    return make_develop_frontend(
+        repo, run_agent=run_agent, impl_run_agent=impl_run_agent,
+        dimensions=dimensions, convergence_budget=budget, attest_peer=spec.name)
+
+
+def cmd_develop(
+    repo_path, *, dimensions: list[str], peer: str | None = None,
+    budget: int = 5, _make_frontend=None,
+) -> int:
+    """Operator entry for develop: drive the real audit->author->implement
+    frontend over a single repo. Fails CLOSED on a bad repo, missing config, or
+    missing dimensions; a mid-run crash is reported (the lease/ledger persist)."""
+    from peers.modes.bring_up.assembly import validate_git_repo
+    from peers.spine.mode_run import ModeRun, drive
+    from peers.spine.op_config import OpConfig
+
+    repo = Path(repo_path)
+    if not dimensions:
+        print("peers develop: --dimensions is required", file=sys.stderr)
+        return 2
+    err = validate_git_repo(repo)
+    if err:
+        print(f"peers develop: {err}", file=sys.stderr)
+        return 1
+    ledger_path = repo / ".peers" / "run.jsonl"
+    try:
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"peers develop: cannot create .peers: {e}", file=sys.stderr)
+        return 1
+    run_id = f"develop-{repo.name}"
+    try:
+        front = (_make_frontend(repo) if _make_frontend is not None
+                 else _build_develop_frontend_from_config(
+                     repo, dimensions, peer, budget))
+    except (ValueError, OSError) as e:
+        print(f"peers develop: {e}", file=sys.stderr)
+        return 1
+    op = OpConfig.from_dict({"mode": "develop"})
+    run = ModeRun(tool=repo, op_config=op, ledger_path=ledger_path,
+                  mode_run=run_id)
+    try:
+        drive(run, front)  # drive() writes the op-config ledger row itself
+    except Exception as e:  # noqa: BLE001 — a mid-run crash must fail CLOSED
+        print(f"peers develop: run crashed: {e}", file=sys.stderr)
+        return 1
+    print(f"peers develop: complete (ledger: {ledger_path})")
+    return 0
+
+
+def _build_web_modality(cfg: dict, modalities: list[str]):
+    """Return ``(web_search, fetch)`` for the research ``web`` modality, or
+    ``(None, None)`` (the deny-by-default: web stays inert, codebase-only is dry).
+
+    Wired ONLY when the operator both requests ``web`` AND opts in via a
+    ``research.web`` config block with ``enabled: true`` + a non-empty host
+    ``allow`` list + ``seed_urls``. The fetcher is allowlisted + SSRF-guarded +
+    fail-closed; the searcher returns the operator's seed URLs (no search-engine
+    API). The live transport routes through an optional ``proxy`` (the egress
+    proxy). Never on by default — a missing/disabled block leaves web inert."""
+    if "web" not in (modalities or []):
+        return (None, None)
+    research = cfg.get("research") if isinstance(cfg, dict) else None
+    if research is None:
+        return (None, None)
+    if not isinstance(research, dict):
+        # S4 review (LOW): a truthy non-dict `research:` is malformed config — fail
+        # CLOSED with a clean ValueError, never an uncaught AttributeError.
+        raise ValueError("config 'research' must be a mapping (got "
+                         f"{type(research).__name__})")
+    web = research.get("web")
+    if not isinstance(web, dict) or web.get("enabled") is not True:
+        return (None, None)
+    allow = web.get("allow")
+    seeds = web.get("seed_urls")
+    if not (isinstance(allow, list) and allow and all(isinstance(a, str) for a in allow)):
+        raise ValueError("research.web.enabled but 'allow' is missing/invalid "
+                         "(a non-empty list of host regexes is required — deny-by-default)")
+    if not (isinstance(seeds, list) and seeds and all(isinstance(s, str) for s in seeds)):
+        raise ValueError("research.web.enabled but 'seed_urls' is missing/invalid "
+                         "(the operator must scope the sources to fetch)")
+    from peers.research.web_fetch import (
+        AllowlistedFetcher,
+        make_seed_url_search,
+        urllib_transport,
+    )
+    proxy = web.get("proxy") if isinstance(web.get("proxy"), str) else None
+    max_bytes = web.get("max_bytes")
+    max_bytes = max_bytes if isinstance(max_bytes, int) and max_bytes > 0 else 5 * 1024 * 1024
+    fetcher = AllowlistedFetcher(
+        allow=allow, transport=urllib_transport(proxy=proxy, max_bytes=max_bytes),
+        max_bytes=max_bytes)
+    return (make_seed_url_search(seeds), fetcher.fetch)
+
+
+def _build_research_frontend_from_config(repo: Path, modalities: list[str], peer: str | None):
+    """Wire a real ResearchFrontend from the repo's configured peer spec."""
+    from peers.agent_invoke import agent_runner_from_spec
+    from peers.research.assembly import make_research_frontend
+
+    cfg_path = repo / ".peers" / "config.yaml"
+    if not cfg_path.exists():
+        raise ValueError("missing .peers/config.yaml — run `peers init`")
+    cfg = _load_config_yaml(cfg_path)
+    specs = load_peer_specs(cfg)
+    if not specs:
+        raise ValueError("no peers configured in .peers/config.yaml")
+    if peer is not None:
+        spec = next((s for s in specs if s.name == peer), None)
+        if spec is None:
+            raise ValueError(f"peer {peer!r} not found in config")
+    else:
+        spec = specs[0]
+    run_agent = agent_runner_from_spec(spec, cwd=repo)
+    web_search, fetch = _build_web_modality(cfg, modalities)
+    return make_research_frontend(
+        repo, run_agent=run_agent, modalities=modalities, attest_peer=spec.name,
+        web_search=web_search, fetch=fetch)
+
+
+def cmd_research(
+    repo_path, *, modalities: list[str], peer: str | None = None, _make_frontend=None,
+) -> int:
+    """Operator entry for research: drive the real decompose->sweep->synthesize
+    frontend over a repo holding an operator-authored TOPIC.md. Fails CLOSED on a
+    bad repo, missing/invalid TOPIC.md, or missing modalities.
+
+    RC-03 (by design, mirrors ``peers develop``): a single-repo run commits the
+    RESEARCH.md report onto the operator's CURRENT branch (the run leases no
+    isolated worktree). Isolation/propagation is a fleet concern; run on a throwaway
+    branch if you don't want the report on your working branch."""
+    from peers.modes.bring_up.assembly import validate_git_repo
+    from peers.research.intake import require_topic
+    from peers.spine.mode_run import ModeRun, drive
+    from peers.spine.op_config import OpConfig
+
+    repo = Path(repo_path)
+    if not modalities:
+        print("peers research: --modalities is required", file=sys.stderr)
+        return 2
+    err = validate_git_repo(repo)
+    if err:
+        print(f"peers research: {err}", file=sys.stderr)
+        return 1
+    ok, problems = require_topic(repo)
+    if not ok:
+        print(f"peers research: invalid TOPIC.md: {'; '.join(problems)}",
+              file=sys.stderr)
+        return 1
+    ledger_path = repo / ".peers" / "run.jsonl"
+    try:
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"peers research: cannot create .peers: {e}", file=sys.stderr)
+        return 1
+    run_id = f"research-{repo.name}"
+    try:
+        front = (_make_frontend(repo) if _make_frontend is not None
+                 else _build_research_frontend_from_config(repo, modalities, peer))
+    except (ValueError, OSError) as e:
+        print(f"peers research: {e}", file=sys.stderr)
+        return 1
+    op = OpConfig.from_dict({"mode": "research"})
+    run = ModeRun(tool=repo, op_config=op, ledger_path=ledger_path, mode_run=run_id)
+    try:
+        drive(run, front)  # drive() writes the op-config ledger row itself
+    except Exception as e:  # noqa: BLE001 — a mid-run crash must fail CLOSED
+        print(f"peers research: run crashed: {e}", file=sys.stderr)
+        return 1
+    print(f"peers research: complete (ledger: {ledger_path})")
+    if "web" not in modalities:
+        # Honest, legible terminal note (the URL-citation floor is by design, not a
+        # bug): codebase-only gathers + classifies evidence but cannot write a
+        # URL-cited RESEARCH.md, so it ends dry. Point the operator at the opt-in.
+        print("peers research: note — codebase-only gathers evidence but produces "
+              "NO committable report (the report honesty floor requires >=2 "
+              "primary-source URL citations, which code-locations are not). Enable "
+              "the web modality (--modalities codebase,web) with a research.web "
+              "block (enabled/allow/seed_urls) in .peers/config.yaml to produce a "
+              "cited report.")
+    return 0
+
+
+def _build_find_bugs_frontend_from_config(
+    repo: Path, *, input_path, bug_id, fuzz_binary, expected_function, ladder, peer,
+):
+    """Wire a real generic FindBugsFrontend from the repo's configured peer spec."""
+    from peers.agent_invoke import agent_runner_from_spec
+    from peers.modes.find_bugs_reproduce.assembly import make_find_bugs_frontend
+    from peers.modes.find_bugs_reproduce.chitin_backend import ChitinClient
+    from peers.modes.find_bugs_reproduce.intake import FileInputSource
+
+    cfg_path = repo / ".peers" / "config.yaml"
+    if not cfg_path.exists():
+        raise ValueError("missing .peers/config.yaml — run `peers init`")
+    cfg = _load_config_yaml(cfg_path)
+    specs = load_peer_specs(cfg)
+    if not specs:
+        raise ValueError("no peers configured in .peers/config.yaml")
+    if peer is not None:
+        spec = next((s for s in specs if s.name == peer), None)
+        if spec is None:
+            raise ValueError(f"peer {peer!r} not found in config")
+    else:
+        spec = specs[0]
+    run_agent = agent_runner_from_spec(spec, cwd=repo)
+    return make_find_bugs_frontend(
+        repo, input_source=FileInputSource(Path(input_path), bug_id=bug_id),
+        run_agent=run_agent, chitin=ChitinClient(), fuzz_binary=fuzz_binary,
+        expected_function=expected_function, ladder_profile=ladder,
+        attest_peer=spec.name)
+
+
+def cmd_find_bugs(
+    repo_path, *, input_path, fuzz_binary, bug_id=None, expected_function=None,
+    ladder="llm_assisted", peer=None, _make_frontend=None,
+) -> int:
+    """Operator entry for find-bugs:reproduce: drive the real reproduce frontend over
+    one crashing-seed input. Fails CLOSED on a bad repo, a missing seed, or missing
+    peer config; a mid-run crash is reported (the lease/ledger persist)."""
+    if not _mode_pkg_available("peers.modes.find_bugs_reproduce"):
+        print("find-bugs mode is not available in this build.", file=sys.stderr)
+        return 2
+
+    from peers.modes.bring_up.assembly import validate_git_repo
+    from peers.spine.mode_run import ModeRun, drive
+    from peers.spine.op_config import OpConfig
+
+    repo = Path(repo_path)
+    err = validate_git_repo(repo)
+    if err:
+        print(f"peers find-bugs: {err}", file=sys.stderr)
+        return 1
+    seed = Path(input_path)
+    if not seed.is_file():
+        print(f"peers find-bugs: input seed not found: {seed}", file=sys.stderr)
+        return 2
+    ledger_path = repo / ".peers" / "run.jsonl"
+    try:
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"peers find-bugs: cannot create .peers: {e}", file=sys.stderr)
+        return 1
+    run_id = f"find-bugs-{repo.name}"
+    try:
+        front = (_make_frontend(repo) if _make_frontend is not None
+                 else _build_find_bugs_frontend_from_config(
+                     repo, input_path=seed, bug_id=bug_id, fuzz_binary=fuzz_binary,
+                     expected_function=expected_function, ladder=ladder, peer=peer))
+    except (ValueError, OSError) as e:
+        print(f"peers find-bugs: {e}", file=sys.stderr)
+        return 1
+    op = OpConfig.from_dict({"mode": "find-bugs:reproduce"})
+    run = ModeRun(tool=repo, op_config=op, ledger_path=ledger_path, mode_run=run_id)
+    try:
+        drive(run, front)  # drive() writes the op-config ledger row itself
+    except Exception as e:  # noqa: BLE001 — a mid-run crash must fail CLOSED
+        print(f"peers find-bugs: run crashed: {e}", file=sys.stderr)
+        return 1
+    print(f"peers find-bugs: complete (ledger: {ledger_path})")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2202,6 +2919,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_tmux(args.target, args.tmux_cmd)
     if args.cmd == "run-check":
         return cmd_run_check(args.target, args.name)
+    if args.cmd == "bring-up":
+        return cmd_bring_up(args.manifest, args.fixer, peer=args.peer)
+    if args.cmd == "develop":
+        dims = [d.strip() for d in (args.dimensions or "").split(",") if d.strip()]
+        return cmd_develop(
+            Path(args.repo), dimensions=dims, peer=args.peer,
+            budget=args.convergence_budget)
+    if args.cmd == "research":
+        mods = [m.strip() for m in (args.modalities or "").split(",") if m.strip()]
+        return cmd_research(Path(args.repo), modalities=mods, peer=args.peer)
+    if args.cmd == "find-bugs":
+        return cmd_find_bugs(
+            Path(args.repo), input_path=args.input, fuzz_binary=args.fuzz_binary,
+            bug_id=args.bug_id, expected_function=args.expected_function,
+            ladder=args.ladder, peer=args.peer)
     return 2
 
 

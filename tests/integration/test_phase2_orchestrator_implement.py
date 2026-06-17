@@ -13,10 +13,11 @@ import json
 import os
 import subprocess
 import sys
-from hashlib import sha256
 from pathlib import Path
 
 import yaml
+
+from peers_ctl.contracts import write_frozen_contracts
 
 
 def _peers_ctl(
@@ -206,27 +207,19 @@ def test_fake_convergence_all_gates_pass(tmp_path):
         "  - touches: src/auth.py, tests/test_auth.py\n"
     )
 
-    # Frozen contracts: simulate `peers-ctl new --modes=implement` output.
-    # Hand-roll instead of calling peers-ctl so we can exercise the gates
-    # against a tightly-controlled fixture (gives a clean error if a
-    # gate disagrees with the contract format).
+    # Frozen contracts: build the real init-time layout via the same
+    # library `peers-ctl new --modes=implement` calls, so the fixture can
+    # never drift from the contract format the gates enforce. (A prior
+    # hand-rolled fixture silently went stale when BUG-178 added the
+    # hash-chained contracts.log that verify_contracts now requires.)
     plan_dir = tmp_path / ".peers"
-    contracts = plan_dir / "contracts"
-    contracts.mkdir(parents=True)
-    acc = contracts / "acceptance.sh"
-    acc.write_text("#!/bin/sh\nexit 0\n")  # passes => acceptance_pass green
-    acc.chmod(0o444)
-    plan_orig = plan_dir / "PLAN.original.md"
-    # Original == current at this moment (no steps dropped between init
-    # and the convergence claim) => plan_original_preserved green.
-    plan_orig.write_text(plan.read_text())
-    plan_orig.chmod(0o444)
-    sha_map = {
-        "acceptance.sh": sha256(acc.read_bytes()).hexdigest(),
-        "PLAN.original.md": sha256(plan_orig.read_bytes()).hexdigest(),
-    }
-    (plan_dir / "contracts.sha").write_text(
-        json.dumps(sha_map, indent=2) + "\n",
+    write_frozen_contracts(
+        plan_dir,
+        acceptance="exit 0",  # passes => acceptance_pass green
+        e2e=None,  # no e2e.sh => e2e_pass skips (rc 0)
+        # Original == current PLAN.md (no steps dropped between init and
+        # the convergence claim) => plan_original_preserved green.
+        plan_md_content=plan.read_text(),
     )
 
     # Run each implement-mode gate.

@@ -156,3 +156,19 @@ def test_freshly_redegraded_peer_waits_full_cooldown() -> None:
     # No recovery_cooldown_iter (cleared on the prior heal).
     tm = TurnManager(state)
     assert tm.current() == "codex"  # benched: 31 - 30 = 1 < interval (8)
+
+
+def test_failed_recovery_below_threshold_still_restarts_cooldown() -> None:
+    # full-depth-analysis #10: a failed recovery turn of an already-degraded peer
+    # whose sliding-window credit is < 3 must STILL restart the cooldown — else it
+    # falls through every branch and is re-offered a wasted recovery turn EVERY
+    # tick instead of once per interval (v17 anti-starvation).
+    drv = _Health()
+    state = _bare_state()
+    state["peers"]["claude"]["state"] = "degraded"
+    state["peers"]["claude"]["degraded_at_iter"] = 0
+    state["peers"]["claude"]["recent_runs"] = [True, True]   # this fail -> only 1/3
+    state["iteration"] = 8
+    drv._update_peer_health(state, "claude", success=False)   # recovery failed, <3
+    assert state["peers"]["claude"]["recovery_cooldown_iter"] == 8
+    assert state["peers"]["claude"]["degraded_at_iter"] == 0

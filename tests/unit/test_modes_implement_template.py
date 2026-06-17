@@ -68,8 +68,10 @@ def test_all_implement_check_files_referenced():
     we accept either surface as proof the check is registered.
     """
     checks_dir = IMPLEMENT_DIR / "checks"
+    # Underscore-prefixed modules are PRIVATE helpers (internal harness shims),
+    # not goal check scripts — exclude them the same way ``__init__`` is excluded.
     check_files = {
-        p.stem for p in checks_dir.glob("*.py") if p.stem != "__init__"
+        p.stem for p in checks_dir.glob("*.py") if not p.stem.startswith("_")
     }
 
     data = yaml.safe_load((IMPLEMENT_DIR / "goals.yaml").read_text())

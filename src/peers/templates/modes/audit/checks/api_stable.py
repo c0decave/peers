@@ -11,11 +11,13 @@ from pathlib import Path
 
 from peers.safe_io import (
     atomic_write_text_in_dir_no_symlink,
+    read_bytes_no_symlink,
     read_text_no_symlink,
 )
 
 
 BASELINE = Path(".peers/api-baseline.txt")
+MAX_SOURCE_FILE_BYTES = 8 * 1024 * 1024
 
 
 def _refuse_if_linked(path: Path) -> str | None:
@@ -49,16 +51,35 @@ def _refuse_if_linked(path: Path) -> str | None:
     return None
 
 
+def _parse_source(path: Path) -> ast.Module | None:
+    try:
+        raw = read_bytes_no_symlink(
+            path, max_bytes=MAX_SOURCE_FILE_BYTES + 1,
+        )
+    except OSError:
+        return None
+    if len(raw) > MAX_SOURCE_FILE_BYTES:
+        return None
+    try:
+        return ast.parse(raw.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError):
+        return None
+
+
 def public_symbols(srcdir: str = "src") -> list[str]:
+    src_root = Path(srcdir)
     out: list[str] = []
-    for file in sorted(Path(srcdir).rglob("*.py")):
+    for file in sorted(src_root.rglob("*.py")):
         if file.name.startswith("_"):
             continue
-        try:
-            tree = ast.parse(file.read_text(errors="ignore"))
-        except SyntaxError:
+        tree = _parse_source(file)
+        if tree is None:
             continue
-        mod = ".".join(file.with_suffix("").parts[1:])
+        try:
+            rel = file.with_suffix("").relative_to(src_root)
+        except ValueError:
+            continue
+        mod = ".".join(rel.parts)
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not node.name.startswith("_"):
                 out.append(f"{mod}.{node.name}")

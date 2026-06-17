@@ -56,16 +56,29 @@ def compute_stuck_gate_halt_reason(state: dict[str, Any]) -> str | None:
     return f"stuck:{worst_gate}"
 
 
-# Progress-aware stuck reset. The convergence-wall halt watches
-# `tests-pass`, but in implement-mode the acceptance suite is red BY
-# DESIGN until ~all PLAN steps are built (calc v2 diagnostic 2026-05-31:
-# a multi-step build was killed `stuck:tests-pass` while genuinely
-# progressing one step at a time). When the count of completed PLAN
-# steps rises on a tick, the configured terminal gate's red streak is
-# forgiven — so a run halts only on NO step progress for N ticks, not on
-# mere feature-incompleteness. HEAD-advance is deliberately NOT the
-# signal: a handoff commit advances HEAD every tick even when stuck.
-_IMPLEMENT_PROGRESS_RESET_GATES = ("tests-pass",)
+# Progress-aware stuck reset. The convergence-wall halt watches BOTH
+# `tests-pass` and `no-prior-regression`, but in implement-mode the
+# acceptance suite is red BY DESIGN until ~all PLAN steps are built
+# (calc v2 diagnostic 2026-05-31: a multi-step build was killed
+# `stuck:tests-pass` while genuinely progressing one step at a time).
+# When the count of completed PLAN steps rises on a tick, the configured
+# terminal gates' red streak is forgiven — so a run halts only on NO step
+# progress for N ticks, not on mere feature-incompleteness. HEAD-advance
+# is deliberately NOT the signal: a handoff commit advances HEAD every
+# tick even when stuck.
+#
+# BUG-STUCK-01 (2026-06-12): the reset set MUST mirror the watched-halt
+# set (_DEFAULT_STUCK_HALT_GATES). `no-prior-regression` was watched for
+# the halt but originally omitted here, so a progressing band was
+# false-halted `stuck:no-prior-regression` on band-external env drift —
+# its baseline (.peers/passing-baseline.txt) is a run-start one-shot, so
+# a later `-n` worker-count change, a mid-run toolchain install, or
+# flaky async-under-xdist flips tests vs the stale snapshot. Forgiving it
+# on step progress does NOT let bad work converge (the gate must still go
+# green to converge — a genuine regression keeps it red and blocks
+# `complete`); it only stops the PREMATURE kill of an actively-progressing
+# band, exactly mirroring the tests-pass precedent.
+_IMPLEMENT_PROGRESS_RESET_GATES = ("tests-pass", "no-prior-regression")
 _DONE_STEP_RE = re.compile(r"(?m)^[ \t]*-[ \t]*\[[xX]\]")
 
 

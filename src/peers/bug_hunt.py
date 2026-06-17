@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -57,6 +58,15 @@ SEVERITY_ORDER = ("crit", "high", "med", "low", "info")
 BLOCKING_SEVERITIES = frozenset({"crit", "high", "med"})
 _SEVERITY_RANK = {sev: i for i, sev in enumerate(SEVERITY_ORDER)}
 _TRAILER_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]{1,}):\s*(.*?)\s*$")
+# `git cherry-pick -x` appends `(cherry picked from commit <sha>)`
+# AFTER the trailer block. git's own `interpret-trailers --parse` treats it
+# as a skippable git-generated footer, not a stop marker; we match that so
+# a cherry-picked Resolve commit's trailers are still parsed.
+# SHA-1 oids are 40 hex chars; SHA-256 oids are 64. Cap at 64 so
+# repos created with `git init --object-format=sha256` are handled too.
+_CHERRY_PICK_FOOTER_RE = re.compile(
+    r"^\(cherry picked from commit [0-9a-f]{4,64}\)$"
+)
 _TDD_SUBJECT_RE = re.compile(
     r"^TDD:\s*reproducer\s+for\s+(BUG-\d+)\b",
     re.IGNORECASE,
@@ -157,6 +167,9 @@ def parse_commit_trailers(message: str) -> dict[str, list[str]]:
     for line in reversed(lines):
         if line.strip() == "":
             break
+        if _CHERRY_PICK_FOOTER_RE.match(line):
+            # git-generated footer (see BUG-758): not a stop marker.
+            continue
         m = _TRAILER_RE.match(line)
         if not m:
             break
@@ -180,9 +193,14 @@ def _historical_tdd_subject_reproduce_ids(message: str) -> list[str]:
     return [match.group(1).upper()] if match else []
 
 
-def _first_json_block(body: str) -> dict | None:
-    """Extract the first balanced `{...}` block from a commit body and
-    return its parsed value if it decodes as a JSON object."""
+def _iter_json_blocks(body: str) -> Iterator[dict]:
+    """Yield every balanced top-level `{...}` block in `body` that decodes
+    as a JSON object, in document order.
+
+    Security-sensitive callers (`_bug_report_block`, `_resolution_block`)
+    scan ALL blocks rather than trusting the first one, so a peer cannot
+    shadow the real Bug-Report/Resolution JSON by prepending a decoy object
+    (BUG-712 gate-integrity hardening)."""
     in_string = False
     escape = False
     depth = 0
@@ -207,12 +225,53 @@ def _first_json_block(body: str) -> dict | None:
             depth -= 1
             if depth == 0 and start >= 0:
                 snippet = body[start:i + 1]
+                start = -1
                 try:
                     val = json.loads(snippet)
                 except json.JSONDecodeError:
-                    start = -1
                     continue
-                return val if isinstance(val, dict) else None
+                if isinstance(val, dict):
+                    yield val
+
+
+def _first_json_block(body: str) -> dict | None:
+    """First balanced `{...}` JSON object in `body`, or None.
+
+    Retained for non-security callers; Bug-Report severity and
+    Bug-Resolution status are selected by id via `_bug_report_block` /
+    `_resolution_block` so a decoy object cannot shadow the real one."""
+    return next(_iter_json_blocks(body), None)
+
+
+def _bug_report_block(body: str, bid: str) -> dict | None:
+    """Return the Bug-Report JSON object for `bid`: among ALL balanced JSON
+    blocks whose `id` equals `bid`, the one with the HIGHEST severity.
+
+    Scanning every block (not just the first) and taking the max severity
+    closes the gate-integrity hole BUG-712 + the residual its first
+    (heading-anchored) fix missed + the BUG-713 CRLF variant: a peer can no
+    longer demote a real crit/high report to `info` by prepending a decoy
+    `{...}` object (in the subject, prose, or under the heading), nor
+    downgrade it with an earlier lower-severity twin. No heading regex is
+    involved, so CRLF/heading formatting cannot defeat it."""
+    best: dict | None = None
+    best_sev: str | None = None
+    for blk in _iter_json_blocks(body):
+        if blk.get("id") != bid:
+            continue
+        sev = _normalize_severity(blk.get("severity"))
+        if best_sev is None or _severity_is_higher(sev, best_sev):
+            best, best_sev = blk, sev
+    return best
+
+
+def _resolution_block(body: str, bid: str, *keys: str) -> dict | None:
+    """First balanced JSON object in `body` for which any of `keys` equals
+    `bid` — anchors Bug-Resolution / Bug-Defer JSON to the right id so a
+    decoy object cannot shadow the real status/note (BUG-712 hardening)."""
+    for blk in _iter_json_blocks(body):
+        if any(blk.get(k) == bid for k in keys):
+            return blk
     return None
 
 
@@ -282,7 +341,6 @@ def count_new_blocking_or_flag_bug_reports(repo: Path, since_sha: str) -> int:
         report_ids = trailers.get("Bug-Report", [])
         if not report_ids:
             continue
-        json_block = _first_json_block(body)
         for bid in report_ids:
             # Flag-bug: the trailer value itself carries the prefix.
             # Prefix detection only is case-insensitive (the BUG-NNN id
@@ -296,8 +354,9 @@ def count_new_blocking_or_flag_bug_reports(repo: Path, since_sha: str) -> int:
             # Standard form: severity comes from the JSON block whose
             # `id` matches the trailer value. Anything else → info.
             sev = "info"
-            if isinstance(json_block, dict) and json_block.get("id") == bid:
-                sev = _normalize_severity(json_block.get("severity"))
+            blk = _bug_report_block(body, bid)
+            if blk is not None:
+                sev = _normalize_severity(blk.get("severity"))
             if sev in BLOCKING_SEVERITIES:
                 count += 1
     return count
@@ -347,12 +406,11 @@ def summarize(repo: Path) -> BugSummary:
         reproduce_ids = trailers.get("Bug-Reproduce", [])
         if not reproduce_ids:
             reproduce_ids = _historical_tdd_subject_reproduce_ids(body)
-        peer_trailer = (trailers.get("Peer") or [None])[0]
-
-        json_block = _first_json_block(body) if (report_ids or resolve_ids
-                                                  or defer_ids) else None
+        _peers = trailers.get("Peer") or []
+        peer_trailer = _peers[0] if _peers else None
 
         for bid in report_ids:
+            report_json = _bug_report_block(body, bid)
             if bid in s.reports:
                 # newest-first iteration → first wins. Surface duplicates
                 # so operators can spot severity-downgrade-style gaming:
@@ -369,9 +427,9 @@ def summarize(repo: Path) -> BugSummary:
                     "newest commit wins (re-triage permitted; check "
                     "older commits for the original severity)"
                 )
-                if isinstance(json_block, dict) and json_block.get("id") == bid:
+                if report_json is not None:
                     older_sev = _normalize_severity(
-                        json_block.get("severity", "info")
+                        report_json.get("severity", "info")
                     )
                     current = s.reports[bid]
                     if _severity_is_higher(older_sev, current.severity):
@@ -390,15 +448,15 @@ def summarize(repo: Path) -> BugSummary:
             cwe = None
             file_name = None
             function = None
-            if isinstance(json_block, dict) and json_block.get("id") == bid:
-                sev = str(json_block.get("severity", "info")).lower()
-                title = str(json_block.get("title", ""))
-                desc = str(json_block.get("description", ""))
-                fix_by = json_block.get("fix_by")
-                location = json_block.get("location")
-                cwe = json_block.get("cwe") or json_block.get("CWE")
-                file_name = json_block.get("file")
-                function = json_block.get("function")
+            if report_json is not None:
+                sev = str(report_json.get("severity", "info")).lower()
+                title = str(report_json.get("title", ""))
+                desc = str(report_json.get("description", ""))
+                fix_by = report_json.get("fix_by")
+                location = report_json.get("location")
+                cwe = report_json.get("cwe") or report_json.get("CWE")
+                file_name = report_json.get("file")
+                function = report_json.get("function")
             else:
                 # Heading-less fallback: pull title from the subject line.
                 subj = body.splitlines()[0] if body else ""
@@ -446,12 +504,10 @@ def summarize(repo: Path) -> BugSummary:
                 continue
             status = "fixed"
             note = ""
-            if isinstance(json_block, dict) and (
-                json_block.get("resolves") == bid
-                or json_block.get("id") == bid
-            ):
-                status = str(json_block.get("status", "fixed")).lower()
-                note = str(json_block.get("note", ""))
+            resolve_json = _resolution_block(body, bid, "resolves", "id")
+            if resolve_json is not None:
+                status = str(resolve_json.get("status", "fixed")).lower()
+                note = str(resolve_json.get("note", ""))
             if status not in RESOLVED_STATUSES:
                 s.warnings.append(
                     f"{sha[:8]}: Bug-Resolves:{bid} status={status!r} "
@@ -478,12 +534,10 @@ def summarize(repo: Path) -> BugSummary:
                 )
                 continue
             note = ""
-            if isinstance(json_block, dict) and (
-                json_block.get("defers") == bid
-                or json_block.get("id") == bid
-            ):
-                note = str(json_block.get("reason")
-                           or json_block.get("note", ""))
+            defer_json = _resolution_block(body, bid, "defers", "id")
+            if defer_json is not None:
+                note = str(defer_json.get("reason")
+                           or defer_json.get("note", ""))
             if not note:
                 # Defer without rationale is gaming — surface it but
                 # still honor the defer so the gate can complete (the

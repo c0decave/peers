@@ -37,7 +37,7 @@ def main(project_dir: str = ".", timeout: int = 600) -> int:
 
     try:
         verify_contracts(plan_dir)
-    except ContractsMismatch as e:
+    except (ContractsMismatch, OSError) as e:
         print(f"acceptance-pass FAIL: contract tampered: {e}")
         return 1
 

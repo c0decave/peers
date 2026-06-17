@@ -54,7 +54,7 @@ def _project_rollup(repo: Path) -> tuple[int, int, str]:
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
         if not isinstance(entry, dict):
             continue
@@ -77,7 +77,7 @@ def _load_dashboard_state(repo: Path) -> dict:
             max_bytes=_DASHBOARD_STATE_MAX_BYTES + 1,
         )
         data = json.loads(raw)
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError, RecursionError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -333,7 +333,7 @@ def _recent_run_lines(repo: Path, *, limit: int = 8) -> list[str]:
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
         if isinstance(entry, dict):
             entries.append(entry)

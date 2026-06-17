@@ -325,6 +325,69 @@ peers-ctl doctor                           # pre-flight: peers + git + peer CLIs
 peers-ctl prune <name>                     # delete old per-project log files
 ```
 
+### `peers-ctl tui` — live cockpit
+
+```sh
+pip install -e .[tui]                      # one-time: install the optional TUI extra
+peers-ctl tui                              # launch the host-side live cockpit
+```
+
+A dark, state-colored master-detail "mission control" for a peers fleet: start
+projects, watch the agents work, read what they say and how they mutually check
+each other, and see the gates / steps / tasks-done, the bugs they find, and the
+diffs they produce — plus a forward-looking view of the agentic-os autonomy
+layer.
+
+- **Optional extra.** The TUI is a Textual UI shipped behind the optional
+  `[tui]` extra (`pip install -e .[tui]` adds Textual + textual-window) so the
+  core install stays `pyyaml`-only. Running `peers-ctl tui` without the extra
+  prints a friendly install hint and exits — it never crashes.
+- **Read-only over the signals; acts via the substrate.** The cockpit only
+  *reads* the file-based signals (`projects.yaml`, per-run state, git
+  trailers/attestation, `bugs.jsonl`, `runs.jsonl`, the spine ledger). Every
+  *action* shells out to the existing `peers-ctl` verbs, so the substrate's
+  guards and hash-chains stay authoritative — the TUI reimplements no write
+  logic, never writes into `.peers/`, and adds no new trust surface. CONVERGED /
+  gate / integrity verdicts are always **re-derived** from the substrate, never
+  trusting the agent-writable stored `independence` flag.
+- **Windows.** A Fleet sidebar plus movable / resizable / toggleable + pop-out
+  windows — Peers, Gates (with a history scrubber: step `[` / `]` through past
+  ticks with absolute + relative time), Tasks/Steps, Live-Stream, Tick-Verlauf,
+  Budget, Bugs, Konsens/Attestation (with a forgery badge), Log, Diff — plus
+  forward-looking autonomy windows (Autonomie-Ledger, Spine-Gates,
+  Propagations-DAG, Autonomie-Feed, Eskalations-Banner) that render an honest
+  empty-state until the spine is wired to an operator-launchable mode.
+- **Acting safely.** A doctor-gated, off-thread launch wizard creates + starts
+  projects; intervention modals (stop / resume / ack-block / amend) show the
+  exact verb and use type-to-confirm for contract-touching ops.
+- **Keys + layout.** vim + arrows + letters (`?` for the in-app help); layout
+  persists to `~/.config/peers-ctl/tui-layout.json`.
+  Full design: [docs/plans/2026-06-11-peers-tui-design.md](docs/plans/2026-06-11-peers-tui-design.md).
+
+#### Observability knobs (host-side; all additive + fail-closed)
+
+The TUI is fed by three substrate additions, all opt-in-safe and backward
+compatible:
+
+- **Live tee — opt-in, default-off.** Set `observability.tee_stream: true` in
+  `.peers/config.yaml` (or `PEERS_TEE_STREAM=1`) to mirror each peer's live
+  stdout to a tail-able `.peers/log/peers/tick-<N>-<peer>.stream.jsonl`, so
+  **codex / opencode are watchable live** in the Live-Stream window just like
+  claude (which is always live via its session jsonl). A normal launch with the
+  knob off is byte-identical; a tee error can never disturb the loop or
+  liveness (fail-closed), and the stream files are log-rotated like the other
+  per-tick logs.
+- **Per-tick `gates` snapshot — always-on, backward-compatible.** Each
+  `runs.jsonl` tick line now carries a compact `gates` map (gate-id → state,
+  soft-consensus n/m). It powers the Gates window's **history scrubber** (what
+  the gates stood at a past tick + when it happened). Every existing
+  `runs.jsonl` reader ignores the extra key.
+- **`.peers/spine-runs/<mode_run>.json` registry — observability-only.**
+  Written fail-closed by the spine's `worktree.lease()` so spine mode-runs are
+  host-discoverable; the autonomy windows light up once the spine becomes
+  operator-runnable. Prune re-derives liveness at reap time (never reaps a live
+  record).
+
 ### Common `peers` operations (inside a target repo)
 
 ```sh
@@ -362,6 +425,24 @@ peers-ctl start <name> --max-ticks 50 --max-usd 1
 
 `peers run --help` and `peers-ctl start --help-man` show the full
 flag set with descriptions.
+
+### Config-file options (`.peers/config.yaml`)
+
+A few capabilities are opt-in via the project's `.peers/config.yaml` (the
+generated file is annotated; the highlights):
+
+- `graphify_mcp: true` — give the peers an opt-in, supply-chain-caged code
+  knowledge graph they query over MCP instead of `grep` (callers /
+  blast-radius / shortest-path / "who uses X / how does A reach B"), so code
+  navigation is cheaper and more precise. Off by default; **fail-open** (any
+  failure just continues with no graph, byte-identical to off). Needs
+  `podman` + the `graphify-sandbox` image; `PEERS_CTL_NO_GRAPHIFY=1` forces
+  it off fleet-wide. In `--container` runs it shares the egress/auth-proxy
+  network at a private loopback port.
+- `egress_allow: ['^host\.example$', ...]` — extra hosts the `--container`
+  peers may reach (tinyproxy host-regexes appended to the egress allow-list,
+  on top of the LLM API hosts), e.g. to let a peer fetch a spec or a research
+  source. Off by default (no extra egress); anchor each pattern.
 
 ---
 

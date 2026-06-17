@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from peers.codemap import index_module, SymbolInfo
 
 SRC = """
@@ -39,3 +41,15 @@ def test_index_syntax_error_returns_none(tmp_path):
 
 def test_index_missing_file_returns_none(tmp_path):
     assert index_module(tmp_path / "nope.py") is None
+
+
+def test_index_refuses_symlinked_source_file(tmp_path):
+    outside = tmp_path / "outside.py"
+    outside.write_text("def leaked(secret):\n    return secret\n", encoding="utf-8")
+    link = tmp_path / "linked.py"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable for this platform: {exc}")
+
+    assert index_module(link) is None

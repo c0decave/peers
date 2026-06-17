@@ -73,8 +73,8 @@ def main(repo: str = ".") -> int:
                 )
     if problems:
         print("description_sections_present FAIL:")
-        for p in problems:
-            print(p)
+        for problem in problems:
+            print(problem)
         return 1
     print(
         "description_sections_present: clean "

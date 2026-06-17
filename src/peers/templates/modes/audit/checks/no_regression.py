@@ -6,12 +6,15 @@ import os
 import stat
 import subprocess
 import sys
-import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import NamedTuple
 
 from peers.safe_io import (
+    _ensure_private_dir,
+    _open_dir_fd_no_symlink,
     atomic_write_text_in_dir_no_symlink,
+    ensure_private_dir_under_root,
     read_text_no_symlink,
 )
 
@@ -56,6 +59,7 @@ def _refuse_if_linked(path: Path) -> str | None:
 
 
 BASELINE = Path(".peers/passing-baseline.txt")
+JUNIT_TMP_DIR = Path(".peers/tmp/no-regression")
 
 # BUG-006 defense-in-depth (resource-cap + audit-log layer): a single
 # flake-tolerated test is the common case. But when MANY baseline-
@@ -69,6 +73,79 @@ BASELINE = Path(".peers/passing-baseline.txt")
 FLAKE_STORM_THRESHOLD = 5
 
 
+class _JunitXmlTarget(NamedTuple):
+    display_path: Path
+    xml_arg: str
+    dir_fd: int
+    filename: str
+    pass_fds: tuple[int, ...]
+
+
+def _junit_xml_arg_for_fd(dir_fd: int, filename: str) -> tuple[str, tuple[int, ...]]:
+    proc_fd_dir = Path("/proc/self/fd") / str(dir_fd)
+    try:
+        if proc_fd_dir.exists():
+            return str(proc_fd_dir / filename), (dir_fd,)
+    except OSError as exc:
+        raise OSError(
+            "cannot verify /proc/self/fd for fd-anchored JUnit XML"
+        ) from exc
+    raise OSError(
+        "cannot create fd-anchored JUnit XML path: /proc/self/fd unavailable"
+    )
+
+
+def _create_junit_xml_path() -> _JunitXmlTarget:
+    """Create a private, repo-local JUnit XML path for pytest to overwrite.
+
+    Keep the directory fd open so pytest can write through /proc/self/fd on
+    Linux. A normal parent pathname can be swapped to a symlink after validation;
+    the fd path stays anchored to the no-follow directory we opened.
+    """
+    _ensure_private_dir(Path(".peers"))
+    ensure_private_dir_under_root(Path(".peers"), ("tmp", "no-regression"))
+    dir_fd = _open_dir_fd_no_symlink(JUNIT_TMP_DIR)
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        for attempt in range(100):
+            filename = f"junit-{os.getpid()}-{attempt}.xml"
+            try:
+                fd = os.open(filename, flags, 0o600, dir_fd=dir_fd)
+            except FileExistsError:
+                continue
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError(
+                        f"refusing non-regular JUnit XML: "
+                        f"{JUNIT_TMP_DIR / filename}"
+                    )
+            finally:
+                os.close(fd)
+            try:
+                xml_arg, pass_fds = _junit_xml_arg_for_fd(dir_fd, filename)
+            except Exception:
+                try:
+                    os.unlink(filename, dir_fd=dir_fd)
+                except OSError:
+                    pass
+                raise
+            return _JunitXmlTarget(
+                display_path=JUNIT_TMP_DIR / filename,
+                xml_arg=xml_arg,
+                dir_fd=dir_fd,
+                filename=filename,
+                pass_fds=pass_fds,
+            )
+        raise OSError(f"cannot allocate unique JUnit XML under {JUNIT_TMP_DIR}")
+    except Exception:
+        os.close(dir_fd)
+        raise
+
+
 def collect_passing() -> set[str] | None:
     """Run pytest, return the set of passing testcase ids, or ``None`` when
     pytest could not run / produce parseable JUnit XML.
@@ -77,15 +154,48 @@ def collect_passing() -> set[str] | None:
     no-prior-regression gate is a hard gate — a ParseError here used to
     take down the whole goal evaluation cycle.
     """
-    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tf:
-        xml_path = tf.name
-    proc = subprocess.run(
-        ["python3", "-m", "pytest", "-q", "--no-header", f"--junitxml={xml_path}", "--tb=no"],
-        capture_output=True, text=True, check=False,
-    )
     try:
-        xml_file = Path(xml_path)
-        if not xml_file.exists() or xml_file.stat().st_size == 0:
+        xml_target = _create_junit_xml_path()
+    except OSError as exc:
+        sys.stderr.write(
+            f"no_regression: cannot create repo-local JUnit XML: {exc}\n"
+        )
+        return None
+    pytest_args = [
+        "python3", "-m", "pytest", "-q", "--no-header",
+        f"--junitxml={xml_target.xml_arg}", "--tb=no",
+    ]
+    try:
+        try:
+            if xml_target.pass_fds:
+                proc = subprocess.run(
+                    pytest_args,
+                    capture_output=True, text=True, check=False,
+                    pass_fds=xml_target.pass_fds,
+                )
+            else:
+                proc = subprocess.run(
+                    pytest_args,
+                    capture_output=True, text=True, check=False,
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            sys.stderr.write(
+                f"no_regression: cannot launch pytest for JUnit XML: {exc}\n"
+            )
+            return None
+        try:
+            xml_stat = os.stat(
+                xml_target.filename,
+                dir_fd=xml_target.dir_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            xml_stat = None
+        if (
+            xml_stat is None
+            or not stat.S_ISREG(xml_stat.st_mode)
+            or xml_stat.st_size == 0
+        ):
             sys.stderr.write(
                 "no_regression: pytest produced no JUnit XML "
                 f"(exit={proc.returncode}); stderr tail: "
@@ -95,16 +205,36 @@ def collect_passing() -> set[str] | None:
         try:
             # XML is generated locally by pytest in this process, not
             # supplied by an external actor.
-            tree = ET.parse(xml_path)  # nosec B314
+            flags = os.O_RDONLY
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            xml_fd = os.open(
+                xml_target.filename, flags, dir_fd=xml_target.dir_fd
+            )
+            with os.fdopen(xml_fd, "rb") as xml_fp:
+                tree = ET.parse(xml_fp)  # nosec B314
+        except OSError as exc:
+            sys.stderr.write(
+                f"no_regression: cannot read JUnit XML at "
+                f"{xml_target.display_path} ({exc}); "
+                f"pytest exit={proc.returncode}; stderr tail: "
+                f"{(proc.stderr or '')[-400:]}\n"
+            )
+            return None
         except ET.ParseError as exc:
             sys.stderr.write(
-                f"no_regression: junit XML at {xml_path} is unparseable ({exc}); "
+                f"no_regression: junit XML at {xml_target.display_path} "
+                f"is unparseable ({exc}); "
                 f"pytest exit={proc.returncode}; stderr tail: "
                 f"{(proc.stderr or '')[-400:]}\n"
             )
             return None
     finally:
-        Path(xml_path).unlink(missing_ok=True)
+        try:
+            os.unlink(xml_target.filename, dir_fd=xml_target.dir_fd)
+        except OSError:
+            pass
+        os.close(xml_target.dir_fd)
     passing: set[str] = set()
     for tc in tree.getroot().iter("testcase"):
         if any(child.tag in ("failure", "error", "skipped") for child in tc):

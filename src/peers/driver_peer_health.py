@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+from peers.driver_host import _DriverHost
 from peers.state_store import current_peer_name
 
 
@@ -32,7 +33,7 @@ def _recent_fails(history: list[Any]) -> float:
 DEFAULT_RECOVERY_INTERVAL = 8
 
 
-class DriverPeerHealthMixin:
+class DriverPeerHealthMixin(_DriverHost):
     def _update_peer_health(self, state: dict[str, Any], peer: str,
                             success: bool, rate_limited: bool = False) -> None:
         """Track per-peer recent failures (sliding window of 5). A peer
@@ -78,6 +79,13 @@ class DriverPeerHealthMixin:
         recent_fails = _recent_fails(history)
         t["recent_fails"] = recent_fails
         prev_state = t.get("state")
+        if (not success) and prev_state == "degraded":
+            # full-depth-analysis #10: ANY failed recovery turn of an already-
+            # degraded peer restarts its cooldown — even when recent_fails < 3
+            # (e.g. a 0.5 productive-no-handoff credit), which would otherwise
+            # fall through every branch below and re-offer a wasted recovery turn
+            # EVERY tick instead of once per interval (v17 anti-starvation).
+            t["recovery_cooldown_iter"] = state.get("iteration", 0)
         if success and prev_state == "degraded":
             t["state"] = "healthy"
             # (post-2026-05-24): clear degraded annotations
@@ -149,8 +157,8 @@ class DriverPeerHealthMixin:
             file=sys.stderr, flush=True,
         )
 
-    def _maybe_halt(self, state: dict[str, Any]) -> None:
-        """If ALL peers are degraded, write HALTED.md and mark state."""
+    def _maybe_halt(self, state: dict[str, Any]) -> dict[str, Any] | None:
+        """If ALL peers are degraded, write HALTED.md and return halt state."""
         self._verify_peer_dir_identity()
         order = state["peer_order"]
         all_degraded = all(
@@ -158,13 +166,14 @@ class DriverPeerHealthMixin:
             for p in order
         )
         if not all_degraded:
-            return
+            return None
         # All peers degraded → halt-state across the board.
         for p in order:
             state["peers"][p]["state"] = "halted"
+        reason = "peer-unavailable:all-peers-degraded"
         halted_path = self.peer_dir / "HALTED.md"
         if halted_path.exists():
-            return
+            return {"reason": reason, "state": state}
         diag_lines = [
             "# Peers loop halted: all peers degraded",
             "",
@@ -202,3 +211,4 @@ class DriverPeerHealthMixin:
                 "permissions.",
                 file=sys.stderr,
             )
+        return {"reason": reason, "state": state}

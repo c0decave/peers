@@ -72,6 +72,64 @@ _UNREADABLE_EXCERPT = (
 _TREE_SYMLINK_SUFFIX = "@"
 
 
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _truncation_notice(max_bytes: int) -> str:
+    return f"\n\n…[recon.md truncated to {max_bytes} bytes]\n"
+
+
+def _utf8_prefix(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    return data[:max_bytes].decode("utf-8", "ignore")
+
+
+def _utf8_line_prefix(text: str, max_bytes: int) -> str:
+    prefix = _utf8_prefix(text, max_bytes)
+    if _utf8_len(text) <= max_bytes:
+        return prefix
+    if text.startswith(prefix) and text[len(prefix):].startswith("\n"):
+        return prefix
+    newline = prefix.rfind("\n")
+    if newline < 0:
+        return ""
+    return prefix[:newline]
+
+
+def _drop_open_untrusted_block(text: str) -> str:
+    last_begin = -1
+    last_end = -1
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        if line.startswith(_UNTRUSTED_DATA_BEGIN):
+            last_begin = offset
+        elif line.startswith(_UNTRUSTED_DATA_END):
+            last_end = offset
+        offset += len(line)
+    if last_begin > last_end:
+        return text[:last_begin]
+    return text
+
+
+def _cap_recon_output(text: str, max_bytes: int | None = None) -> str:
+    if max_bytes is None:
+        max_bytes = MAX_RECON_BYTES
+    if _utf8_len(text) <= max_bytes:
+        return text
+    notice = _truncation_notice(max_bytes)
+    notice_bytes = _utf8_len(notice)
+    if notice_bytes >= max_bytes:
+        return _utf8_prefix(notice, max_bytes)
+    prefix = _utf8_line_prefix(text, max_bytes - notice_bytes)
+    prefix = _drop_open_untrusted_block(prefix).rstrip()
+    return prefix + notice
+
+
 def _detect_languages(repo: Path) -> list[tuple[str, str]]:
     """Returns list of (language_name, marker_file_relpath)."""
     found: list[tuple[str, str]] = []
@@ -84,8 +142,14 @@ def _detect_languages(repo: Path) -> list[tuple[str, str]]:
 
 
 def _excerpt(path: Path, max_chars: int = MAX_DOC_EXCERPT) -> str:
+    # read by BYTES but cap by CHARS. UTF-8 is <=4 bytes/char, so read
+    # up to max_chars*4+1 bytes to be sure we have MORE than max_chars chars
+    # whenever the file has them. A byte cap == char cap would byte-truncate a
+    # multi-byte doc (umlauts/CJK/emoji) below max_chars chars, so the char
+    # check below never fired and the excerpt was silently truncated WITHOUT
+    # the marker.
     try:
-        txt = read_text_no_symlink(path, max_bytes=max_chars + 1)
+        txt = read_text_no_symlink(path, max_bytes=max_chars * 4 + 1)
     except OSError:
         return _UNREADABLE_EXCERPT
     if len(txt) > max_chars:
@@ -142,8 +206,8 @@ def _tree(
             mode = modes[entry]
             label, is_dir = label_for(entry.name, mode)
             yield f"{rel_prefix}{label}"
-            if is_dir and remaining > 0:
-                yield from walk(
+            if is_dir and remaining > 1:    # >1 so depth=N renders exactly N levels
+                yield from walk(            # (full-depth-analysis #16: was >0 -> N+1)
                     entry, rel_prefix + "  ", remaining - 1,
                 )
     yield from walk(repo, "", depth)
@@ -260,13 +324,7 @@ def _build_recon(repo: Path) -> str:
         _readme_excerpt(repo),
     ]
     out = "\n".join(sections)
-    if len(out) > MAX_RECON_BYTES:
-        out = out[:MAX_RECON_BYTES] + (
-            "\n\n…[recon.md truncated to "
-            + str(MAX_RECON_BYTES)
-            + " bytes]\n"
-        )
-    return out
+    return _cap_recon_output(out)
 
 
 def _existing_regular_file_no_links(path: Path) -> bool:

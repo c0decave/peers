@@ -125,6 +125,13 @@ def _claude_json_path() -> Path:
     return Path.home() / ".claude.json"
 
 
+def _is_root() -> bool:
+    """True if the current euid is 0. Wrapped so tests can patch it
+    (``os.geteuid`` is also absent on non-POSIX platforms)."""
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid() == 0 if geteuid is not None else False
+
+
 def _podman_version_string() -> str:
     """Return ``podman --version`` output trimmed to the version
     token (e.g. ``"4.9.0"``), or ``"unknown"`` on probe failure."""
@@ -338,6 +345,37 @@ def probe_git() -> ProbeResult:
         value="present",
         hint="",
         required=True,
+    )
+
+
+def probe_sandbox_root() -> ProbeResult:
+    """Root + ``--dangerously-skip-permissions`` needs ``IS_SANDBOX=1``.
+
+    The peers loop drives the agent CLIs with ``--dangerously-skip-permissions``
+    (the default config argv). claude-code REFUSES that flag under root/sudo
+    unless ``IS_SANDBOX=1`` is exported — so on a root host (the usual lane/LXC
+    case) every claude tick dies instantly with
+    ``--dangerously-skip-permissions cannot be used with root/sudo privileges``,
+    which surfaces only as an opaque ``process-fail``. Advisory (WARN): non-root
+    hosts are unaffected, and doctor cannot see the project's exact argv."""
+    if not _is_root():
+        return ProbeResult(
+            status="OK", label="sandbox/root", value="not root",
+            hint="", required=False,
+        )
+    if os.environ.get("IS_SANDBOX"):
+        return ProbeResult(
+            status="OK", label="sandbox/root",
+            value="root + IS_SANDBOX set", hint="", required=False,
+        )
+    return ProbeResult(
+        status="WARN", label="sandbox/root",
+        value="root without IS_SANDBOX",
+        hint=(
+            "export IS_SANDBOX=1 — claude refuses --dangerously-skip-permissions "
+            "as root/sudo otherwise, so every claude tick fails instantly"
+        ),
+        required=False,
     )
 
 
@@ -565,6 +603,7 @@ _PROBES: tuple[Callable[[], ProbeResult], ...] = (
     probe_version_drift,
     probe_oauth_or_apikey,
     probe_git,
+    probe_sandbox_root,
 )
 
 
@@ -638,6 +677,7 @@ __all__ = [
     "probe_version_drift",
     "probe_oauth_or_apikey",
     "probe_git",
+    "probe_sandbox_root",
     "probe_claude_smoke",
     "run_doctor",
 ]

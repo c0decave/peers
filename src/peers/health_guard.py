@@ -24,9 +24,10 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import IO, Sequence
 
 from peers.liveness import proc_state_alive, socket_active
+from peers.safe_io import open_text_in_dir_no_symlink
 from peers.structured_halt import (
     classify_structured_halt,
     classify_structured_transient,
@@ -130,6 +131,101 @@ def hung_tool_diagnostic(stdout_tail: str) -> str | None:
         return None
     names = ", ".join(sorted(set(open_tools.values())))
     return f"hung mid-tool-call (no tool_result for: {names})"
+
+
+class _TeeWriter:
+    """Optional live tee of a stream's decoded text to an append-only file.
+
+    Wave-2 TUI feature (default-OFF): when the substrate is asked to tee a
+    peer stream, decoded text flowing through `_StreamCollector._append_chunk`
+    is mirrored verbatim (newline-delimited passthrough) into a tail-able
+    ``tick-<N>-<peer>.stream.jsonl`` so codex/opencode are live-watchable the
+    same way claude's session jsonl is.
+
+    Hard contract (it lives in the liveness hot path):
+    - **Fail-CLOSED**: every public method swallows ALL exceptions. A tee
+      failure must NEVER propagate into the reader thread, NEVER touch
+      ``last_output_t`` or the scan cursor. On any error the tee marks itself
+      ``degraded``, closes its fd, and stops teeing — the reader stays fully
+      alive.
+    - **Open-once**: the O_APPEND fd is opened lazily on the first write via a
+      no-symlink dir-fd (same 0600/private-dir discipline as the peer logs).
+    - **No fsync-per-chunk**: rely on the OS / buffered writer; ``close()``
+      flushes the buffer (and is called on every reader-exit path so the last
+      bytes survive).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.degraded = False
+        self._fp: "IO[str] | None" = None
+        self._opened = False
+
+    def _ensure_open(self) -> bool:
+        """Open the append fd once. Returns True iff teeing may proceed.
+
+        Any failure flips ``degraded`` and disables further teeing. Never
+        raises."""
+        if self._fp is not None:
+            return True
+        if self._opened:
+            # Already attempted and failed (degraded), or already closed.
+            return False
+        self._opened = True
+        try:
+            # O_APPEND, 0600, no-follow on parent + leaf — mirrors the
+            # per-tick peer-log write discipline. The parent dir is created
+            # by the caller (invoke) before the collector starts.
+            self._fp = open_text_in_dir_no_symlink(
+                self.path.parent, self.path.name, "a",
+            )
+            return True
+        except Exception:
+            self.degraded = True
+            self._fp = None
+            return False
+
+    def write(self, text: str) -> None:
+        """Mirror ``text`` verbatim into the tee file. Never raises.
+
+        On the first call this opens the fd. On any I/O error the tee
+        degrades (closes + stops) but the caller (the reader thread) is
+        unaffected."""
+        if self.degraded or not text:
+            return
+        if not self._ensure_open() or self._fp is None:
+            return
+        try:
+            self._fp.write(text)
+            # flush() (NOT fsync) pushes the userspace buffer into the kernel
+            # page cache so a `tail -f`/the TUI sees the bytes mid-stream. It
+            # does NOT force a disk sync, so the hot-path cost stays low (one
+            # write/flush per os.read chunk). Tail-ability is the whole point
+            # of the live tee, so this is deliberate, not per-chunk fsync.
+            self._fp.flush()
+        except Exception:
+            # A write failure (disk full, fd revoked, etc.) must not reach
+            # the reader. Degrade + tear down, keep the reader alive.
+            self.degraded = True
+            self._close_fp_quietly()
+
+    def close(self) -> None:
+        """Flush + close the tee fd. Never raises. Idempotent."""
+        self._close_fp_quietly()
+
+    def _close_fp_quietly(self) -> None:
+        fp = self._fp
+        self._fp = None
+        if fp is None:
+            return
+        try:
+            fp.flush()
+        except Exception:
+            self.degraded = True
+        try:
+            fp.close()
+        except Exception:
+            self.degraded = True
 
 
 def _utf8_size(text: str) -> int:
@@ -349,12 +445,20 @@ class _StreamCollector:
     def __init__(self, name: str, stream, shared: dict,
                  shared_lock: threading.Lock,
                  buf_cap_bytes: int = _BUF_SOFT_CAP_BYTES,
-                 scan_enabled: bool = True) -> None:
+                 scan_enabled: bool = True,
+                 tee_path: Path | None = None) -> None:
         self.name = name
         self.stream = stream
         self.shared = shared
         self.shared_lock = shared_lock
         self.lock = threading.Lock()
+        # Optional live tee (Wave-2 TUI). default None → byte-identical to
+        # today: no fd opened, no extra write, no behavioural change. When
+        # set, decoded text is mirrored into `tee_path` from `_append_chunk`,
+        # fail-closed (a tee error can never disturb the reader / liveness).
+        self.tee: "_TeeWriter | None" = (
+            _TeeWriter(tee_path) if tee_path is not None else None
+        )
         self.buf: list[str] = []
         self._scan_buf: list[str] = []
         self._size = 0  # bytes
@@ -384,34 +488,51 @@ class _StreamCollector:
 
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         fd = self.stream.fileno()
-        while not self._stop.is_set():
-            try:
-                readable, _, _ = select.select(
-                    [fd], [], [], _STOP_POLL_INTERVAL_S
-                )
-            except (OSError, ValueError):
-                # fd closed under us (substrate cleanup) → exit cleanly.
-                break
-            if not readable:
-                continue
-            try:
-                chunk = os.read(fd, _READ_CHUNK_BYTES)
-            except OSError:
-                break
-            if not chunk:
-                break
-            text = decoder.decode(chunk)
-            if text:
-                self._append_chunk(text, len(chunk))
-            with self.shared_lock:
-                self.shared["last_output_t"] = time.monotonic()
-        tail = decoder.decode(b"", final=True)
-        if tail:
-            self._append_chunk(tail, _utf8_size(tail))
         try:
-            self.stream.close()
-        except Exception:
-            pass
+            while not self._stop.is_set():
+                try:
+                    readable, _, _ = select.select(
+                        [fd], [], [], _STOP_POLL_INTERVAL_S
+                    )
+                except (OSError, ValueError):
+                    # fd closed under us (substrate cleanup) → exit cleanly.
+                    break
+                if not readable:
+                    continue
+                try:
+                    chunk = os.read(fd, _READ_CHUNK_BYTES)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                text = decoder.decode(chunk)
+                # Publish the liveness signal from the LIVE read, BEFORE the
+                # append. `_append_chunk` now drives the tee write/flush under
+                # `self.lock`, and the fail-closed guard only neutralises RAISED
+                # tee errors — a tee write that BLOCKS (full disk / stalled NFS /
+                # throttled writeback; O_NONBLOCK is a no-op for regular files)
+                # would otherwise keep `_append_chunk` from returning, freezing
+                # `last_output_t` so the idle-timeout / hang watchdog could kill a
+                # LIVE peer. Hoisting the publish here decouples liveness from the
+                # tee fd entirely; only WHEN we publish changed, not WHAT.
+                with self.shared_lock:
+                    self.shared["last_output_t"] = time.monotonic()
+                if text:
+                    self._append_chunk(text, len(chunk))
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                self._append_chunk(tail, _utf8_size(tail))
+        finally:
+            # Flush + close the tee on EVERY exit path (clean EOF, request_stop,
+            # fd-closed, os.read error) — including after the final-tail
+            # _append_chunk above — so the last mirrored bytes are never lost
+            # and the held fd never leaks. Never raises (close swallows all).
+            if self.tee is not None:
+                self.tee.close()
+            try:
+                self.stream.close()
+            except Exception:
+                pass
 
     def request_stop(self) -> None:
         """Signal the reader thread to exit at the next stop-poll.
@@ -439,6 +560,21 @@ class _StreamCollector:
                     self._scan_size = _utf8_size(scan_tail)
             if self._size > self._cap_bytes:
                 self._truncate_locked()
+            # Live tee LAST — after buf/scan are settled. `text` is already
+            # utf-8-boundary-safe decoded text, so a multibyte char split
+            # across two os.read chunks is never corrupted in the tee. The
+            # tee captures pre-truncation bytes (truncation above only
+            # rewrites `self.buf`, not what we already mirrored). `_TeeWriter`
+            # swallows all errors; the extra guard here is defense-in-depth so
+            # nothing can ever escape `_append_chunk` into the reader thread,
+            # alter `last_output_t`, or move the scan cursor. `getattr` keeps
+            # the path safe for collectors built via `__new__` in unit tests.
+            tee = getattr(self, "tee", None)
+            if tee is not None:
+                try:
+                    tee.write(text)
+                except Exception:
+                    pass
 
     def _truncate_locked(self) -> None:
         # the early-return below used to
@@ -668,6 +804,8 @@ class HealthGuard:
         buf_cap_bytes: int = _BUF_SOFT_CAP_BYTES,
         extra_env: dict[str, str] | None = None,
         tool: str | None = None,
+        tee_dir: Path | None = None,
+        tee_tag: str | None = None,
     ) -> RunResult:
         if prompt_mode == "argv-substitute":
             effective_argv = [a.replace("{PROMPT}", prompt) for a in argv]
@@ -732,6 +870,35 @@ class HealthGuard:
         matched_source: str = ""
         config_error: str = ""
 
+        # Optional live tee (Wave-2 TUI; default OFF → tee_dir is None →
+        # byte-identical to today). When enabled, the caller passes the
+        # private peer-log dir and a `tick-<N>-<peer>` tag; we mirror stdout
+        # into `<tag>.stream.jsonl` (the file the TUI Live-Stream tails) and
+        # stderr into `<tag>.stream.err.jsonl`. Resolving the paths must never
+        # break the run: any failure here just disables teeing (fail-CLOSED).
+        stdout_tee_path: Path | None = None
+        stderr_tee_path: Path | None = None
+        if tee_dir is not None and tee_tag:
+            try:
+                tee_dir = Path(tee_dir)
+                # M1: plain mkdir here can traverse a symlinked INTERMEDIATE
+                # ancestor, but `invoke()` only receives a pre-joined opaque
+                # `tee_dir` (no root/rel_parts split), so the clean primitive
+                # `safe_io.ensure_private_dir_under_root` is not applicable
+                # without inventing a fragile last-N-component path split. The
+                # no-symlink GUARANTEE is the LEAF open: `_TeeWriter` opens the
+                # file via `open_text_in_dir_no_symlink`, which opens the parent
+                # dir O_NOFOLLOW + the leaf O_NOFOLLOW with dev/ino/nlink checks,
+                # so a swapped/symlinked tee parent or leaf cannot redirect the
+                # write. (Matches the existing peer-log writer, which holds its
+                # own root/rel_parts and uses the no-follow nested-dir helper.)
+                tee_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                stdout_tee_path = tee_dir / f"{tee_tag}.stream.jsonl"
+                stderr_tee_path = tee_dir / f"{tee_tag}.stream.err.jsonl"
+            except Exception:
+                stdout_tee_path = None
+                stderr_tee_path = None
+
         # Start readers BEFORE writing stdin to avoid pipe-buffer deadlock.
         shared = {"last_output_t": time.monotonic()}
         shared_lock = threading.Lock()
@@ -739,21 +906,24 @@ class HealthGuard:
             "out", proc.stdout, shared, shared_lock,
             buf_cap_bytes=buf_cap_bytes,
             scan_enabled=bool(combined_patterns),
+            tee_path=stdout_tee_path,
         )
         stderr_col = _StreamCollector(
             "err", proc.stderr, shared, shared_lock,
             buf_cap_bytes=buf_cap_bytes,
             scan_enabled=bool(combined_patterns),
+            tee_path=stderr_tee_path,
         )
         stdout_col.start()
         stderr_col.start()
 
         stdin_thread: threading.Thread | None = None
-        if stdin_pipe is subprocess.PIPE and proc.stdin is not None:
+        proc_stdin = proc.stdin
+        if stdin_pipe is subprocess.PIPE and proc_stdin is not None:
             def _write_stdin() -> None:
                 try:
                     if send_stdin is not None:
-                        proc.stdin.write(
+                        proc_stdin.write(
                             send_stdin.encode("utf-8", errors="replace")
                         )
                 except BrokenPipeError:
@@ -761,7 +931,7 @@ class HealthGuard:
                 except OSError:
                     pass
                 try:
-                    proc.stdin.close()
+                    proc_stdin.close()
                 except (BrokenPipeError, OSError, ValueError):
                     pass
 

@@ -294,6 +294,21 @@ def seed_repo_architecture(repo: Path) -> str:
             f"({n} subsystems to cover, prose empty)")
 
 
+# CAP-14 FINDING-1 DE-SCOPE: the STEP-4 `render_architecture_actual` /
+# `regenerate_repo_architecture_actual` generators were REMOVED. They rendered
+# ARCHITECTURE.actual.md as a STRUCTURAL document (one ## per live subsystem /
+# `## Subsystems (live)`), but a production ARCHITECTURE.intended.md is PEER-
+# AUTHORED PROSE with SEMANTIC H2s (Components/Data Flow/Module Boundaries/...
+# see templates/modes/implement/prompts/architecture.md). Wiring this at
+# convergence made the soft architecture-coherent gate WARN permanently (the two
+# heading sets are disjoint) regardless of real drift, and overwrote .actual
+# every convergence so a peer could never steer it clean. The gate is left at
+# its prior honest behaviour (actual_missing -> soft no-op). A REAL arch-coherent
+# check needs a design decision — AST-vs-AST drift or a normalized comparison
+# that reconciles the prose-.intended vs AST-.actual mismatch — and is a tracked
+# follow-up, NOT delivered here.
+
+
 AGENTS_FILE = "AGENTS.md"
 
 _AGENTS_HEADER = (

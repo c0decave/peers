@@ -21,11 +21,15 @@ Inputs (at project root)
   whitespace tokenisation.
 * ``REVIEW_NOTES.md`` -- reviewer-peer's description of what the
   implementation appears to be. Required, same word-count threshold.
-* ``CONCERNS.md`` -- optional. If present and contains the literal
-  marker ``[BLIND-REVIEW-MISMATCH]`` anywhere in its text, the gate
-  fails. This is the explicit escape valve for either peer to record
-  "I read the other side's notes and they don't match what's actually
-  in the tree".
+* ``CONCERNS.md`` -- optional. If present and a line *begins* with the
+  marker ``[BLIND-REVIEW-MISMATCH]`` (after optional Markdown list/heading/
+  blockquote prefixes and an optional backtick), the gate fails. This is the
+  explicit escape valve for either peer to record "I read the other side's
+  notes and they don't match what's actually in the tree". A marker that only
+  appears *mid-prose* (e.g. a Concern that documents the protocol: "if codex
+  disagrees, file ``[BLIND-REVIEW-MISMATCH]``") is a reference, not a filing,
+  and does NOT trip the gate -- the reviewer prompt instructs filing it as a
+  line.
 
 Why no content semantics
 ------------------------
@@ -39,12 +43,13 @@ which is a prompt-template invariant, not a textual one.
 Exit codes
 ----------
 * ``0`` -- both files present, both above the word threshold, no
-  ``[BLIND-REVIEW-MISMATCH]`` marker in ``CONCERNS.md``.
+  line-leading ``[BLIND-REVIEW-MISMATCH]`` marker in ``CONCERNS.md``.
 * ``1`` -- any of: file missing, file too short, mismatch marker
   filed. Stdout names the failing condition.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -53,6 +58,28 @@ _REVIEW_NOTES_NAME = "REVIEW_NOTES.md"
 _CONCERNS_NAME = "CONCERNS.md"
 _MISMATCH_MARKER = "[BLIND-REVIEW-MISMATCH]"
 _MIN_WORDS = 20
+
+# A *filed* mismatch is the marker at the START of a line, FOLLOWED BY a
+# description of the divergence — what the reviewer prompt instructs. A marker
+# that appears mid-prose, or wrapped in inline code with nothing after it but
+# punctuation ("...if codex disagrees, file `[BLIND-REVIEW-MISMATCH]`."), is a
+# REFERENCE, not a filing, and must not trip this hard honesty gate.
+#
+# Detection is per-line (the `^`/`$` anchors + line-local whitespace classes,
+# so nothing matches across newlines — an earlier global inline-code strip
+# `\`[^\`]*\`.sub("")` was a false-NEGATIVE: it erased a genuine filing that was
+# itself backticked, or that sat between two stray backticks on other lines).
+# A line fires iff, after optional Markdown line prefixes (list/heading/quote/
+# number) and an optional ``\``` / ``**`` / ``__`` wrapper, the marker is present
+# and is followed EITHER by end-of-line or by a token containing a word char (a
+# real description). Trailing punctuation only (the reference case) does NOT fire.
+_WRAP = r"(?:\*\*|__|`)?"
+_FILED_MISMATCH_RE = re.compile(
+    r"^[ \t>]*(?:[-*+][ \t]+|#{1,6}[ \t]+|\d+\.[ \t]+)*"
+    + _WRAP + re.escape(_MISMATCH_MARKER) + _WRAP
+    + r"[ \t]*(?:$|\S*[A-Za-z0-9])",
+    re.MULTILINE,
+)
 
 
 def _word_count(text: str) -> int:
@@ -94,10 +121,10 @@ def main(project_dir: str = ".") -> int:
                 f"need >= {_MIN_WORDS})"
             )
 
-    # ---- Explicit mismatch marker. ----
+    # ---- Explicit mismatch marker (a FILED line, not a prose/backtick reference). ----
     if concerns_path.is_file():
         concerns_text = concerns_path.read_text(encoding="utf-8")
-        if _MISMATCH_MARKER in concerns_text:
+        if _FILED_MISMATCH_RE.search(concerns_text):
             failures.append(
                 f"{_CONCERNS_NAME} contains {_MISMATCH_MARKER} "
                 f"-- reviewer/implementer recorded a mismatch"

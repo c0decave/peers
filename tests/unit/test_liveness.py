@@ -41,6 +41,18 @@ def test_socket_active_false_when_only_non_established(tmp_path: Path) -> None:
     assert socket_active(123, proc_root=proc) is False
 
 
+def test_socket_active_edge_ignores_malformed_queue_rows(tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    _write_tcp(
+        proc,
+        123,
+        "   0: too-short",
+        "   1: 0100007F:1F90 0100007F:C9B2 01 nothex:00000000 ...",
+        "   2: 0100007F:1F90 0100007F:C9B2 01 0000000A ...",
+    )
+    assert socket_active(123, proc_root=proc) is False
+
+
 def test_socket_active_none_when_proc_unavailable(tmp_path: Path) -> None:
     assert socket_active(999, proc_root=tmp_path / "nonexistent") is None
 
@@ -86,6 +98,12 @@ def test_proc_state_alive_false_when_whole_tree_in_futex(tmp_path: Path) -> None
     # syscall 202 = futex (lock wait) -> not I/O, not running -> deadlock cand.
     _write_thread(proc, 100, 100, "202 0x55 0x80", "S", children="101")
     _write_thread(proc, 100, 101, "202 0x55 0x80", "S")
+    assert proc_state_alive(100, proc_root=proc) is False
+
+
+def test_proc_state_alive_sad_false_for_corrupt_syscall(tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    _write_thread(proc, 100, 100, "not-a-syscall", "S")
     assert proc_state_alive(100, proc_root=proc) is False
 
 

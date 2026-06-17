@@ -11,6 +11,7 @@ from peers.safe_io import (
     _write_text_in_private_nested_dir_no_symlink,
     append_text_in_dir_no_symlink,
     append_text_no_symlink,
+    ensure_private_dir_under_root,
     open_text_in_dir_no_symlink,
     read_text_no_symlink,
     read_text_under_root_no_follow,
@@ -491,3 +492,67 @@ def test_atomic_write_refuses_preplanted_tmp_collision_BUG_181(
     with pytest.raises(OSError):
         atomic_write_text_in_dir_no_symlink(target, "fresh\n")
     assert bait.read_text(encoding="utf-8") == "keep me"
+
+
+def test_ensure_private_dir_under_root_creates_nested_0700(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    leaf = ensure_private_dir_under_root(root, [".peers", "graphify"])
+    assert leaf == root / ".peers" / "graphify"
+    assert leaf.is_dir()
+    assert stat.S_IMODE(leaf.stat().st_mode) == 0o700
+    assert stat.S_IMODE((root / ".peers").stat().st_mode) == 0o700
+
+
+def test_ensure_private_dir_under_root_rejects_symlinked_ancestor(tmp_path: Path):
+    # BUG-514 follow-up: a symlinked component *under* the trusted root must not
+    # be traversed (mkdir(parents=True) in _ensure_private_dir would follow it).
+    # The leaf must not be created inside the attacker-controlled target.
+    root = tmp_path / "root"
+    root.mkdir()
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    try:
+        (root / ".peers").symlink_to(attacker, target_is_directory=True)
+    except OSError as e:
+        pytest.skip(f"symlinks unavailable: {e}")
+
+    with pytest.raises(OSError):
+        ensure_private_dir_under_root(root, [".peers", "graphify"])
+    assert not (attacker / "graphify").exists()
+
+
+def test_ensure_private_dir_under_root_allows_symlinked_root_ancestor(tmp_path: Path):
+    # Differentiator vs a naive walk from "/": the ROOT itself may legitimately
+    # live under a symlinked ancestor (e.g. /tmp -> /private/tmp). We trust the
+    # operator-given root; only components UNDER it are O_NOFOLLOW-enforced.
+    real_base = tmp_path / "real"
+    real_base.mkdir()
+    link_base = tmp_path / "link"
+    try:
+        link_base.symlink_to(real_base, target_is_directory=True)
+    except OSError as e:
+        pytest.skip(f"symlinks unavailable: {e}")
+    root = link_base / "repo"
+    root.mkdir()
+
+    leaf = ensure_private_dir_under_root(root, [".peers", "graphify"])
+    assert leaf.is_dir()
+    assert (real_base / "repo" / ".peers" / "graphify").is_dir()
+
+
+def test_ensure_private_dir_under_root_idempotent(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    leaf1 = ensure_private_dir_under_root(root, [".peers", "graphify"])
+    leaf2 = ensure_private_dir_under_root(root, [".peers", "graphify"])
+    assert leaf1 == leaf2
+    assert leaf2.is_dir()
+
+
+def test_ensure_private_dir_under_root_rejects_bad_components(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    for bad in ([], [".."], [".peers", ".."], ["a/b"], [""]):
+        with pytest.raises((OSError, ValueError)):
+            ensure_private_dir_under_root(root, bad)

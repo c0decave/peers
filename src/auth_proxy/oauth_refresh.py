@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import secrets
+import stat
 import time
 import urllib.parse
 import urllib.request
@@ -231,32 +232,61 @@ def refresh_access_token(
     return refreshed
 
 
+def _write_all_fd(fd: int, data: bytes) -> None:
+    """Write ``data`` to ``fd`` in full (``os.write`` may write fewer bytes)."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
 def _rewrite_in_place_from_tmp(tmp: Path, path: Path) -> None:
     data = tmp.read_bytes()
-    with path.open("r+b") as fp:
-        # take fcntl.flock(LOCK_EX) before the seek/write/
-        # truncate window so concurrent readers (LOCK_SH in
-        # _read_text_with_shared_lock) wait until the rewrite is
-        # durable instead of seeing a torn file.
-        if _fcntl is not None:
-            try:
-                _fcntl.flock(fp.fileno(), _fcntl.LOCK_EX)
-            except OSError:
-                pass
-        fp.seek(0)
-        fp.write(data)
-        fp.truncate()
-        fp.flush()
-        os.fsync(fp.fileno())
-        if _fcntl is not None:
-            try:
-                _fcntl.flock(fp.fileno(), _fcntl.LOCK_UN)
-            except OSError:
-                pass
+    # harden the in-place rewrite against a symlink / TOCTOU swap of the
+    # destination token file. It is used when ``os.replace`` fails on a bind mount
+    # (the in-container token at /auth/.claude.json on a world-traversable tmpfs,
+    # mode 1733), so an attacker can race a symlink/file swap onto ``path``. A
+    # plain ``path.open("r+b")`` would FOLLOW a symlink and write the fresh OAuth
+    # token THROUGH it to an arbitrary target. Open with O_NOFOLLOW (refuse a
+    # symlink at the final component) and re-verify the opened fd is the SAME
+    # regular, non-hard-linked file we lstat'd (dev/ino) — the safe_io BUG-185
+    # pattern, matching the O_NOFOLLOW already on the sibling tmp write
+    # (_write_unique_token_tmp).
+    lst = path.lstat()
+    if stat.S_ISLNK(lst.st_mode):
+        raise OSError(f"refusing symlinked OAuth token file: {path}")
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(str(path), flags)
     try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"refusing non-regular OAuth token file: {path}")
+        if st.st_nlink != 1:
+            raise OSError(f"refusing hard-linked OAuth token file: {path}")
+        if (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino):
+            raise OSError(f"refusing swapped OAuth token file: {path}")
+        # hold flock(LOCK_EX) across the truncate/write window so
+        # concurrent shared-lock readers (_read_text_with_shared_lock) wait for a
+        # durable rewrite instead of seeing a torn file.
+        if _fcntl is not None:
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+            except OSError:
+                pass
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        _write_all_fd(fd, data)
+        os.fsync(fd)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        if _fcntl is not None:
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)
     try:
         tmp.unlink()
     except FileNotFoundError:

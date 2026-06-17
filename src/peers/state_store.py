@@ -34,6 +34,7 @@ from __future__ import annotations
 import copy
 import fcntl
 import json
+import stat
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -97,6 +98,20 @@ def _build_default_state(peer_order: Iterable[str] | None = None
     }
 
 
+def _default_state_for_overlay(
+    state: dict[str, Any],
+    fallback_peer_order: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    order = state.get("peer_order")
+    if (
+        isinstance(order, list)
+        and order
+        and all(isinstance(name, str) and name for name in order)
+    ):
+        return _build_default_state(order)
+    return _build_default_state(fallback_peer_order)
+
+
 # Public default (n=2 claude+codex). Tests and external readers see the
 # new shape directly.
 DEFAULT_STATE: dict[str, Any] = _build_default_state()
@@ -150,6 +165,31 @@ def _validate_state(state: dict[str, Any], path: Path) -> None:
             f"state file corrupt: {path}: schema_version must be "
             f"{SCHEMA_VERSION}, got {state.get('schema_version')!r}"
         )
+    iteration = state.get("iteration")
+    if (
+        not isinstance(iteration, int)
+        or isinstance(iteration, bool)
+        or iteration < 0
+    ):
+        raise RuntimeError(
+            f"state file corrupt: {path}: iteration must be a "
+            f"non-negative integer, got {iteration!r}"
+        )
+    budget = state.get("budget")
+    if not isinstance(budget, dict):
+        raise RuntimeError(
+            f"state file corrupt: {path}: budget must be a mapping"
+        )
+    goals_status = state.get("goals_status")
+    if not isinstance(goals_status, dict):
+        raise RuntimeError(
+            f"state file corrupt: {path}: goals_status must be a mapping"
+        )
+    stuck_counter = state.get("stuck_counter")
+    if not isinstance(stuck_counter, dict):
+        raise RuntimeError(
+            f"state file corrupt: {path}: stuck_counter must be a mapping"
+        )
     order = state.get("peer_order")
     if not isinstance(order, list) or not order:
         raise RuntimeError(
@@ -168,7 +208,11 @@ def _validate_state(state: dict[str, Any], path: Path) -> None:
             f"entries: {order}"
         )
     ti = state.get("turn_index")
-    if not isinstance(ti, int) or not (0 <= ti < len(order)):
+    if (
+        not isinstance(ti, int)
+        or isinstance(ti, bool)
+        or not (0 <= ti < len(order))
+    ):
         raise RuntimeError(
             f"state file corrupt: {path}: turn_index must be int in "
             f"[0, {len(order)}), got {ti!r}"
@@ -246,8 +290,12 @@ class StateStore:
         return copy.deepcopy(DEFAULT_STATE)
 
     def load(self) -> dict[str, Any]:
-        if not self.path.exists():
+        try:
+            existing = self.path.lstat()
+        except FileNotFoundError:
             return self._empty_default()
+        if stat.S_ISLNK(existing.st_mode):
+            raise OSError(f"refusing symlinked state file: {self.path}")
         try:
             data = read_bytes_no_symlink(
                 self.path, max_bytes=_STATE_FILE_MAX_BYTES + 1
@@ -307,7 +355,7 @@ class StateStore:
             loaded = _migrate_v1(loaded)
             migrated = True
 
-        base = self._empty_default()
+        base = _default_state_for_overlay(loaded, self._cfg_peer_order)
         # The defaults' peer_order may not match the loaded order; we want
         # the loaded order to win. Merge non-destructively.
         state = _deep_merge(base, loaded)
@@ -343,6 +391,10 @@ class StateStore:
         to_write = {k: v for k, v in state.items()
                     if not k.startswith("_")}
         to_write.setdefault("schema_version", SCHEMA_VERSION)
+        to_write = _deep_merge(
+            _default_state_for_overlay(to_write, self._cfg_peer_order),
+            to_write,
+        )
         # M6: validate before writing. Refuse to persist corrupt
         # state — otherwise the user can't run peers at all next
         # time without manually editing the file.

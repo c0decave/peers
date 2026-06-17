@@ -9,6 +9,7 @@ import sys
 from typing import Any
 
 from peers.driver_helpers import _format_tick_status
+from peers.driver_host import _DriverHost
 from peers.health_guard import RunResult
 from peers.safe_io import (
     _ensure_private_dir,
@@ -18,7 +19,113 @@ from peers.safe_io import (
 )
 
 
-class DriverObservabilityMixin:
+# Wave-2 §5.2: cap the per-tick gates snapshot so a project with an absurd
+# number of gates can never bloat a single runs.jsonl line. Counts hard + soft
+# entries combined; beyond the cap the snapshot is truncated (deterministic by
+# sorted gate-id) and flagged with a "_truncated" marker.
+_GATES_SNAPSHOT_MAX_ENTRIES = 200
+
+# Defensive: any single gate-id longer than this is skipped (a gate-id is a
+# short slug in practice; an oversized one signals a corrupt/hostile source).
+_GATES_SNAPSHOT_MAX_ID_LEN = 200
+
+
+def _build_gates_snapshot(
+    goals_status: Any,
+    soft_status: Any,
+    soft_needed: dict[str, int],
+) -> dict[str, Any] | None:
+    """Build a compact, bounded ``{"hard": {...}, "soft": {...}}`` snapshot of
+    this tick's gate stand from the IN-MEMORY results the driver already
+    computed — never recompute, never shell.
+
+    Shape (compact by design):
+      ``hard``: ``{gate_id: "pass"|"fail"|"unknown"}`` from ``goals_status[gid].state``.
+      ``soft``: ``{gate_id: "<count>/<needed>"}`` consensus from ``soft_status``.
+
+    Fail-closed contract: this is pure + total. It NEVER raises — a garbage
+    source (non-dict, non-dict entry, oversized id) is simply skipped. Returns
+    ``None`` when there is nothing trustworthy to record (so the caller omits
+    the field entirely rather than writing an empty map).
+
+    The result is bounded to :data:`_GATES_SNAPSHOT_MAX_ENTRIES` total entries
+    (hard preferred, then soft; both iterated in sorted gate-id order for
+    determinism). A truncated snapshot carries ``"_truncated": True``.
+    """
+    snap: dict[str, Any] = {}
+    remaining = _GATES_SNAPSHOT_MAX_ENTRIES
+    truncated = False
+
+    if isinstance(goals_status, dict):
+        hard: dict[str, str] = {}
+        for gid in sorted(goals_status.keys(), key=str):
+            if remaining <= 0:
+                truncated = True
+                break
+            info = goals_status.get(gid)
+            if not isinstance(info, dict):
+                continue
+            gid_s = str(gid)
+            if not gid_s or len(gid_s) > _GATES_SNAPSHOT_MAX_ID_LEN:
+                continue
+            st = info.get("state")
+            st_s = str(st) if st in ("pass", "fail") else "unknown"
+            hard[gid_s] = st_s
+            remaining -= 1
+        if hard:
+            snap["hard"] = hard
+
+    if isinstance(soft_status, dict):
+        soft: dict[str, str] = {}
+        for gid in sorted(soft_status.keys(), key=str):
+            if remaining <= 0:
+                truncated = True
+                break
+            entry = soft_status.get(gid)
+            if not isinstance(entry, dict):
+                continue
+            gid_s = str(gid)
+            if not gid_s or len(gid_s) > _GATES_SNAPSHOT_MAX_ID_LEN:
+                continue
+            try:
+                count = int(entry.get("consensus_count", 0) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            needed = soft_needed.get(gid_s, 2)
+            try:
+                needed = int(needed)
+            except (TypeError, ValueError):
+                needed = 2
+            # Defense in depth: a corrupt in-memory consensus_count (or a
+            # hostile soft_needed) could be an enormous int whose decimal
+            # rendering would blow past the per-line size bound. Clamp the
+            # magnitude to [0, 10**9] AFTER coercion, before building the
+            # "n/m" string — the numerator/denominator never exceed 10 digits.
+            count = max(0, min(count, 10**9))
+            needed = max(0, min(needed, 10**9))
+            soft[gid_s] = f"{count}/{needed}"
+            remaining -= 1
+        if soft:
+            snap["soft"] = soft
+
+    if not snap:
+        return None
+    if truncated:
+        snap["_truncated"] = True
+    return snap
+
+
+def _first_error_line(stderr: str, *, limit: int = 200) -> str:
+    """First non-empty stderr line, stripped + truncated, for inline tick-end
+    diagnostics on a failure classification. Empty string if stderr is blank."""
+    for raw in stderr.splitlines():
+        line = raw.strip()
+        if line:
+            return line if len(line) <= limit else line[: limit - 1] + "…"
+    return ""
+
+
+class DriverObservabilityMixin(_DriverHost):
     def _emit_tick_end(
         self, state: dict[str, Any], peer: str, run: RunResult,
         success: bool, tick_dt: int, head_after_sha: str | None,
@@ -34,9 +141,18 @@ class DriverObservabilityMixin:
             head_short = head_after_sha[:8]
         else:
             head_short = "no-new-commit"
+        # Surface the agent's own error inline on a failure classification, so an
+        # otherwise-opaque "process-fail head=no-new-commit dur=0s" names its cause
+        # (e.g. claude refusing --dangerously-skip-permissions as root) instead of
+        # hiding it in a per-tick .stderr.log the operator must go digging for.
+        reason = ""
+        if not success and run.classification != "success" and run.stderr:
+            snippet = _first_error_line(run.stderr)
+            if snippet:
+                reason = f" -- {snippet}"
         print(
             f"peers: tick {state['iteration']} {status_str} "
-            f"head={head_short} dur={tick_dt}s",
+            f"head={head_short} dur={tick_dt}s{reason}",
             file=sys.stderr, flush=True,
         )
         if self.verbose:
@@ -88,24 +204,58 @@ class DriverObservabilityMixin:
                 file=sys.stderr,
             )
 
+    #: the tee-stream file suffixes the Wave-2 live tee writes. These end in
+    #: ``.jsonl`` (NOT ``.log``), so they must be rotated as their OWN group with
+    #: the same threshold/cap as the ``.log`` group — otherwise a long run with
+    #: the tee enabled grows the directory without bound.
+    _PEER_TEE_STREAM_SUFFIXES = (".stream.jsonl", ".stream.err.jsonl")
+
     def _maybe_rotate_peer_logs(self) -> None:
-        """Gzip the oldest `.log` file once the directory grows past
-        the threshold. Defensive (best-effort): any error is silently
-        swallowed — this is a disk-budget safeguard, not a correctness
-        feature.
+        """Gzip the oldest file in each rotation group once that group grows
+        past the threshold. Two independent groups share the SAME
+        :data:`_PEER_LOG_ROTATE_THRESHOLD`:
+
+          * the per-tick ``tick-*.log`` stdout/stderr logs, and
+          * the Wave-2 live-tee ``tick-*.stream.jsonl`` /
+            ``tick-*.stream.err.jsonl`` streams (these end in ``.jsonl``, NOT
+            ``.log``, so without their own group they would never rotate).
+
+        Defensive (best-effort): any error is silently swallowed — this is a
+        disk-budget safeguard, not a correctness feature. The gzipped output
+        ends in ``.gz`` and so is never re-counted by either group's predicate.
         """
         dir_fd = -1
         try:
             dir_fd = _open_private_nested_dir_fd_no_symlink(
                 self.peer_dir, ("log", "peers"),
             )
-            logs = sorted(
-                name for name in os.listdir(dir_fd)
+            names = os.listdir(dir_fd)
+            log_group = sorted(
+                name for name in names
                 if name.startswith("tick-") and name.endswith(".log")
             )
-            if len(logs) <= self._PEER_LOG_ROTATE_THRESHOLD:
+            tee_group = sorted(
+                name for name in names
+                if name.startswith("tick-")
+                and name.endswith(self._PEER_TEE_STREAM_SUFFIXES)
+            )
+            self._rotate_oldest_in_group(dir_fd, log_group)
+            self._rotate_oldest_in_group(dir_fd, tee_group)
+        except Exception:
+            pass
+        finally:
+            if dir_fd >= 0:
+                os.close(dir_fd)
+
+    def _rotate_oldest_in_group(self, dir_fd: int, group: list[str]) -> None:
+        """Gzip + unlink the oldest file in ``group`` iff the group is over the
+        threshold. ``dir_fd`` is an already-opened (no-symlink) directory fd;
+        ``group`` is the sorted list of candidate names. Fail-soft: any error is
+        swallowed (best-effort disk-budget safeguard)."""
+        try:
+            if len(group) <= self._PEER_LOG_ROTATE_THRESHOLD:
                 return
-            oldest = logs[0]
+            oldest = group[0]
             gz_name = f"{oldest}.gz"
             src_fd = -1
             dst_fd = -1
@@ -145,9 +295,6 @@ class DriverObservabilityMixin:
             os.unlink(oldest, dir_fd=dir_fd)
         except Exception:
             pass
-        finally:
-            if dir_fd >= 0:
-                os.close(dir_fd)
 
     _VERBOSE_STDOUT_TAIL_LINES = 50
 
@@ -292,6 +439,27 @@ class DriverObservabilityMixin:
         ):
             if k in last:
                 entry[k] = last[k]
+        # Wave-2 §5.2: a compact, bounded per-tick gate snapshot so the gate
+        # stand of past ticks is reconstructable for the TUI history scrubber.
+        # Sourced from the SAME in-memory results the driver already computed
+        # this tick (state["goals_status"] + state["soft_status"]) — never
+        # recomputed, never shelled. Fail-CLOSED: any error omits the field and
+        # the tick is still logged (observability must never break a run).
+        try:
+            soft_needed = {
+                g.id: g.consensus_needed
+                for g in getattr(self, "goals", [])
+                if getattr(g, "type", None) == "soft"
+            }
+            gates_snapshot = _build_gates_snapshot(
+                state.get("goals_status"),
+                state.get("soft_status"),
+                soft_needed,
+            )
+            if gates_snapshot is not None:
+                entry["gates"] = gates_snapshot
+        except Exception:
+            pass  # fail-closed: omit the field, never break the tick.
         append_text_in_dir_no_symlink(
             log_dir, "runs.jsonl", json.dumps(entry) + "\n"
         )

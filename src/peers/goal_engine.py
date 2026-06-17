@@ -63,10 +63,14 @@ def _close_selector_streams(sel: selectors.BaseSelector) -> None:
             sel.unregister(stream)
         except Exception:
             pass
-        try:
-            stream.close()
-        except Exception:
-            pass
+        # fileobj is typed int | HasFileno; we only ever register IO streams,
+        # which carry .close(). A raw-int fileobj (no .close) is skipped.
+        close = getattr(stream, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
 
 def _run_goal_cmd(cmd: str, cwd: Path, timeout_s: int
@@ -121,13 +125,15 @@ def _run_goal_cmd(cmd: str, cwd: Path, timeout_s: int
                 time.sleep(0.05)
                 continue
             for key, _mask in events:
-                stream = key.fileobj
+                fobj = key.fileobj
+                if isinstance(fobj, int):
+                    continue  # we only register IO streams, never raw fds
                 try:
-                    chunk = os.read(stream.fileno(), 8192)
+                    chunk = os.read(fobj.fileno(), 8192)
                 except BlockingIOError:
                     continue
                 if not chunk:
-                    sel.unregister(stream)
+                    sel.unregister(fobj)
                     continue
                 if key.data == "stdout":
                     stdout_size, did_truncate = _append_capped(

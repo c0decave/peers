@@ -17,6 +17,7 @@ from peers.driver_orchestrator import (
     OrchestratorDriver,
     _AUTO_SKEPTIC_PROMPT_PREFIX,
 )
+from peers.goal_engine import GoalResult
 from peers.peer_spec import PeerSpec
 from peers.state_store import DEFAULT_STATE
 
@@ -32,10 +33,48 @@ def _init_repo(repo: Path) -> Path:
     return repo
 
 
-def _make_driver(tmp_path: Path, **kw) -> OrchestratorDriver:
+def _plan_with_convergence(n: int) -> str:
+    return (
+        "# Feature\n"
+        "## Meta\n"
+        "surfaces: [cli]\n"
+        "acceptance: false\n"
+        f"convergence_n: {n}\n"
+        "## Steps\n"
+        "- [ ] [STEP-1] do thing\n"
+        "  - touches: src/thing.py\n"
+    )
+
+
+def _make_driver(
+    tmp_path: Path,
+    *,
+    mode_name: str | None = None,
+    plan_convergence_n: int | None = None,
+    live_plan_convergence_n: int | None = None,
+    **kw,
+) -> OrchestratorDriver:
     repo = _init_repo(tmp_path / "repo")
     peer_dir = repo / ".peers"
     peer_dir.mkdir(mode=0o700)
+    if mode_name is not None:
+        (peer_dir / "modes-applied.txt").write_text(
+            f"2026-06-09T00:00:00+00:00 {mode_name} v1 sha256=test\n",
+            encoding="utf-8",
+        )
+    if plan_convergence_n is not None:
+        (peer_dir / "PLAN.original.md").write_text(
+            _plan_with_convergence(plan_convergence_n),
+            encoding="utf-8",
+        )
+        (repo / "PLAN.md").write_text(
+            _plan_with_convergence(
+                live_plan_convergence_n
+                if live_plan_convergence_n is not None
+                else plan_convergence_n
+            ),
+            encoding="utf-8",
+        )
     return OrchestratorDriver(
         repo=repo, peer_dir=peer_dir, goals=[],
         peer_specs=[
@@ -52,6 +91,10 @@ def _convergence_state() -> dict:
     s["iteration"] = 10
     s["consecutive_clean_ticks"] = 3
     return s
+
+
+def _hard_green_results() -> dict[str, GoalResult]:
+    return {"tests-pass": GoalResult("tests-pass", "pass", 1)}
 
 
 def test_default_auto_skeptic_is_enabled(tmp_path: Path) -> None:
@@ -257,3 +300,55 @@ def test_skeptic_prompt_prefix_constant_has_required_content() -> None:
     # Must close with an end marker so it's clearly delineated from the
     # tick's normal prompt body
     assert "END SKEPTIC HEADER" in _AUTO_SKEPTIC_PROMPT_PREFIX
+
+
+def test_implement_phase_a_honors_plan_convergence_n_BUG_509(
+    tmp_path: Path,
+) -> None:
+    """BUG-509: implement Phase A must use the operator's PLAN threshold."""
+    drv = _make_driver(
+        tmp_path,
+        mode_name="implement",
+        plan_convergence_n=3,
+    )
+    state = {"convergence_phase": "A", "consecutive_hard_green_ticks": 0}
+
+    for _ in range(3):
+        drv._update_two_phase_counters(state, _hard_green_results())
+
+    assert state["convergence_phase"] == "B"
+
+
+def test_implement_phase_a_prefers_frozen_plan_over_live_plan_BUG_509(
+    tmp_path: Path,
+) -> None:
+    """Edge: peers cannot shorten Phase A by editing live PLAN.md metadata."""
+    drv = _make_driver(
+        tmp_path,
+        mode_name="implement",
+        plan_convergence_n=3,
+        live_plan_convergence_n=1,
+    )
+    state = {"convergence_phase": "A", "consecutive_hard_green_ticks": 0}
+
+    drv._update_two_phase_counters(state, _hard_green_results())
+
+    assert state["convergence_phase"] == "A"
+
+
+def test_implement_phase_a_uses_default_when_plan_unparseable_BUG_509(
+    tmp_path: Path,
+) -> None:
+    """Sad path: bad plan metadata must not crash or promote early."""
+    drv = _make_driver(tmp_path, mode_name="implement")
+    (drv.peer_dir / "PLAN.original.md").write_text(
+        "# Broken\n## Meta\nsurfaces: []\n", encoding="utf-8"
+    )
+    state = {"convergence_phase": "A", "consecutive_hard_green_ticks": 0}
+
+    for _ in range(4):
+        drv._update_two_phase_counters(state, _hard_green_results())
+    assert state["convergence_phase"] == "A"
+
+    drv._update_two_phase_counters(state, _hard_green_results())
+    assert state["convergence_phase"] == "B"

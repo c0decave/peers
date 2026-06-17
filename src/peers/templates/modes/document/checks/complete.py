@@ -17,7 +17,7 @@ def main(project_dir: str = ".", codemap: str | None = None) -> int:
     except CodeMapError as e:
         print(f"complete FAIL: {e}")
         return 1
-    violations = check_complete(project_dir, cm)
+    violations = check_complete(Path(project_dir), cm)
     if violations:
         print(f"complete FAIL: {len(violations)} undocumented public symbol(s):")
         for s in violations[:50]:

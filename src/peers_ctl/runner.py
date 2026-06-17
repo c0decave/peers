@@ -21,16 +21,19 @@ import math
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, TypeGuard
 
 import yaml
 
 from peers.budget_accountant import OPERATOR_BUDGET_OVERRIDE_FILE
+from peers.graphify_mcp import GRAPHIFY_API_KEY_ENV, GRAPHIFY_ENDPOINT_ENV
+from peers.graphify_sidecar import build_graph, new_api_key, serve_cmd
 from peers.model_provider import (
     OPENROUTER_EXTRA_HOST_RE,
     required_peer_runtime_env_keys,
@@ -43,7 +46,6 @@ from peers.safe_io import (
     open_text_no_symlink,
     read_bytes_under_root_no_follow,
     read_text_under_root_no_follow,
-    read_text_no_symlink,
 )
 from peers_ctl.store import Project, Store, is_pid_alive
 
@@ -51,6 +53,13 @@ from peers_ctl.store import Project, Store, is_pid_alive
 PEERS_CMD = os.environ.get("PEERS_CTL_PEERS_BIN", "peers")
 CONTAINER_IMAGE = os.environ.get("PEERS_CTL_IMAGE", "peers:dev")
 PODMAN_CMD = os.environ.get("PEERS_CTL_PODMAN_BIN", "podman")
+# Opt-in caged graphify MCP. A global kill-switch forces it off regardless of
+# per-project config (defense in depth -- one env var disables it fleet-wide).
+GRAPHIFY_DISABLED = os.environ.get("PEERS_CTL_NO_GRAPHIFY", "") not in ("", "0", "false")
+_GRAPHIFY_SERVE_PORT = 8080  # host mode: in-container port, published to a free host port
+# Container mode binds the SHARED egress-proxy netns loopback, where the
+# auth-proxy already holds 8080 (AUTH_PROXY_PORT) -> graphify needs a distinct port.
+_GRAPHIFY_CONTAINER_PORT = 8645
 # On some hosts (e.g. when /dev/net/tun is missing) pasta — podman's
 # default rootless network backend — fails to set up. Override via
 # PEERS_CTL_PODMAN_NETWORK=host to bypass (the peers loop doesn't
@@ -109,6 +118,13 @@ AUTH_PROXY_DISABLED = _parse_truthy_env(
 )
 AUTH_PROXY_PORT = 8080
 AUTH_PROXY_URL = f"http://127.0.0.1:{AUTH_PROXY_PORT}"
+# Non-secret placeholder bearer handed to the workspace in auth-proxy mode. The
+# claude CLI refuses to issue any request when it has no credential at all
+# (apiKeySource "none" -> "Not logged in"), so ANTHROPIC_BASE_URL alone is inert.
+# The sidecar STRIPS this header and injects the real OAuth token, so the value
+# is intentionally not a real credential — podman argv is ps-visible and the
+# workspace is the untrusted side.
+AUTH_PROXY_PLACEHOLDER_TOKEN = "peers-auth-proxy-placeholder"
 
 
 @contextmanager
@@ -214,6 +230,40 @@ def check_container_version_drift() -> tuple[str, str]:
 # warn to error for these modes. Operator can override via PEERS_CTL_ALLOW_DRIFT=1.
 _DRIFT_REFUSE_MODES = frozenset({"audit", "thorough"})
 _MODES_APPLIED_MAX_BYTES = 512 * 1024
+_PROJECT_CONFIG_MAX_BYTES = 512 * 1024
+
+
+def _read_project_config_text(project: Project) -> str | None:
+    """Read ``<project>/.peers/config.yaml`` without following ancestors.
+
+    ``read_text_no_symlink(project/.peers/config.yaml)`` only protects the
+    final ``config.yaml`` leaf. Controller start-time decisions also trust the
+    ``.peers`` ancestor, so route through the same dir-fd walker used for
+    state/mode files and reject symlinked ancestors before parsing config.
+    """
+    project_path = Path(project.path)
+    display = project_path / ".peers" / "config.yaml"
+    try:
+        raw = read_bytes_under_root_no_follow(
+            project_path,
+            [".peers", "config.yaml"],
+            max_bytes=_PROJECT_CONFIG_MAX_BYTES + 1,
+        )
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise ValueError(f"unsafe project config {display}: {e}") from e
+    if len(raw) > _PROJECT_CONFIG_MAX_BYTES:
+        raise ValueError(
+            f"unsafe project config {display}: exceeds "
+            f"{_PROJECT_CONFIG_MAX_BYTES} bytes"
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(
+            f"unsafe project config {display}: invalid UTF-8: {e}"
+        ) from e
 
 
 def _read_project_modes_applied(project) -> list[str]:
@@ -413,9 +463,19 @@ def _auth_proxy_container_name(project: Project) -> str:
     return f"peers-auth-proxy_{suffix}"
 
 
-def _auth_proxy_enabled(home: Path | None = None) -> bool:
+def _auth_proxy_token_file(home: Path | None = None) -> Path | None:
     home = home or Path.home()
-    return (not AUTH_PROXY_DISABLED) and (home / ".claude.json").is_file()
+    relocated = home / ".claude" / ".credentials.json"
+    if relocated.is_file():
+        return relocated
+    legacy = home / ".claude.json"
+    if legacy.is_file():
+        return legacy
+    return None
+
+
+def _auth_proxy_enabled(home: Path | None = None) -> bool:
+    return (not AUTH_PROXY_DISABLED) and _auth_proxy_token_file(home) is not None
 
 
 def _auth_proxy_was_used(project: Project) -> bool:
@@ -429,13 +489,11 @@ def _project_uses_openrouter(project: Project) -> bool:
 
 def _load_project_peer_specs(project: Project):
     cfg_path = Path(project.path) / ".peers" / "config.yaml"
-    if not cfg_path.exists():
+    raw = _read_project_config_text(project)
+    if raw is None:
         return None
     try:
-        raw = read_text_no_symlink(cfg_path)
         cfg = yaml.safe_load(raw)
-    except OSError as e:
-        raise ValueError(f"cannot read {cfg_path}: {e}") from e
     except yaml.YAMLError as e:
         raise ValueError(f"cannot parse {cfg_path}: {e}") from e
     if not isinstance(cfg, dict):
@@ -446,10 +504,134 @@ def _load_project_peer_specs(project: Project):
         raise ValueError(f"invalid peer config {cfg_path}: {e}") from e
 
 
+# Operator-declared egress allow-list (config `egress_allow:`). Bounded to
+# limit blast radius from typos or a config that widens egress too far.
+_MAX_EGRESS_ALLOW = 64
+_MAX_EGRESS_HOST_LEN = 256
+
+
+def _config_egress_allow(project: Project) -> tuple[str, ...]:
+    """Extra egress allow-list (tinyproxy host regexes) declared by the project
+    in ``.peers/config.yaml`` ``egress_allow: [..]`` -- e.g. an RFC editor or a
+    research source the peers may reach. FAIL-CLOSED: a missing/malformed value
+    yields no extra hosts (a parse error must never silently widen egress).
+    Entries containing a comma or newline are dropped so one entry cannot
+    smuggle additional filter lines through the comma-joined env var."""
+    try:
+        raw = _read_project_config_text(project)
+        if raw is None:
+            return ()
+        cfg = yaml.safe_load(raw)
+    except (ValueError, yaml.YAMLError):
+        return ()
+    if not isinstance(cfg, dict):
+        return ()
+    raw = cfg.get("egress_allow")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        print(
+            "peers-ctl: warning: egress_allow must be a list of host-regex "
+            "strings; ignoring",
+            file=sys.stderr,
+        )
+        return ()
+    hosts: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        host = entry.strip()
+        if not host or len(host) > _MAX_EGRESS_HOST_LEN:
+            continue
+        if "," in host or "\n" in host:
+            continue
+        hosts.append(host)
+    return tuple(hosts[:_MAX_EGRESS_ALLOW])
+
+
+_EGRESS_ALLOW_TRUST_NOTE = "egress_allow_sha256"
+
+
+def _notes_value(notes: str | None, key: str) -> str | None:
+    prefix = f"{key}="
+    for token in (notes or "").split():
+        if token.startswith(prefix):
+            return token.split("=", 1)[1] or None
+    return None
+
+
+def _notes_with_value(notes: str | None, key: str, value: str) -> str:
+    prefix = f"{key}="
+    tokens = [
+        token for token in (notes or "").split()
+        if not token.startswith(prefix)
+    ]
+    tokens.append(f"{key}={value}")
+    return " ".join(tokens)
+
+
+def _egress_allow_digest(hosts: tuple[str, ...]) -> str:
+    payload = json.dumps(list(hosts), separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _egress_trust_note_suffix(project: Project) -> str:
+    digest = _notes_value(project.notes, _EGRESS_ALLOW_TRUST_NOTE)
+    return f" {_EGRESS_ALLOW_TRUST_NOTE}={digest}" if digest else ""
+
+
+def _ensure_config_trusted_for_egress(
+    store: Store,
+    project: Project,
+    *,
+    force: bool = False,
+    trust_egress_allow: bool = False,
+) -> Project:
+    """Require host-side review before project config widens container egress.
+
+    `.peers/config.yaml` is deliberately project-local and gitignored, so peers
+    can edit it while the egress proxy is the containment layer. Treating
+    `egress_allow` as trusted merely because it appears in that file lets a
+    prompt-injected peer persist a wider network policy for the next container
+    start. A non-empty allow-list therefore needs an exact digest in the
+    host-owned registry notes; `--trust-egress-allow` records that digest after
+    the operator has reviewed the config. `--force` deliberately remains scoped
+    to the budget/sentinel preflight and does not trust network policy.
+    """
+    _ = force
+    hosts = _config_egress_allow(project)
+    if not hosts:
+        return project
+    digest = _egress_allow_digest(hosts)
+    trusted = _notes_value(project.notes, _EGRESS_ALLOW_TRUST_NOTE)
+    if trusted == digest:
+        return project
+    if not trust_egress_allow:
+        if trusted:
+            raise ValueError(
+                "egress_allow in .peers/config.yaml changed since the "
+                "host-side review; review the current allow-list and rerun "
+                "`peers-ctl start --container --trust-egress-allow` to trust it."
+            )
+        raise ValueError(
+            "egress_allow in .peers/config.yaml is not yet trusted by the "
+            "host registry; review the current allow-list and rerun "
+            "`peers-ctl start --container --trust-egress-allow` to trust it."
+        )
+    return store.update(
+        project.name,
+        notes=_notes_with_value(
+            project.notes, _EGRESS_ALLOW_TRUST_NOTE, digest,
+        ),
+    )
+
+
 def _egress_extra_allow_hosts(project: Project) -> tuple[str, ...]:
+    hosts: list[str] = []
     if _project_uses_openrouter(project):
-        return (OPENROUTER_EXTRA_HOST_RE,)
-    return ()
+        hosts.append(OPENROUTER_EXTRA_HOST_RE)
+    hosts.extend(_config_egress_allow(project))
+    return tuple(hosts)
 
 
 def _require_openrouter_env_for_container(project: Project) -> None:
@@ -473,6 +655,53 @@ def _project_provider_env_keys(project: Project) -> tuple[str, ...]:
     if not specs:
         return ()
     return required_peer_runtime_env_keys(specs)
+
+
+def _project_has_native_claude_peer(project: Project) -> bool:
+    """True iff the project configures a peer that runs the native `claude` CLI
+    (which authenticates via the in-container auth-proxy). An openrouter-claude
+    peer talks to openrouter directly, NOT the proxy, so it does not count."""
+    try:
+        specs = _load_project_peer_specs(project)
+    except ValueError:
+        return False
+    if not specs:
+        return False
+    for spec in specs:
+        argv = tuple(getattr(spec, "argv", ()) or ())
+        provider = (getattr(spec, "provider", None) or "anthropic").lower()
+        if argv and argv[0] == "claude" and provider != "openrouter":
+            return True
+    return False
+
+
+def _ensure_claude_can_authenticate_for_container(
+    project: Project, *, skip: bool = False, _smoke=None,
+) -> None:
+    """Preflight: if a native-claude peer is configured for a --container run,
+    prove claude actually authenticates IN the container before launching.
+
+    The container auth-proxy path fails SILENTLY: a broken claude auth just
+    degrades the peer a few ticks in and the run continues single-peer — the
+    v26 internal testing lost its entire claude side this way and ran codex-solo for
+    hours. A live claude smoke here turns that into a loud, pre-launch refusal.
+    `--skip-claude-smoke` bypasses it (e.g. transient network)."""
+    if skip:
+        return
+    if not _project_has_native_claude_peer(project):
+        return
+    if _smoke is None:
+        from peers_ctl.doctor import probe_claude_smoke
+        _smoke = probe_claude_smoke
+    result = _smoke()
+    if getattr(result, "status", None) != "OK":
+        detail = getattr(result, "value", "") or "claude did not reply"
+        raise ValueError(
+            f"project {project.name!r} configures a claude peer but the "
+            f"in-container claude smoke failed: {detail}. Fix claude auth "
+            f"(check `peers-ctl doctor --claude-smoke`) or rerun "
+            f"`peers-ctl start --container --skip-claude-smoke` to bypass."
+        )
 
 
 def _build_proxy_argv(project: Project) -> list[str]:
@@ -515,6 +744,17 @@ def _build_proxy_argv(project: Project) -> list[str]:
         # (rc=126) — the full-isolation start was unusable.
         "--userns=keep-id",
         "--cap-drop=ALL",
+        # NET_ADMIN: the entrypoint installs an in-netns firewall lockdown that
+        #   forces ALL egress through tinyproxy. Without it the joined main
+        #   container has the proxy netns's open default route and bypasses the
+        #   allow-list by clearing HTTP_PROXY.
+        # SETUID/SETGID: the entrypoint starts as (mapped, unprivileged) root to
+        #   run iptables, then `su-exec`s down to the tinyproxy uid for the
+        #   long-lived daemon. cap-drop=ALL above means these three are the ONLY
+        #   capabilities this security component holds.
+        "--cap-add=NET_ADMIN",
+        "--cap-add=SETUID",
+        "--cap-add=SETGID",
         "--security-opt=no-new-privileges",
         "--read-only",
         # B108 here is a container-internal mount destination, not a
@@ -527,6 +767,12 @@ def _build_proxy_argv(project: Project) -> list[str]:
         # this container because tinyproxy is the only principal.
         "--tmpfs", "/run/tinyproxy:rw,nosuid,nodev,size=4m,mode=1777",
         "--pids-limit=128",
+        # Stamp the allow-list this proxy was built for. A later start compares
+        # this against the current config and recreates the proxy on drift, so a
+        # changed `egress_allow` is never silently ignored by a reused sidecar
+        #.
+        f"--label=peers.egress_allow_digest="
+        f"{_egress_allow_digest(_egress_extra_allow_hosts(project))}",
     ]
     # Code-review C1: explicit dedicated network mode for the proxy.
     # NEVER inherit PEERS_CTL_PODMAN_NETWORK (which the operator may
@@ -552,8 +798,7 @@ def _build_auth_proxy_argv(project: Project, home: Path | None = None) -> list[s
     # (key `claudeAiOauth`). Prefer the relocated file when present; fall back
     # to the legacy path for older clients. The proxy always reads it at the
     # fixed in-container path /auth/.claude.json, so only the host source moves.
-    relocated = home / ".claude" / ".credentials.json"
-    token_file = relocated if relocated.is_file() else home / ".claude.json"
+    token_file = _auth_proxy_token_file(home) or home / ".claude.json"
     # Run as the invoking host uid (= the token-file owner). Under
     # --userns=keep-id the default container user is NOT the token owner, and
     # with cap-drop=ALL it lacks CAP_DAC_OVERRIDE, so it cannot read the
@@ -606,12 +851,60 @@ def _build_auth_proxy_argv(project: Project, home: Path | None = None) -> list[s
     return argv
 
 
+def _proxy_egress_digest(name: str) -> str | None:
+    """Read the `peers.egress_allow_digest` label off a running proxy
+    container, or None if absent/unreadable. Used to detect that a reused
+    sidecar was built for a different (stale) egress allow-list."""
+    try:
+        r = subprocess.run(
+            [PODMAN_CMD, "inspect", "--type", "container",
+             "--format", "{{index .Config.Labels \"peers.egress_allow_digest\"}}",
+             name],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    value = (r.stdout or "").strip()
+    # podman prints "<no value>" for a missing label key.
+    if not value or value == "<no value>":
+        return None
+    return value
+
+
+def _run_proxy_container(project: Project) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        _build_proxy_argv(project),
+        stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, check=False,
+    )
+
+
+def _proxy_is_live(name: str) -> bool:
+    """True iff the proxy container is still running shortly after launch.
+    `podman run -d` returns 0 once the container is *created*, even if its
+    entrypoint then exits non-zero — which is exactly what the fail-closed
+    egress lockdown does when it cannot install the firewall. Poll briefly so
+    a clean (slightly-delayed) start is not mistaken for a crash."""
+    for _ in range(6):
+        if _container_running(name):
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def _ensure_egress_proxy_running(project: Project) -> None:
     """Phase-2 hardening B2: ensure the egress-proxy sidecar is up
     before launching the main peers container. The main container
     will use `--network=container:<proxy_name>` and would otherwise
     refuse to start if the proxy is missing. Idempotent on multiple
     calls. No-op when EGRESS_PROXY_DISABLED.
+
+    A reused sidecar must match the CURRENT egress allow-list: if a running
+    proxy was built for a different `egress_allow` (digest drift), it is
+    stopped and recreated. Otherwise a config change would be silently ignored
+    and the proxy would 403 the operator's newly-allowlisted hosts.
 
     Raises RuntimeError with an actionable message when the proxy
     image is missing or fails to start — better than letting the main
@@ -622,15 +915,29 @@ def _ensure_egress_proxy_running(project: Project) -> None:
         return
     pname = _proxy_container_name(project)
     if _container_running(pname):
-        return
+        want = _egress_allow_digest(_egress_extra_allow_hosts(project))
+        if _proxy_egress_digest(pname) == want:
+            return
+        # Drift: the running proxy enforces a different allow-list. Recreate it
+        # so the new policy actually takes effect.
+        _stop_egress_proxy_best_effort(project)
     _cleanup_stale_container(pname)
-    run = subprocess.run(
-        _build_proxy_argv(project),
-        stdin=subprocess.DEVNULL,
-        capture_output=True, text=True, check=False,
-    )
+    run = _run_proxy_container(project)
     if run.returncode == 0:
-        return
+        if _proxy_is_live(pname):
+            return
+        # `podman run -d` succeeded but the container is already gone: the
+        # entrypoint's fail-closed egress lockdown aborts the proxy when it
+        # cannot install the firewall (e.g. the host denies rootless
+        # CAP_NET_ADMIN for the proxy netns). Refuse loudly rather than let the
+        # main container join a dead netns with an opaque "no such container".
+        raise RuntimeError(
+            f"egress proxy ({pname}) exited immediately after start — it "
+            f"refuses to run without its egress lockdown (the container needs "
+            f"rootless CAP_NET_ADMIN for its network namespace). Check "
+            f"`podman logs {pname}`; do NOT set PEERS_CTL_NO_EGRESS_PROXY=1 "
+            f"unless you accept unfiltered container egress."
+        )
     # Code-review C3: between `_container_running()` and `podman run`
     # a concurrent peers-ctl start can win the race; we get "name in
     # use". Recover by re-probing — if the proxy is now running, the
@@ -728,9 +1035,190 @@ def _stop_auth_proxy_best_effort(project: Project) -> None:
         pass
 
 
+# --- graphify MCP sidecar (opt-in, caged, fail-open; mirrors the proxies) ---
+
+
+def _graphify_container_name(project: Project) -> str:
+    """Stable per-project graphify sidecar name. Distinct prefix from the main
+    + proxy containers so `peers-ctl stop` can find and reap all of them."""
+    main = _container_name(project)
+    suffix = main[len("peers-ctl_"):] if main.startswith("peers-ctl_") else main
+    return f"peers-graphify_{suffix}"
+
+
+def _graphify_enabled(project: Project) -> bool:
+    """True iff the project opts into the caged graphify MCP (config.yaml
+    ``graphify_mcp: true``). Off by default; PEERS_CTL_NO_GRAPHIFY forces off."""
+    if GRAPHIFY_DISABLED:
+        return False
+    try:
+        raw = _read_project_config_text(project)
+        if raw is None:
+            return False
+        cfg = yaml.safe_load(raw)
+    except (ValueError, yaml.YAMLError):
+        return False
+    # same bug class as BUG-760 (goals.py) — `bool(cfg.get(..., False))`
+    # truth-coerces quoted `'false'` to True, silently starting the caged
+    # sidecar an operator meant to keep off. Strict identity instead: only
+    # the real boolean True enables the opt-in; any other scalar (string,
+    # int, None) falls back to disabled. Fail-open path so we don't raise,
+    # we just refuse to enable on an unrecognised value.
+    if not isinstance(cfg, dict):
+        return False
+    return cfg.get("graphify_mcp") is True
+
+
+def _free_loopback_port() -> int:
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
+
+
+def _ensure_graphify_serve_host(project: Project) -> tuple[str, str] | None:
+    """Build the caged graph and start a host-published graphify serve sidecar.
+
+    Returns ``(endpoint, api_key)`` for the driver's env, or ``None`` on any
+    failure (FAIL-OPEN: a missing podman/image/graph must never block the run).
+    The api key reaches the sidecar via the podman subprocess env, so it never
+    appears in any argv (ps-invisible).
+    """
+    try:
+        if not _graphify_enabled(project):
+            return None
+        out_dir = Path(project.path) / ".peers" / "graphify"
+        graph = build_graph(Path(project.path), out_dir)
+        if graph is None:
+            return None
+        name = _graphify_container_name(project)
+        _cleanup_stale_container(name)
+        api_key = new_api_key()
+        port = _free_loopback_port()
+        cmd = serve_cmd(
+            graph, name=name, port=_GRAPHIFY_SERVE_PORT,
+            publish=f"127.0.0.1:{port}:{_GRAPHIFY_SERVE_PORT}",
+            bind_host="0.0.0.0",
+        )
+        run = subprocess.run(
+            cmd,
+            env={**os.environ, GRAPHIFY_API_KEY_ENV: api_key},
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            check=False,
+        )
+        if run.returncode != 0:
+            print(
+                "peers-ctl: warning: graphify serve sidecar failed to start "
+                f"(rc={run.returncode}); continuing without graph: "
+                f"{(run.stderr or '').strip()[:200]}",
+                file=sys.stderr,
+            )
+            _stop_graphify_best_effort(project)
+            return None
+        return f"http://127.0.0.1:{port}/mcp", api_key
+    except Exception as e:  # fail-open: never block a run on the accelerator
+        print(
+            "peers-ctl: warning: graphify serve host error "
+            f"(continuing without graph): {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _stop_graphify_best_effort(project: Project) -> None:
+    """Tear down the project's graphify sidecar if running. Best-effort: a
+    leftover (caged, --rm) sidecar is preferable to a stop-failure that breaks
+    the operator's recovery path; the next start reaps it by name."""
+    name = _graphify_container_name(project)
+    if not _container_running(name):
+        return
+    try:
+        subprocess.run(
+            [PODMAN_CMD, "stop", "-t", "2", name],
+            capture_output=True, timeout=15, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
+def _peer_netns_head(project: Project) -> str | None:
+    """The container whose netns the main peer container joins -- so a graphify
+    sidecar must join the SAME one to be reachable on the shared loopback: the
+    egress proxy in the hardened default, the auth proxy when egress is off, or
+    None when the peer owns its own netns (nothing to attach to => caller
+    fail-opens). Mirrors the netns block in _peer_container_runtime_flags."""
+    if not EGRESS_PROXY_DISABLED:
+        return _proxy_container_name(project)
+    if _auth_proxy_enabled():
+        return _auth_proxy_container_name(project)
+    return None
+
+
+def _ensure_graphify_serve_container(project: Project) -> tuple[str, str] | None:
+    """Build the caged graph and start a graphify serve sidecar that JOINS the
+    peer's netns chain (egress/auth proxy head), so the in-container peers reach
+    it on the shared loopback -- at a port distinct from the proxies'. Returns
+    ``(endpoint, api_key)`` or ``None`` (FAIL-OPEN). The api key reaches the
+    sidecar via the podman subprocess env, never via argv (ps-invisible).
+    """
+    try:
+        if not _graphify_enabled(project):
+            return None
+        head = _peer_netns_head(project)
+        if head is None:
+            print(
+                "peers-ctl: warning: graphify needs a proxy netns to share in "
+                "container mode; none active -> continuing without graph",
+                file=sys.stderr,
+            )
+            return None
+        if not _container_running(head):
+            return None
+        out_dir = Path(project.path) / ".peers" / "graphify"
+        graph = build_graph(Path(project.path), out_dir)
+        if graph is None:
+            return None
+        name = _graphify_container_name(project)
+        _cleanup_stale_container(name)
+        api_key = new_api_key()
+        cmd = serve_cmd(
+            graph, name=name, port=_GRAPHIFY_CONTAINER_PORT,
+            network=f"container:{head}", userns=f"container:{head}",
+            bind_host="127.0.0.1",
+        )
+        run = subprocess.run(
+            cmd,
+            env={**os.environ, GRAPHIFY_API_KEY_ENV: api_key},
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            check=False,
+        )
+        if run.returncode != 0:
+            print(
+                "peers-ctl: warning: graphify serve sidecar failed to start "
+                f"(rc={run.returncode}); continuing without graph: "
+                f"{(run.stderr or '').strip()[:200]}",
+                file=sys.stderr,
+            )
+            _stop_graphify_best_effort(project)
+            return None
+        return f"http://127.0.0.1:{_GRAPHIFY_CONTAINER_PORT}/mcp", api_key
+    except Exception as e:  # fail-open: never block a run on the accelerator
+        print(
+            "peers-ctl: warning: graphify serve container error "
+            f"(continuing without graph): {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _build_container_argv(project: Project,
                           max_ticks: int | None,
-                          extra_args: Sequence[str]) -> list[str]:
+                          extra_args: Sequence[str],
+                          *,
+                          graphify: tuple[str, str] | None = None,
+                          peers_subcmd: Sequence[str] | None = None) -> list[str]:
     """Compose a `podman run -d` invocation that drives the substrate
     inside the peers:dev image. The container mounts:
       - the target repo at /work
@@ -754,7 +1242,14 @@ def _build_container_argv(project: Project,
     # sidecar's netns it must share THAT sidecar's userns (so it owns the
     # netns and can mount sysfs); only when it owns its own netns does it
     # mint keep-id.
-    argv += _peer_container_runtime_flags(project)
+    argv += _peer_container_runtime_flags(project, graphify=graphify)
+    if peers_subcmd is not None:
+        # Non-loop mode (e.g. `peers research /work ...`): run an explicit peers
+        # subcommand instead of the default `peers run` loop, reusing ALL the
+        # container plumbing above. The subcmd carries its own args, so neither
+        # --max-ticks nor extra_args are injected.
+        argv += [CONTAINER_IMAGE, *peers_subcmd]
+        return argv
     argv += [CONTAINER_IMAGE, "run"]
     if max_ticks is not None:
         argv += ["--max-ticks", str(max_ticks)]
@@ -762,10 +1257,16 @@ def _build_container_argv(project: Project,
     return argv
 
 
-def _peer_container_runtime_flags(project: Project) -> list[str]:
+def _peer_container_runtime_flags(
+    project: Project, *, graphify: tuple[str, str] | None = None,
+) -> list[str]:
     """The shared podman flags + mounts + auth/netns wiring for a peer
     container — everything between ``podman run [-d] --rm --name N`` and
     the image reference.
+
+    ``graphify=(endpoint, api_key)`` threads the opt-in graphify MCP env into
+    the container (endpoint inlined; key INHERITED via ``-e GRAPHIFY_API_KEY``
+    so it never enters argv). ``None`` => byte-identical to a no-graphify run.
 
     Extracted from :func:`_build_container_argv` so the ``peers-ctl
     doctor --claude-smoke`` probe can launch a throwaway claude in a
@@ -809,9 +1310,15 @@ def _peer_container_runtime_flags(project: Project) -> list[str]:
         # claude/codex runs that never touch it).
         "--tmpfs", "~/.local/state:rw,nosuid,nodev,size=64m",
         "-v", f"{Path(project.path).resolve()}:/work",
-        "-v", f"{home / '.claude'}:~/.claude",
         "-v", f"{home / '.codex'}:~/.codex",
     ]
+    if auth_proxy:
+        # current Claude Code stores the OAuth credential inside
+        # ~/.claude/.credentials.json. In auth-proxy mode the workspace must
+        # get an empty writable config dir, not the host credential directory.
+        flags += ["--tmpfs", "~/.claude:rw,nosuid,nodev,size=16m"]
+    else:
+        flags += ["-v", f"{home / '.claude'}:~/.claude"]
     # Optional `opencode` peer: mount its config (model defaults / provider
     # setup) and credentials so it can authenticate inside --container, the
     # same way ~/.claude and ~/.codex are mounted. Conditional because opencode
@@ -869,8 +1376,22 @@ def _peer_container_runtime_flags(project: Project) -> list[str]:
         ]
     if auth_proxy:
         flags += ["-e", f"ANTHROPIC_BASE_URL={AUTH_PROXY_URL}"]
+        # ANTHROPIC_BASE_URL alone is inert: the claude CLI gates on having a
+        # credential before it issues any request, so without a token it prints
+        # "Not logged in" and never reaches the sidecar. Hand it a NON-SECRET
+        # placeholder bearer so it authenticates locally and routes through the
+        # proxy, which strips this header and injects the real OAuth token.
+        flags += ["-e", f"ANTHROPIC_AUTH_TOKEN={AUTH_PROXY_PLACEHOLDER_TOKEN}"]
     for env_key in _project_provider_env_keys(project):
         flags += ["-e", env_key]
+    if graphify is not None:
+        endpoint, _api_key = graphify
+        # endpoint is not secret (inline); the key is INHERITED from the podman
+        # launch env (-e GRAPHIFY_API_KEY, no value) so it never enters argv.
+        flags += [
+            "-e", f"{GRAPHIFY_ENDPOINT_ENV}={endpoint}",
+            "-e", GRAPHIFY_API_KEY_ENV,
+        ]
     return flags
 
 
@@ -935,7 +1456,7 @@ def _read_state(project: Project) -> dict[str, Any] | None:
             Path(project.path), [".peers", "state.json"],
         )
         state = json.loads(raw)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
     return state if isinstance(state, dict) else None
 
@@ -1000,7 +1521,12 @@ def _persist_budget_override(project: Project, **caps: int) -> None:
         )
         if isinstance(loaded, dict):
             existing = loaded
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # json.loads raises RecursionError (not a ValueError
+        # subclass) on a sufficiently deep malformed JSON array; treat
+        # it as malformed input and fall back to existing={} so a
+        # pre-staged deep `.peers/budget-overrides.json` cannot crash
+        # `peers-ctl start` before the operator's caps are applied.
         existing = {}
     existing.update(caps)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1162,6 +1688,11 @@ def _start_container_streamer(log_path: Path, cid: str) -> subprocess.Popen:
 def _start_project_container(
     store: Store, project: Project, log_path: Path,
     max_ticks: int | None, max_usd: float | None, extra_args: Sequence[str],
+    *,
+    force: bool = False,
+    trust_egress_allow: bool = False,
+    skip_claude_smoke: bool = False,
+    peers_subcmd: Sequence[str] | None = None,
 ) -> int:
     cname = _container_name(project)
     if _container_running(cname):
@@ -1175,6 +1706,15 @@ def _start_project_container(
     if drift_level == "warn" and drift_msg:
         print(f"peers-ctl: warning: {drift_msg}", file=sys.stderr)
     _require_openrouter_env_for_container(project)
+    project = _ensure_config_trusted_for_egress(
+        store, project, force=force, trust_egress_allow=trust_egress_allow,
+    )
+    # v26 lesson: a claude peer that cannot authenticate in-container degrades
+    # silently and the run continues codex-solo. Prove it can auth BEFORE we
+    # spin up the real sidecars (the smoke uses its own throwaway sidecars).
+    _ensure_claude_can_authenticate_for_container(
+        project, skip=skip_claude_smoke,
+    )
     _cleanup_stale_container(cname)
     try:
         # Phase-2 hardening B2: bring the egress-proxy sidecar up FIRST,
@@ -1183,19 +1723,30 @@ def _start_project_container(
         # Phase 14: auth proxy joins the same namespace and owns
         # ~/.claude.json, keeping credentials out of the workspace.
         _ensure_auth_proxy_running(project)
+        # Opt-in caged graphify MCP: build + start the serve sidecar joining the
+        # proxy netns chain, then thread its endpoint+key into the main
+        # container (fail-open: None => no graphify, byte-identical).
+        graphify = _ensure_graphify_serve_container(project)
         run = subprocess.run(
             _build_container_argv(
                 project, max_ticks, _run_extra_args(max_usd, extra_args),
+                graphify=graphify, peers_subcmd=peers_subcmd,
             ),
             cwd=project.path,
+            env=(
+                {**os.environ, GRAPHIFY_API_KEY_ENV: graphify[1]}
+                if graphify is not None else None
+            ),
             stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False,
         )
     except Exception:
+        _stop_graphify_best_effort(project)
         _stop_auth_proxy_best_effort(project)
         _stop_egress_proxy_best_effort(project)
         raise
     if run.returncode != 0:
+        _stop_graphify_best_effort(project)
         _stop_auth_proxy_best_effort(project)
         _stop_egress_proxy_best_effort(project)
         raise RuntimeError(
@@ -1218,6 +1769,8 @@ def _start_project_container(
                 f"container=1 container_name={cname} container_id={cid[:12]} "
                 f"auth_proxy={int(_auth_proxy_enabled())} "
                 f"auth_proxy_name={_auth_proxy_container_name(project)}"
+                + (f" peers_cmd={peers_subcmd[0]}" if peers_subcmd else "")
+                + _egress_trust_note_suffix(project)
             ),
         )
     except Exception:
@@ -1238,17 +1791,35 @@ def _start_project_host(
         argv += ["--max-ticks", str(max_ticks)]
     argv.extend(_run_extra_args(max_usd, extra_args))
 
+    # Opt-in caged graphify MCP: build the graph + start the serve sidecar, then
+    # hand the driver its endpoint + key via env (fail-open: None => no graphify).
+    graphify = _ensure_graphify_serve_host(project)
+    child_env = None
+    if graphify is not None:
+        endpoint, api_key = graphify
+        child_env = {
+            **os.environ,
+            GRAPHIFY_ENDPOINT_ENV: endpoint,
+            GRAPHIFY_API_KEY_ENV: api_key,
+        }
+
     log_fp = open_text_in_dir_no_symlink(log_path.parent, log_path.name, "a")
     try:
         proc = subprocess.Popen(
             argv,
             cwd=project.path,
+            env=child_env,
             stdin=subprocess.DEVNULL,
             stdout=log_fp,
             stderr=subprocess.STDOUT,
             start_new_session=True,  # setsid()
             close_fds=True,
         )
+    except Exception:
+        # The graphify sidecar started above; don't orphan it if the driver
+        # process fails to spawn (symmetric with _start_project_container).
+        _stop_graphify_best_effort(project)
+        raise
     finally:
         try:
             log_fp.close()
@@ -1287,11 +1858,12 @@ def _start_project_host(
             notes=(
                 f"max_ticks={max_ticks} max_usd={max_usd} "
                 f"started_by_pid={os.getpid()} starttime={starttime_token} "
-                "container=0"
+                f"container=0{_egress_trust_note_suffix(project)}"
             ),
         )
     except Exception:
         _terminate_spawned_process(proc)
+        _stop_graphify_best_effort(project)
         raise
     return proc.pid
 
@@ -1302,10 +1874,19 @@ def start_project(store: Store, project: Project,
                   max_runtime_s: int | None = None,
                   reset_budget: bool = False,
                   force: bool = False,
+                  trust_egress_allow: bool = False,
+                  skip_claude_smoke: bool = False,
                   extra_args: Sequence[str] = (),
                   container: bool = False,
+                  research_subcmd: Sequence[str] | None = None,
                   ) -> int:
     """Launch `peers run` in a detached host process or container.
+
+    ``research_subcmd`` (e.g. ``["research", "/work", "--modalities",
+    "codebase,web"]``) runs that explicit peers subcommand inside the container
+    instead of the default ``peers run`` loop, reusing the full sidecar / auth /
+    egress / claude-smoke plumbing. It implies ``--container`` (the isolation +
+    egress allow-list are the point) and ignores max_ticks/max_usd.
 
     `max_runtime_s` (operator CLI: `--max-runtime DURATION`) overrides
     `budget.max_runtime_s` in `.peers/state.json` BEFORE the loop
@@ -1321,10 +1902,26 @@ def start_project(store: Store, project: Project,
     accepts that the loop will exit after 0 ticks with the
     `budget:max_runtime` sentinel (useful for recording terminal
     state after a clean external stop).
+
+    `trust_egress_allow` (operator CLI: `--trust-egress-allow`) records the
+    exact digest of a non-empty `.peers/config.yaml` egress_allow list after
+    host-side review. It is intentionally separate from `force` because
+    egress policy is peer-writable and crosses a network trust boundary.
     """
     lock_path = store.config_dir / "locks" / f"{project.name}.start.lock"
     try:
         with _acquire_start_lock(lock_path):
+            # full-depth-analysis #8: re-read the AUTHORITATIVE record UNDER the
+            # start-lock. The `project` snapshot was read by cmd_start BEFORE the
+            # lock, so two concurrent host starts both saw the pre-lock pid (often
+            # None) and the second clobbered the first's registry pid (orphaning the
+            # live loop). store.get reads fresh from disk and the lock serializes the
+            # spawn, so the 2nd start now observes the 1st's persisted pid and the
+            # preflight's is_pid_alive guard raises "already running".
+            fresh = store.get(project.name)
+            if fresh is None:
+                raise ValueError(f"project {project.name!r} is no longer registered")
+            project = fresh
             _start_project_preflight(
                 project, max_ticks, max_usd,
                 max_runtime_s=max_runtime_s,
@@ -1332,9 +1929,13 @@ def start_project(store: Store, project: Project,
                 force=force,
             )
             log_path = _start_project_log_path(store, project)
-            if container:
+            if research_subcmd is not None or container:
                 return _start_project_container(
-                    store, project, log_path, max_ticks, max_usd, extra_args
+                    store, project, log_path, max_ticks, max_usd, extra_args,
+                    force=force,
+                    trust_egress_allow=trust_egress_allow,
+                    skip_claude_smoke=skip_claude_smoke,
+                    peers_subcmd=research_subcmd,
                 )
             return _start_project_host(
                 store, project, log_path, max_ticks, max_usd, extra_args
@@ -1354,6 +1955,9 @@ def stop_project(store: Store, project: Project,
     The substrate's existing SIGTERM handler routes through
     KeyboardInterrupt so state.save() + lock-release still run.
     """
+    # Tear down the opt-in graphify MCP sidecar for BOTH modes (no-op when
+    # absent). At the top so it runs even if the main stop below raises.
+    _stop_graphify_best_effort(project)
     if _is_container_project(project):
         cname = _container_from_project(project)
         if cname and _container_running(cname):
@@ -1421,7 +2025,18 @@ def stop_project(store: Store, project: Project,
                      ).isoformat())
         return 0
 
-    pid = project.pid
+    pid_raw = project.pid
+    if (
+        isinstance(pid_raw, bool)
+        or not isinstance(pid_raw, int)
+        or pid_raw <= 0
+    ):
+        store.update(project.name, state="stopped", pid=None,
+                     last_stopped_at=_dt.datetime.now(
+                         _dt.timezone.utc
+                     ).isoformat())
+        return 0
+    pid = pid_raw
     if not is_pid_alive(pid):
         store.update(project.name, state="stopped", pid=None,
                      last_stopped_at=_dt.datetime.now(
@@ -1548,7 +2163,7 @@ def _safe_getpgid(pid: int) -> int | None:
         return None
 
 
-def _valid_pgid(pgid: int | None) -> bool:
+def _valid_pgid(pgid: object) -> TypeGuard[int]:
     return isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 0
 
 

@@ -9,6 +9,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from peers.graphify_mcp import (
+    GRAPHIFY_API_KEY_ENV,
+    graphify_mcp_flags,
+    graphify_runtime,
+)
 
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 OPENROUTER_CLAUDE_BASE_URL = "https://openrouter.ai/api"
@@ -41,13 +46,52 @@ def build_peer_argv(
         return argv, {}
 
     tool = getattr(spec, "tool", None)
-    translator = _TOOL_TRANSLATORS.get(tool)
+    translator = _TOOL_TRANSLATORS.get(tool) if isinstance(tool, str) else None
     if translator is not None:
         return translator(argv, model, reasoning, provider)
     raise ValueError(
         f"tool {tool!r} has no model/reasoning/provider translation; "
         "use argv directly"
     )
+
+
+def apply_graphify_mcp(
+    argv: Sequence[str],
+    extra_env: Mapping[str, str],
+    tool: str | None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Splice the opt-in graphify MCP server into a peer launch.
+
+    Keyed off the env signal (:func:`graphify_runtime`): when graphify is off
+    -- or its caged sidecar never came up -- the argv and env are returned
+    unchanged, so the launch is byte-identical to a no-graphify run. For a
+    known tool the per-tool flags (:func:`graphify_mcp_flags`) are inserted in
+    a tool-safe location: Claude's variadic ``--mcp-config`` must be followed
+    by another option rather than the positional prompt, while codex config
+    flags go after the ``codex`` subcommand. Both tools read the bearer token
+    from ``GRAPHIFY_API_KEY`` (added to ``extra_env``) so the secret never
+    enters argv.
+    """
+    base_argv = tuple(argv)
+    base_env = dict(extra_env)
+    runtime = graphify_runtime(env)
+    if runtime is None:
+        return base_argv, base_env
+    endpoint, api_key = runtime
+    flags = graphify_mcp_flags(tool or "", endpoint)
+    if not flags:
+        return base_argv, base_env
+    # Both tools read the key from GRAPHIFY_API_KEY in the env (claude expands
+    # ${GRAPHIFY_API_KEY} in the --mcp-config header; codex via
+    # bearer_token_env_var), so the secret never enters argv.
+    new_env = {**base_env, GRAPHIFY_API_KEY_ENV: api_key}
+    if tool == "claude":
+        return _insert_claude_mcp_config(base_argv, flags), new_env
+    if tool == "codex":
+        return _insert_codex_config(base_argv, flags), new_env
+    return _insert_before_prompt(base_argv, flags), new_env
 
 
 def validate_peer_runtime_env(
@@ -211,6 +255,35 @@ def _insert_codex_config(
         out[1:1] = additions
         return tuple(out)
     return _insert_before_prompt(out, additions)
+
+
+def _insert_claude_mcp_config(
+    argv: Sequence[str],
+    additions: Sequence[str],
+) -> tuple[str, ...]:
+    out = list(argv)
+    prompt_idx = next(
+        (i for i, arg in enumerate(out) if "{PROMPT}" in arg),
+        len(out),
+    )
+    # Claude's --mcp-config is variadic (<configs...>). If the JSON config is
+    # inserted immediately before the prompt, Claude consumes the prompt as a
+    # second config and tries to open it as a filename. Put the config before
+    # the first existing option so the option boundary terminates the variadic
+    # list.
+    for idx in range(1, prompt_idx):
+        if out[idx].startswith("-"):
+            out[idx:idx] = additions
+            return tuple(out)
+    if prompt_idx < len(out):
+        # No pre-prompt option exists to terminate Claude's variadic
+        # --mcp-config list. Claude accepts options after its positional
+        # prompt, and placing the config there keeps the prompt out of
+        # the variadic values.
+        out[prompt_idx + 1:prompt_idx + 1] = additions
+        return tuple(out)
+    out.extend(additions)
+    return tuple(out)
 
 
 def _build_claude_argv(

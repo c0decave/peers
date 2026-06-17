@@ -153,6 +153,32 @@ def test_replay_missing_runs_returns_exit_1(tmp_path: Path) -> None:
     assert "runs.jsonl" in text or "no tick history" in text
 
 
+def test_replay_skips_deep_malformed_runs_line_BUG_516(
+    tmp_path: Path,
+) -> None:
+    proj = _seed_project(tmp_path, "demo")
+    log_dir = proj / ".peers" / "log"
+    log_dir.mkdir(parents=True)
+    (log_dir / "runs.jsonl").write_text(
+        ("[" * 10000) + "\n"
+        + json.dumps({
+            "iteration": 3,
+            "peer": "codex",
+            "classification": "success",
+            "duration_ms": 100,
+            "success": True,
+        }) + "\n"
+    )
+
+    opts = _opts()
+    rc = replay_project("demo", opts)
+
+    assert rc == 0
+    text = opts.out.getvalue()
+    assert "iteration: 3" in text
+    assert "peer: codex" in text
+
+
 def test_replay_unknown_project_returns_exit_1(tmp_path: Path) -> None:
     """An unknown project name returns exit 1 with a diagnostic."""
     opts = _opts()
@@ -265,6 +291,62 @@ def test_replay_show_prompts_refuses_symlinked_iter_dir_BUG_176(
     assert rc == 0
     text = opts.out.getvalue()
     assert "SECRET_ATTACKER_CONTENT" not in text
+
+
+def test_replay_show_prompts_refuses_symlinked_prompts_ancestor_BUG_518(
+    tmp_path: Path,
+) -> None:
+    """BUG-518: the prompts directory ancestor can be the symlink, not
+    only the final iter-N directory or file."""
+    proj = _seed_project(tmp_path, "demo", [
+        {"iteration": 1, "peer": "claude", "classification": "success",
+         "duration_ms": 100, "success": True,
+         "head_before": "x", "head_after": "y"},
+    ])
+    real_log = proj / ".peers" / "log"
+    real_log.mkdir(parents=True, exist_ok=True)
+    attacker_root = tmp_path / "attacker_prompts"
+    (attacker_root / "iter-1").mkdir(parents=True)
+    (attacker_root / "iter-1" / "leak.txt").write_text(
+        "SECRET_PROMPT_CONTENT\n"
+    )
+    (real_log / "prompts").symlink_to(attacker_root, target_is_directory=True)
+
+    opts = _opts(show_prompts=True)
+    rc = replay_project("demo", opts)
+    assert rc == 0
+    text = opts.out.getvalue()
+    assert "SECRET_PROMPT_CONTENT" not in text
+    assert "symlink" in text.lower() or "refus" in text.lower()
+
+
+def test_replay_refuses_symlinked_runs_ancestor_BUG_519(
+    tmp_path: Path,
+) -> None:
+    """BUG-519: public replay must fail closed when the history control
+    path has a symlinked ancestor, not silently render an empty run."""
+    proj = tmp_path / "projects" / "demo"
+    proj.mkdir(parents=True)
+    outside = tmp_path / "outside-peers"
+    (outside / "log").mkdir(parents=True)
+    (outside / "log" / "runs.jsonl").write_text(json.dumps({
+        "iteration": 1,
+        "peer": "codex",
+        "classification": "success",
+        "duration_ms": 1,
+        "success": True,
+        "head_before": "aaaa",
+        "head_after": "bbbb",
+    }) + "\n")
+    (proj / ".peers").symlink_to(outside, target_is_directory=True)
+
+    opts = _opts()
+    rc = replay_project("demo", opts)
+
+    text = opts.out.getvalue()
+    assert rc == 1
+    assert "unsafe" in text.lower() or "refus" in text.lower()
+    assert "iteration: 1" not in text
 
 
 def test_replay_show_prompts_reads_existing(tmp_path: Path) -> None:

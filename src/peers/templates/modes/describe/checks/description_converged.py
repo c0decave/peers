@@ -23,6 +23,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from peers.safe_io import read_bytes_under_root_no_follow
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - yaml is required everywhere else
@@ -32,6 +34,7 @@ DESCRIPTION_FILES = ["SPEC.md", "ARCHITECTURE.md", "DESIGN.md"]
 DEFAULT_N = 2
 LARGE_DIFF_LINES = 100
 LARGE_DELETION_RATIO = 0.5
+MAX_CONFIG_BYTES = 512 * 1024
 
 
 def _git(*args: str, cwd: Path) -> str:
@@ -43,12 +46,39 @@ def _git(*args: str, cwd: Path) -> str:
 
 
 def _read_convergence_n(repo: Path) -> int:
-    cfg_path = repo / ".peers" / "config.yaml"
-    if not cfg_path.is_file() or yaml is None:
+    if yaml is None:
+        # PyYAML is a hard dependency; its absence is anomalous. If a
+        # .peers/config.yaml exists we cannot parse it to honor a possibly
+        # STRICTER describe_convergence_n — silently using DEFAULT_N would
+        # weaken a configured HARD gate (FU-1 defense-in-depth), so fail
+        # CLOSED. With no config there is nothing configured to violate, so
+        # DEFAULT_N is safe.
+        if (repo / ".peers" / "config.yaml").exists():
+            raise RuntimeError(
+                "PyYAML unavailable but .peers/config.yaml exists; cannot "
+                "honor a configured describe_convergence_n (failing closed)"
+            )
         return DEFAULT_N
     try:
-        cfg = yaml.safe_load(cfg_path.read_text())
-    except (yaml.YAMLError, OSError):
+        raw = read_bytes_under_root_no_follow(
+            repo, (".peers", "config.yaml"),
+            max_bytes=MAX_CONFIG_BYTES + 1,
+        )
+    except FileNotFoundError:
+        return DEFAULT_N
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"config.yaml unreadable: {e}") from e
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise RuntimeError(
+            f"config.yaml exceeds {MAX_CONFIG_BYTES}-byte limit"
+        )
+    try:
+        cfg_text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"config.yaml unreadable: {e}") from e
+    try:
+        cfg = yaml.safe_load(cfg_text)
+    except yaml.YAMLError:
         return DEFAULT_N
     if not isinstance(cfg, dict):
         return DEFAULT_N
@@ -124,7 +154,11 @@ def _classify_commit(
 
 def main(repo: str = ".") -> int:
     root = Path(repo).resolve()
-    n = _read_convergence_n(root)
+    try:
+        n = _read_convergence_n(root)
+    except RuntimeError as e:
+        print(f"description_converged FAIL: {e}")
+        return 1
     commits = _recent_commits_touching_docs(root, n)
     if len(commits) == 0:
         print(

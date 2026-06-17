@@ -7,7 +7,7 @@ from typing import Any
 
 from peers.goal_engine import GoalResult
 from peers.goals import _GOALS_YAML_MAX_BYTES
-from peers.safe_io import read_bytes_no_symlink
+from peers.safe_io import read_bytes_no_symlink, read_bytes_under_root_no_follow
 
 
 _AUTO_SKEPTIC_PROMPT_PREFIX = """\
@@ -39,6 +39,48 @@ A single tick — so be more honest than usual.
 
 === END SKEPTIC HEADER ===
 """
+
+_HYBRID_INBOX_SNIPPET_CHARS = 4000
+_HYBRID_INBOX_READ_BYTES = _HYBRID_INBOX_SNIPPET_CHARS + 1
+
+
+def _decode_hybrid_inbox_payload(
+    data: bytes, *, read_cap_hit: bool,
+) -> tuple[str, str | None]:
+    try:
+        return data.decode("utf-8"), None
+    except UnicodeDecodeError as e:
+        if (
+            read_cap_hit
+            and e.reason == "unexpected end of data"
+            and e.end == len(data)
+        ):
+            return (
+                data[:e.start].decode("utf-8"),
+                "dropped a partial UTF-8 character at the read cap",
+            )
+        raise
+
+
+def _read_hybrid_inbox_snippet(
+    peer_dir: Path, rel_parts: tuple[str, ...],
+) -> tuple[str, str | None]:
+    raw = read_bytes_under_root_no_follow(
+        peer_dir,
+        rel_parts,
+        _HYBRID_INBOX_READ_BYTES,
+    )
+    text, decode_warning = _decode_hybrid_inbox_payload(
+        raw,
+        read_cap_hit=len(raw) >= _HYBRID_INBOX_READ_BYTES,
+    )
+    snippet = text[:_HYBRID_INBOX_SNIPPET_CHARS]
+    if (
+        len(text) > _HYBRID_INBOX_SNIPPET_CHARS
+        or len(raw) > _HYBRID_INBOX_SNIPPET_CHARS
+    ):
+        snippet += "\n... (truncated)"
+    return snippet, decode_warning
 
 
 def _hash_goals_yaml(path: Path) -> str:

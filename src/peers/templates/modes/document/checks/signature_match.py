@@ -17,7 +17,7 @@ def main(project_dir: str = ".", codemap: str | None = None) -> int:
     except CodeMapError as e:
         print(f"signature-match FAIL: {e}")
         return 1
-    violations = check_signatures(project_dir, cm)
+    violations = check_signatures(Path(project_dir), cm)
     if violations:
         print(f"signature-match FAIL: {len(violations)} mismatch(es):")
         for s in violations[:50]:

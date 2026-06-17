@@ -1,6 +1,7 @@
 """Test no-skipped-tests check (Task 5.4)."""
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from peers.templates.modes.implement.checks import no_skipped_tests
@@ -12,6 +13,32 @@ def _setup(tmp_path: Path, test_files: dict[str, str]) -> Path:
     for name, body in test_files.items():
         (tests / name).write_text(body)
     return tmp_path
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          capture_output=True, text=True, check=True).stdout
+
+
+def _git_setup(tmp_path: Path, test_files: dict[str, str]) -> Path:
+    """_setup + git init + initial commit (so FU-2 review commits resolve)."""
+    proj = _setup(tmp_path, test_files)
+    _git(proj, "init", "-q")
+    _git(proj, "config", "commit.gpgsign", "false")
+    _git(proj, "config", "user.email", "t@t")
+    _git(proj, "config", "user.name", "t")
+    _git(proj, "add", "-A")
+    _git(proj, "commit", "-q", "-m", "init")
+    return proj
+
+
+def _attested_review(repo: Path, artifact: str, peer: str) -> str:
+    """The OTHER peer signs off via a substrate-attested peers-review commit."""
+    _git(repo, "commit", "-q", "--allow-empty",
+         "-m", f"peers-review: {artifact}\n\nLGTM")
+    sha = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "notes", "--ref=peers-attest", "add", "-f", "-m", peer, sha)
+    return sha
 
 
 def test_clean_tests_pass(tmp_path, capsys):
@@ -90,19 +117,17 @@ def test_x():
     assert rc == 1
 
 
-def test_signed_skip_passes(tmp_path, capsys):
-    from peers_ctl.justifications import append_justification
-    _setup(tmp_path, {"test_a.py": """import pytest
+def test_signed_skip_passes_with_review_commit(tmp_path, capsys):
+    # FU-2: the SKIP-REASON skip is forgiven once an independent peer (codex)
+    # signs off on tests/test_a.py via a substrate-attested peers-review commit.
+    proj = _git_setup(tmp_path, {"test_a.py": """import pytest
 # SKIP-REASON: waits on upstream issue 42
 @pytest.mark.skip(reason="x")
 def test_x():
     pass
 """})
-    plan_dir = tmp_path / ".peers"
-    plan_dir.mkdir()
-    # Signoff for the decorator line (line 3)
-    append_justification(plan_dir, "tests/test_a.py", 3, "waits on upstream issue 42", "codex@p.local")
-    rc = no_skipped_tests.main(str(tmp_path))
+    _attested_review(proj, "tests/test_a.py", "codex")
+    rc = no_skipped_tests.main(str(proj))
     assert rc == 0
 
 
@@ -125,29 +150,92 @@ def test_skips_non_test_paths(tmp_path, capsys):
     assert rc == 0
 
 
-def test_forged_signoff_with_broken_chain_fails_closed_BUG_173(
-    tmp_path, capsys,
-):
-    """A forged justification entry with bogus chain prefix must not
-    waive a skip marker. The gate must verify the chain before consulting
-    it; otherwise a peer can ship a hand-rolled log line that bypasses
-    every signed-skip enforcement.
+def test_forged_log_entry_does_not_bless_FU_2(tmp_path, capsys):
+    """FU-2 (supersedes BUG-173): a justifications.log entry no longer waives a
+    skip — the forgeable, agent-authored log is not the mechanism. Only a
+    substrate-attested peers-review commit forgives a SKIP-REASON skip, so a
+    hand-written entry bypasses nothing.
     """
-    _setup(tmp_path, {"test_a.py": """import pytest
+    proj = _git_setup(tmp_path, {"test_a.py": """import pytest
 # SKIP-REASON: handwave
 @pytest.mark.skip(reason="x")
 def test_x():
     pass
 """})
-    plan_dir = tmp_path / ".peers"
+    plan_dir = proj / ".peers"
     plan_dir.mkdir()
     (plan_dir / "justifications.log").write_text(
         "0000000000000000 tests/test_a.py:3 attacker forged reason\n",
     )
-    rc = no_skipped_tests.main(str(tmp_path))
+    rc = no_skipped_tests.main(str(proj))
     assert rc == 1
-    out = capsys.readouterr().out
-    assert "chain" in out.lower() or "tamper" in out.lower()
+    assert "test_a.py" in capsys.readouterr().out
+
+
+def test_multi_author_laundering_does_not_bless_skip_FU_2(tmp_path, capsys):
+    # CRITICAL (adversarial review): claude authors the skip + SKIP-REASON;
+    # codex makes a trivial edit elsewhere (last editor); claude self-reviews.
+    # The guard must exclude the SKIP LINE's author (claude), not the last
+    # editor (codex), so the self-review is rejected.
+    proj = _git_setup(tmp_path, {"test_a.py": """import pytest
+# SKIP-REASON: deferred
+@pytest.mark.skip(reason="x")
+def test_x():
+    pass
+"""})
+    init = _git(proj, "rev-parse", "HEAD").strip()
+    _git(proj, "notes", "--ref=peers-attest", "add", "-f", "-m", "claude", init)
+    # codex appends a trailing line — does NOT touch the skip (line 3) or
+    # SKIP-REASON (line 2)
+    with (proj / "tests" / "test_a.py").open("a") as f:
+        f.write("\n# trailing\n")
+    _git(proj, "add", "-A")
+    _git(proj, "commit", "-q", "-m", "codex trivial")
+    edit = _git(proj, "rev-parse", "HEAD").strip()
+    _git(proj, "notes", "--ref=peers-attest", "add", "-f", "-m", "codex", edit)
+    _attested_review(proj, "tests/test_a.py", "claude")  # skip author self-reviews
+    rc = no_skipped_tests.main(str(proj))
+    assert rc == 1
+    assert "test_a.py" in capsys.readouterr().out
+
+
+def test_coeditor_who_did_not_author_skip_can_review_FU_2(tmp_path, capsys):
+    # complement (not over-strict): codex edited a non-skip line, so codex can
+    # review claude's skip.
+    proj = _git_setup(tmp_path, {"test_a.py": """import pytest
+# SKIP-REASON: deferred
+@pytest.mark.skip(reason="x")
+def test_x():
+    pass
+"""})
+    init = _git(proj, "rev-parse", "HEAD").strip()
+    _git(proj, "notes", "--ref=peers-attest", "add", "-f", "-m", "claude", init)
+    with (proj / "tests" / "test_a.py").open("a") as f:
+        f.write("\n# trailing\n")
+    _git(proj, "add", "-A")
+    _git(proj, "commit", "-q", "-m", "codex trivial")
+    edit = _git(proj, "rev-parse", "HEAD").strip()
+    _git(proj, "notes", "--ref=peers-attest", "add", "-f", "-m", "codex", edit)
+    _attested_review(proj, "tests/test_a.py", "codex")
+    rc = no_skipped_tests.main(str(proj))
+    assert rc == 0
+
+
+def test_self_review_does_not_bless_skip_FU_2(tmp_path, capsys):
+    """FU-2 sad: the test file's own author cannot self-bless its skip — a
+    peers-review commit attested to the author (codex) is excluded."""
+    proj = _git_setup(tmp_path, {"test_a.py": """import pytest
+# SKIP-REASON: self
+@pytest.mark.skip(reason="x")
+def test_x():
+    pass
+"""})
+    init = _git(proj, "rev-parse", "HEAD").strip()
+    _git(proj, "notes", "--ref=peers-attest", "add", "-f", "-m", "codex", init)
+    _attested_review(proj, "tests/test_a.py", "codex")  # self-review
+    rc = no_skipped_tests.main(str(proj))
+    assert rc == 1
+    assert "test_a.py" in capsys.readouterr().out
 
 
 # --- skip-baseline grandfathering (gate-scoping fix) ----------------------

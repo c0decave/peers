@@ -98,6 +98,34 @@ def _positive_int(raw: Any, field: str, gid: str) -> int:
     return raw
 
 
+def _nonneg_int(raw: Any, field: str, gid: str, *, cap: int = 5) -> int:
+    """Non-negative int with an upper bound (full-depth-analysis #12). Mirrors
+    `_positive_int`'s structured per-goal error (rejects bools/floats/strings,
+    unlike a bare `int()`) and caps so a typo can't make a red gate retry forever
+    (masking a genuine failure as a hang)."""
+    if raw is None:
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError(
+            f"goal {gid}: {field} must be a non-negative integer, "
+            f"got {type(raw).__name__} ({raw!r})"
+        )
+    if raw < 0:
+        raise ValueError(f"goal {gid}: {field} must be >= 0, got {raw}")
+    return min(raw, cap)
+
+
+def _bool_flag(raw: Any, field: str, gid: str) -> bool:
+    if raw is None:
+        return False
+    if not isinstance(raw, bool):
+        raise ValueError(
+            f"goal {gid}: {field} must be a boolean, "
+            f"got {type(raw).__name__} ({raw!r})"
+        )
+    return raw
+
+
 def _parse_goals_yaml_bytes(data: bytes) -> list[Goal]:
     if len(data) > _GOALS_YAML_MAX_BYTES:
         raise ValueError(
@@ -189,9 +217,10 @@ def _parse_goals_yaml_bytes(data: bytes) -> list[Goal]:
             quorum_num=quorum_num,
             quorum_den=quorum_den,
             timeout_s=timeout_s,
-            cacheable=bool(entry.get("cacheable", False)),
-            expensive=bool(entry.get("expensive", False)),
-            retry_on_fail=max(0, int(entry.get("retry_on_fail", 0) or 0)),
+            cacheable=_bool_flag(entry.get("cacheable"), "cacheable", gid),
+            expensive=_bool_flag(entry.get("expensive"), "expensive", gid),
+            retry_on_fail=_nonneg_int(entry.get("retry_on_fail", 0),
+                                      "retry_on_fail", gid),
         )
         if g.type == "hard":
             if not isinstance(g.cmd, str) or not g.cmd.strip():
@@ -321,6 +350,15 @@ def _safe_regex_search(pattern: str, text: str) -> re.Match | None:
             f"regex() pattern too large "
             f"(>{_MAX_REGEX_PATTERN_BYTES} bytes)"
         )
+    # full-depth-analysis #11: the SIGALRM ReDoS bound only works on the MAIN
+    # thread; off-main (e.g. the AsyncGateRunner worker) it is unavailable and
+    # `re.search` runs without it. A watchdog thread CANNOT bound it — a
+    # catastrophic-backtracking match holds the GIL and would starve the whole
+    # process, strictly worse than wedging the single async worker (the main loop
+    # falls back to a synchronous, SIGALRM-bounded eval). The real mitigation is
+    # the operator-supplied (not agent) pattern + the `_MAX_REGEX_PATTERN_BYTES`
+    # cap above; a bounded-backtracking engine (the `regex` module) is the only
+    # true fix and is out of scope. So off-main we run unbounded, knowingly.
     if not hasattr(signal, "setitimer"):
         return re.search(pattern, text)
 
@@ -492,7 +530,7 @@ def _validate_ast(node: ast.AST) -> None:
             #    (e.g. stdout.strip()) or a whitelisted Call
             #    (e.g. json('x.json').totals — the Call's own func is
             #    re-validated by the Call branch below).
-            root = child
+            root: ast.expr = child
             while isinstance(root, ast.Attribute):
                 root = root.value
             if isinstance(root, ast.Name):
@@ -573,12 +611,12 @@ def evaluate_pass_when(expr: str, ctx: dict[str, Any]) -> bool:
         {"__builtins__": {}},
         env,
     )
-    # Reject non-(bool|int|float|None) — catches the bare-method-attribute
-    # foot-gun (`pass_when: stdout.strip` evaluates to a bound method
-    # which is truthy and would always "pass").
-    if not isinstance(result, (bool, int, float)) and result is not None:
+    # Require an explicit boolean expression. Truth-coercing other result
+    # types is a gate-integrity foot-gun: `pass_when: exit_code` evaluates
+    # to 1 on a failing command, and bool(1) would pass the gate.
+    if not isinstance(result, bool):
         raise ValueError(
-            f"pass_when must return bool/numeric/None, got "
+            f"pass_when must return bool, got "
             f"{type(result).__name__}: did you forget a comparison?"
         )
-    return bool(result)
+    return result

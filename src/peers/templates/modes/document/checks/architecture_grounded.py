@@ -20,7 +20,7 @@ def main(project_dir: str = ".", codemap: str | None = None) -> int:
     except CodeMapError as e:
         print(f"architecture-grounded FAIL: {e}")
         return 1
-    violations = check_architecture(project_dir, cm)
+    violations = check_architecture(Path(project_dir), cm)
     if violations:
         print(f"architecture-grounded FAIL: {len(violations)} issue"
               f"{'' if len(violations) == 1 else 's'}:")

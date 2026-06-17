@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+import peers.recon as recon_mod
 from peers.recon import run_recon, RECON_FILE
 
 
@@ -37,6 +38,20 @@ def _make_python_project(root: Path) -> Path:
     )
     (root / "README.md").write_text("# Thing\n\nA tiny project.\n")
     return root
+
+
+def _assert_balanced_untrusted_fences(content: str) -> None:
+    begins = content.count(recon_mod._UNTRUSTED_DATA_BEGIN)
+    ends = content.count(recon_mod._UNTRUSTED_DATA_END)
+    assert begins == ends, (
+        "unbalanced untrusted-data fences: "
+        f"{begins} BEGIN markers, {ends} END markers"
+    )
+
+
+def _truncation_notice_size(byte_cap: int) -> int:
+    notice = f"\n\n…[recon.md truncated to {byte_cap} bytes]\n"
+    return len(notice.encode("utf-8"))
 
 
 def test_recon_writes_recon_md(tmp_path: Path) -> None:
@@ -429,6 +444,88 @@ def test_recon_caps_doc_excerpts(tmp_path: Path) -> None:
     content = (peer_dir / RECON_FILE).read_text()
     # Whole file shouldn't be inlined; rough cap is in the implementation.
     assert len(content) < 30_000  # ~30KB upper bound on recon.md
+
+
+def test_recon_total_cap_keeps_small_digest_fences_balanced(
+    tmp_path: Path,
+) -> None:
+    repo = _make_python_project(tmp_path / "repo")
+    (repo / "SPEC.md").write_text("# Spec\n\nTrusted only as data.\n")
+
+    content = recon_mod._build_recon(repo)
+
+    assert "recon.md truncated" not in content
+    assert "--- BEGIN UNTRUSTED PROJECT-SUPPLIED DATA: SPEC.md" in content
+    assert "--- END UNTRUSTED PROJECT-SUPPLIED DATA: SPEC.md" in content
+    _assert_balanced_untrusted_fences(content)
+
+
+def test_recon_total_cap_preserves_complete_fence_at_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_python_project(tmp_path / "repo")
+    (repo / "SPEC.md").write_text("# Spec\n\n" + ("body line\n" * 20))
+    monkeypatch.setattr(recon_mod, "MAX_RECON_BYTES", 1_000_000)
+    full = recon_mod._build_recon(repo)
+    spec_end = "--- END UNTRUSTED PROJECT-SUPPLIED DATA: SPEC.md"
+    prefix_end = full.index(spec_end) + len(spec_end)
+    prefix_bytes = len(full[:prefix_end].encode("utf-8"))
+    byte_cap = prefix_bytes + _truncation_notice_size(prefix_bytes)
+    while True:
+        next_cap = prefix_bytes + _truncation_notice_size(byte_cap)
+        if next_cap == byte_cap:
+            break
+        byte_cap = next_cap
+    monkeypatch.setattr(recon_mod, "MAX_RECON_BYTES", byte_cap)
+
+    content = recon_mod._build_recon(repo)
+
+    assert "recon.md truncated" in content
+    assert "--- BEGIN UNTRUSTED PROJECT-SUPPLIED DATA: SPEC.md" in content
+    assert spec_end in content
+    _assert_balanced_untrusted_fences(content)
+    assert len(content.encode("utf-8")) <= byte_cap
+
+
+def test_recon_total_cap_drops_open_fence_when_cut_mid_body_BUG_708(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _make_python_project(tmp_path / "repo")
+    (repo / "SPEC.md").write_text(
+        "# Spec\n\n" + "".join(f"payload-line-{i:03d}\n" for i in range(120))
+    )
+    monkeypatch.setattr(recon_mod, "MAX_RECON_BYTES", 1_000_000)
+    full = recon_mod._build_recon(repo)
+    byte_cap = len(full[:full.index("payload-line-060")].encode("utf-8"))
+    assert byte_cap > _truncation_notice_size(byte_cap)
+    monkeypatch.setattr(recon_mod, "MAX_RECON_BYTES", byte_cap)
+
+    content = recon_mod._build_recon(repo)
+
+    assert "recon.md truncated" in content
+    _assert_balanced_untrusted_fences(content)
+    assert len(content.encode("utf-8")) <= byte_cap
+
+
+def test_excerpt_marks_truncation_on_multibyte_content(tmp_path: Path) -> None:
+    """BUG-506 (v22 harvest): a multi-byte UTF-8 doc longer than the char cap
+    must still get the truncation marker. The byte cap must not silently drop
+    bytes while the char-count check fails to fire (chars < bytes)."""
+    from peers.recon import _excerpt
+    p = tmp_path / "SPEC.md"
+    p.write_text("ä" * 5000, encoding="utf-8")  # 5000 chars / 10000 bytes
+    out = _excerpt(p, max_chars=3000)
+    assert "…[truncated]" in out, "multi-byte truncation marker missing"
+    assert out.count("ä") <= 3000  # capped at the char budget
+
+
+def test_excerpt_no_marker_for_short_multibyte(tmp_path: Path) -> None:
+    from peers.recon import _excerpt
+    p = tmp_path / "SPEC.md"
+    p.write_text("ä" * 100, encoding="utf-8")
+    out = _excerpt(p, max_chars=3000)
+    assert "…[truncated]" not in out
+    assert out.count("ä") == 100
 
 
 def test_recon_ignores_node_modules_and_pycache(tmp_path: Path) -> None:

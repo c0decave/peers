@@ -975,6 +975,144 @@ def test_server_caps_accepted_connections_BUG_159(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_accept_semaphore_released_after_handler_thread_BUG_505(
+    monkeypatch,
+) -> None:
+    """BUG-505 happy path: an accepted connection consumes one
+    accept-time slot while the worker runs, then process_request_thread
+    releases it after the handler finishes."""
+    import threading
+    from socketserver import ThreadingMixIn
+    from auth_proxy import server as auth_proxy_server
+
+    srv = auth_proxy_server._AuthProxyThreadingHTTPServer.__new__(
+        auth_proxy_server._AuthProxyThreadingHTTPServer,
+    )
+    sem = threading.BoundedSemaphore(1)
+    srv.auth_proxy_accept_semaphore = sem
+    request = object()
+    client_address = ("127.0.0.1", 1234)
+    calls = []
+
+    def fake_process_request(self, req, addr):
+        calls.append(("spawn", req, addr))
+        assert not sem.acquire(blocking=False), (
+            "accept slot must stay held while the handler thread is live"
+        )
+
+    def fake_process_request_thread(self, req, addr):
+        calls.append(("thread", req, addr))
+
+    monkeypatch.setattr(
+        ThreadingMixIn, "process_request", fake_process_request,
+    )
+    monkeypatch.setattr(
+        ThreadingMixIn, "process_request_thread", fake_process_request_thread,
+    )
+
+    srv.process_request(request, client_address)
+    assert calls == [("spawn", request, client_address)]
+    assert not sem.acquire(blocking=False)
+
+    srv.process_request_thread(request, client_address)
+    assert calls == [
+        ("spawn", request, client_address),
+        ("thread", request, client_address),
+    ]
+    assert sem.acquire(blocking=False)
+    assert not sem.acquire(blocking=False)
+    sem.release()
+
+
+def test_accept_semaphore_refusal_keeps_unowned_slot_held_BUG_505() -> None:
+    """BUG-505 edge path: when the accept cap is already exhausted,
+    the refusal path must not release a slot owned by another request."""
+    import threading
+    from auth_proxy import server as auth_proxy_server
+
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+
+        def sendall(self, data: bytes) -> None:
+            self.sent.append(data)
+
+    srv = auth_proxy_server._AuthProxyThreadingHTTPServer.__new__(
+        auth_proxy_server._AuthProxyThreadingHTTPServer,
+    )
+    sem = threading.BoundedSemaphore(1)
+    assert sem.acquire(blocking=False)
+    srv.auth_proxy_accept_semaphore = sem
+    request = FakeRequest()
+    shutdowns = []
+    srv.shutdown_request = lambda req: shutdowns.append(req)
+
+    srv.process_request(request, ("127.0.0.1", 1234))
+
+    assert request.sent == [
+        b"HTTP/1.1 503 Service Unavailable\r\n"
+        b"Connection: close\r\n"
+        b"Content-Length: 0\r\n\r\n",
+    ]
+    assert shutdowns == [request]
+    assert not sem.acquire(blocking=False), (
+        "refusing a new connection must not free another request's slot"
+    )
+    sem.release()
+
+
+def test_accept_semaphore_released_when_thread_start_fails_BUG_505(
+    monkeypatch,
+) -> None:
+    """BUG-505 sad path: if ThreadingMixIn fails before the worker
+    starts, process_request_thread never runs, so the accept thread must
+    return the slot itself and close the request."""
+    import threading
+    from socketserver import ThreadingMixIn
+    from auth_proxy import server as auth_proxy_server
+
+    class FakeRequest:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+
+        def sendall(self, data: bytes) -> None:
+            self.sent.append(data)
+
+    srv = auth_proxy_server._AuthProxyThreadingHTTPServer.__new__(
+        auth_proxy_server._AuthProxyThreadingHTTPServer,
+    )
+    sem = threading.BoundedSemaphore(1)
+    srv.auth_proxy_accept_semaphore = sem
+    request = FakeRequest()
+    client_address = ("127.0.0.1", 1234)
+    shutdowns = []
+    errors = []
+    srv.shutdown_request = lambda req: shutdowns.append(req)
+    srv.handle_error = lambda req, addr: errors.append((req, addr))
+
+    def fail_to_start_thread(self, req, addr):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(
+        ThreadingMixIn, "process_request", fail_to_start_thread,
+    )
+
+    srv.process_request(request, client_address)
+
+    assert errors == [(request, client_address)]
+    assert shutdowns == [request]
+    assert request.sent == [
+        b"HTTP/1.1 503 Service Unavailable\r\n"
+        b"Connection: close\r\n"
+        b"Content-Length: 0\r\n\r\n",
+    ]
+    assert sem.acquire(blocking=False), (
+        "thread-start failure leaked the accept semaphore slot"
+    )
+    assert not sem.acquire(blocking=False)
+    sem.release()
+
+
 def test_refresh_access_token_accepts_normal_response_BUG_158(
     tmp_path: Path,
 ) -> None:
@@ -998,6 +1136,54 @@ def test_refresh_access_token_accepts_normal_response_BUG_158(
 
 
 # --- BUG-180: auth proxy must not forward stale Content-Length --------------
+
+def _run_auth_proxy_handler_with_headers(monkeypatch, headers, body: bytes):
+    import io
+    from auth_proxy import server as auth_proxy_server
+    from auth_proxy.server import AuthProxyHandler, ProxyResponse
+
+    forwarded = []
+
+    def _stub_forward(command, path, request_headers, request_body, *args, **kwargs):
+        forwarded.append({
+            "command": command,
+            "path": path,
+            "headers": request_headers,
+            "body": request_body,
+            "kwargs": kwargs,
+        })
+        return ProxyResponse(status=200, headers={}, body=b"ok")
+
+    monkeypatch.setattr(auth_proxy_server, "forward_request", _stub_forward)
+
+    class FakeServer:
+        auth_proxy_semaphore = None
+        auth_proxy_verbose = False
+
+    class FakeStore:
+        def access_token(self) -> str: return "tok"
+        def refresh(self) -> bool: return False
+
+    handler = AuthProxyHandler.__new__(AuthProxyHandler)
+    handler.server = FakeServer()
+    handler.rfile = io.BytesIO(body)
+    handler.wfile = io.BytesIO()
+    handler.headers = headers
+    handler.command = "POST"
+    handler.path = "/v1/messages"
+    handler.client_address = ("127.0.0.1", 0)
+    handler.request_version = "HTTP/1.1"
+    handler.protocol_version = "HTTP/1.1"
+    handler.requestline = "POST / HTTP/1.1"
+    handler.token_store = FakeStore()
+    handler.upstream_base = "https://api.anthropic.com"
+    handler.timeout = 5.0
+    handler.max_request_bytes = 1024
+    handler.max_response_bytes = 1024
+
+    handler._handle_proxy()
+    return handler.wfile.getvalue(), forwarded
+
 
 def test_forward_request_strips_caller_content_length_BUG_180() -> None:
     """BUG-180: a caller-supplied Content-Length must NOT be forwarded
@@ -1096,3 +1282,143 @@ def test_handler_rejects_duplicate_content_length_BUG_180(
     assert forwarded == [], (
         f"handler forwarded a duplicate-Content-Length request: {forwarded!r}"
     )
+
+
+def test_handler_accepts_identical_comma_list_content_length_BUG_118(
+    monkeypatch,
+) -> None:
+    """BUG-118 happy path: RFC 9112 permits a comma-list Content-Length
+    when every member is the same value."""
+    from http.client import HTTPMessage
+
+    headers = HTTPMessage()
+    headers.add_header("Content-Length", "5, 5")
+
+    out, forwarded = _run_auth_proxy_handler_with_headers(
+        monkeypatch, headers, b"abcdeextra",
+    )
+
+    assert b"200" in out, f"expected 200 for legal comma-list, got {out[:200]!r}"
+    assert len(forwarded) == 1
+    assert forwarded[0]["body"] == b"abcde"
+
+
+def test_handler_accepts_identical_duplicate_comma_content_length_BUG_118(
+    monkeypatch,
+) -> None:
+    """BUG-118 edge path: duplicated header entries can themselves contain
+    equivalent comma-lists; all flattened values still describe length 5."""
+    from http.client import HTTPMessage
+
+    headers = HTTPMessage()
+    headers.add_header("Content-Length", "5, 5")
+    headers.add_header("Content-Length", "5")
+
+    out, forwarded = _run_auth_proxy_handler_with_headers(
+        monkeypatch, headers, b"abcde",
+    )
+
+    assert b"200" in out, f"expected 200 for equivalent duplicates, got {out[:200]!r}"
+    assert len(forwarded) == 1
+    assert forwarded[0]["body"] == b"abcde"
+
+
+def test_handler_rejects_conflicting_comma_list_content_length_BUG_118(
+    monkeypatch,
+) -> None:
+    """BUG-118 sad path: a single comma-list with different values is still
+    an HTTP framing error and must not be forwarded."""
+    from http.client import HTTPMessage
+
+    headers = HTTPMessage()
+    headers.add_header("Content-Length", "5, 10")
+
+    out, forwarded = _run_auth_proxy_handler_with_headers(
+        monkeypatch, headers, b"abcde",
+    )
+
+    assert b"400" in out, (
+        f"expected 400 for conflicting comma-list, got {out[:200]!r}"
+    )
+    assert forwarded == []
+
+
+def test_handler_rejects_chunked_request_body_BUG_508(monkeypatch) -> None:
+    """BUG-508: BaseHTTPRequestHandler does not decode chunked bodies for
+    us. If the proxy accepts Transfer-Encoding: chunked, it reads zero bytes
+    (no Content-Length), strips the hop-by-hop header, and forwards an empty
+    request upstream. Unsupported chunked requests must fail before forward.
+    """
+    from http.client import HTTPMessage
+
+    headers = HTTPMessage()
+    headers.add_header("Transfer-Encoding", "chunked")
+
+    out, forwarded = _run_auth_proxy_handler_with_headers(
+        monkeypatch, headers, b"5\r\nhello\r\n0\r\n\r\n",
+    )
+
+    assert b"501" in out, (
+        f"expected 501 for unsupported chunked request, got {out[:200]!r}"
+    )
+    assert forwarded == []
+
+
+# --- BUG-757: in-place rewrite must not follow symlinks / swapped files -------
+# The in-place rewrite (`_rewrite_in_place_from_tmp`) is the fallback used when
+# `os.replace` fails on a bind mount (the in-container token at /auth/.claude.json
+# on a world-traversable tmpfs, mode 1733). It opened the destination with a plain
+# `path.open("r+b")` — NO O_NOFOLLOW and NO dev/ino check — so an attacker who
+# swaps the token file for a symlink gets the FRESH OAuth token written through it
+# to an arbitrary target. happy / sad / edge.
+
+def test_rewrite_in_place_refuses_symlinked_token_file_BUG_757(
+    tmp_path: Path,
+) -> None:
+    victim = tmp_path / "victim.txt"
+    victim.write_text("SECRET-VICTIM", encoding="utf-8")
+    token = tmp_path / "token.json"          # attacker swaps this for a symlink
+    token.symlink_to(victim)
+    tmp = tmp_path / "new.tmp"
+    tmp.write_text("FRESH-OAUTH-TOKEN", encoding="utf-8")
+
+    raised = False
+    try:
+        oauth_refresh._rewrite_in_place_from_tmp(tmp, token)
+    except OSError:
+        raised = True
+    assert raised, "in-place rewrite must REFUSE a symlinked destination"
+    # the fresh token was NOT written through the symlink to the victim:
+    assert victim.read_text(encoding="utf-8") == "SECRET-VICTIM"
+    assert token.is_symlink()                # the symlink itself is untouched
+
+
+def test_rewrite_in_place_refuses_hardlinked_token_file_BUG_757(
+    tmp_path: Path,
+) -> None:
+    real = tmp_path / "token.json"
+    real.write_text("OLD-TOKEN", encoding="utf-8")
+    os.link(real, tmp_path / "alias.json")   # nlink == 2 (attacker-aliased)
+    tmp = tmp_path / "new.tmp"
+    tmp.write_text("FRESH", encoding="utf-8")
+
+    raised = False
+    try:
+        oauth_refresh._rewrite_in_place_from_tmp(tmp, real)
+    except OSError:
+        raised = True
+    assert raised, "in-place rewrite must REFUSE a hard-linked destination"
+    assert real.read_text(encoding="utf-8") == "OLD-TOKEN"   # not rewritten
+
+
+def test_rewrite_in_place_updates_regular_file_happy(tmp_path: Path) -> None:
+    token = tmp_path / "token.json"
+    token.write_text("OLD-CONTENT", encoding="utf-8")
+    tmp = tmp_path / "new.tmp"
+    tmp.write_text("NEW-CONTENT", encoding="utf-8")
+
+    oauth_refresh._rewrite_in_place_from_tmp(tmp, token)
+    assert token.read_text(encoding="utf-8") == "NEW-CONTENT"
+    assert not token.is_symlink()
+    assert stat.S_IMODE(token.stat().st_mode) == 0o600
+    assert not tmp.exists()                  # tmp cleaned up after the rewrite

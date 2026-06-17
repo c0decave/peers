@@ -33,6 +33,14 @@ def _make_e2e_setup(tmp_path: Path, e2e_body: str) -> Path:
     return tmp_path
 
 
+def _replace_contracts_sha_with_symlink(tmp_path: Path) -> None:
+    sha_path = tmp_path / ".peers" / "contracts.sha"
+    backup = tmp_path / "contracts-sha-backup.json"
+    backup.write_text(sha_path.read_text(encoding="utf-8"), encoding="utf-8")
+    sha_path.unlink()
+    sha_path.symlink_to(backup)
+
+
 def _make_non_e2e_setup(tmp_path: Path) -> Path:
     """Project with NO e2e.sh — should result in skip."""
     plan_dir = tmp_path / ".peers"
@@ -97,3 +105,17 @@ def test_e2e_timeout(tmp_path, capsys):
     assert rc == 1
     out = capsys.readouterr().out
     assert "timed out" in out
+
+
+def test_e2e_unsafe_contracts_sha_reports_fail_without_traceback_BUG_521(
+    tmp_path, capsys,
+):
+    _make_e2e_setup(tmp_path, "#!/bin/sh\nexit 0\n")
+    _replace_contracts_sha_with_symlink(tmp_path)
+
+    rc = e2e_pass.main(str(tmp_path))
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "e2e-pass FAIL" in out
+    assert "contracts.sha" in out

@@ -26,6 +26,14 @@ def _make_setup(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _replace_contracts_sha_with_symlink(tmp_path: Path) -> None:
+    sha_path = tmp_path / ".peers" / "contracts.sha"
+    backup = tmp_path / "contracts-sha-backup.json"
+    backup.write_text(sha_path.read_text(encoding="utf-8"), encoding="utf-8")
+    sha_path.unlink()
+    sha_path.symlink_to(backup)
+
+
 def test_clean_contracts_pass(tmp_path, capsys):
     _make_setup(tmp_path)
     rc = contracts_unchanged.main(str(tmp_path))
@@ -68,3 +76,17 @@ def test_malformed_contracts_sha_fails(tmp_path, capsys):
     assert rc == 1
     out = capsys.readouterr().out
     assert "malformed" in out.lower()
+
+
+def test_unsafe_contracts_sha_reports_fail_without_traceback_BUG_521(
+    tmp_path, capsys,
+):
+    _make_setup(tmp_path)
+    _replace_contracts_sha_with_symlink(tmp_path)
+
+    rc = contracts_unchanged.main(str(tmp_path))
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "contracts-unchanged FAIL" in out
+    assert "contracts.sha" in out

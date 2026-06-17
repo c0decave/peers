@@ -31,6 +31,18 @@ def _attest(tmp_path: Path, sha: str, peer: str):
     _git(tmp_path, "notes", "--ref=peers-attest", "add", "-f", "-m", peer, sha)
 
 
+def _review_commit_as(tmp_path: Path, artifact: str, peer: str) -> str:
+    """The reviewer signs off by making a substrate-attested
+    ``peers-review: <artifact>`` commit (FU-2 independent-review mechanism)."""
+    _git(tmp_path, "config", "user.email", _SHARED)
+    _git(tmp_path, "config", "user.name", "dash")
+    _git(tmp_path, "commit", "-q", "--allow-empty",
+         "-m", f"peers-review: {artifact}\n\nLGTM")
+    sha = _git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+    _attest(tmp_path, sha, peer)
+    return sha
+
+
 def _write_plan(tmp_path: Path, body: str):
     (tmp_path / "PLAN.md").write_text(f"""# F
 ## Meta
@@ -152,17 +164,78 @@ def test_co_impl_step_without_independent_review_fails(tmp_path, capsys):
     assert "src/b.py" in capsys.readouterr().out
 
 
-def test_co_impl_step_passes_with_independent_justification(tmp_path, capsys):
-    # BUG-009 fix (A2): the co-implemented step converges once the OTHER peer
-    # signs an independent review of the self-authored file. a.py is reviewed
-    # by the checkoff (claude!=codex); b.py is reviewed via claude's signed
-    # justification -> every file independently reviewed -> PASS.
+def test_co_impl_step_passes_with_independent_review_commit(tmp_path, capsys):
+    # BUG-009 fix (A2) / FU-2: the co-implemented step converges once the OTHER
+    # peer signs an independent review of the self-authored file. a.py is
+    # reviewed by the checkoff (claude!=codex); b.py (impl+checkoff both codex)
+    # is reviewed via claude's substrate-attested `peers-review: src/b.py`
+    # commit -> every file independently reviewed -> PASS.
+    _co_impl_setup(tmp_path)
+    _review_commit_as(tmp_path, "src/b.py", "claude")
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 0
+
+
+def test_co_impl_forged_log_entry_does_not_bless(tmp_path, capsys):
+    # FU-2 security regression: the OLD escape trusted a justifications.log
+    # reviewer field (agent-authored free text). A forged entry naming the
+    # other peer must NO LONGER grant the escape — the log is not the
+    # mechanism; only an attested peers-review commit is.
     from peers_ctl.justifications import append_justification
     _co_impl_setup(tmp_path)
     append_justification(tmp_path / ".peers", "src/b.py", 1,
-                         "reviewed codex's impl", "claude")
+                         "forged self-bless", "claude")
     rc = checkoff_by_other_peer.main(str(tmp_path))
-    assert rc == 0
+    assert rc == 1
+    assert "src/b.py" in capsys.readouterr().out
+
+
+def test_co_impl_self_review_commit_does_not_bless(tmp_path, capsys):
+    # FU-2 sad: codex cannot review its OWN b.py — a peers-review commit
+    # attested to the implementer (codex) is excluded from independent review.
+    _co_impl_setup(tmp_path)
+    _review_commit_as(tmp_path, "src/b.py", "codex")
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 1
+    assert "src/b.py" in capsys.readouterr().out
+
+
+def test_co_impl_multi_author_self_review_rejected(tmp_path, capsys):
+    # CRITICAL (adversarial review): claude authors src/b.py; codex makes a
+    # trivial edit (becoming the last editor) and checks off; claude — the
+    # ORIGINAL author — self-reviews. Excluding only the last editor (codex)
+    # would let claude self-bless. Excluding ALL attested file authors rejects
+    # it.
+    _init_git(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "b.py").write_text("b\n")
+    _write_plan(tmp_path, "- [ ] [STEP-1] x\n  - touches: src/b.py\n")
+    s_impl = _commit_as(tmp_path, _SHARED, "dash", ["src/b.py", "PLAN.md"],
+                        "impl b\n\nPeer: claude")
+    _attest(tmp_path, s_impl, "claude")
+    # codex trivially edits b.py → becomes the last editor before checkoff
+    (tmp_path / "src" / "b.py").write_text("b\nedited\n")
+    s_edit = _commit_as(tmp_path, _SHARED, "dash", ["src/b.py"],
+                        "tweak\n\nPeer: codex")
+    _attest(tmp_path, s_edit, "codex")
+    _write_plan(tmp_path, "- [x] [STEP-1] x\n  - touches: src/b.py\n")
+    s_co = _commit_as(tmp_path, _SHARED, "dash", ["PLAN.md"],
+                      "checkoff\n\nPeer: codex")
+    _attest(tmp_path, s_co, "codex")
+    _review_commit_as(tmp_path, "src/b.py", "claude")  # original author self-reviews
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 1
+    assert "src/b.py" in capsys.readouterr().out
+
+
+def test_co_impl_review_commit_for_other_file_does_not_bless(tmp_path, capsys):
+    # FU-2 edge: an attested review of a DIFFERENT file does not satisfy the
+    # review requirement for src/b.py (artifact binding is exact).
+    _co_impl_setup(tmp_path)
+    _review_commit_as(tmp_path, "src/a.py", "claude")  # wrong file
+    rc = checkoff_by_other_peer.main(str(tmp_path))
+    assert rc == 1
+    assert "src/b.py" in capsys.readouterr().out
 
 
 def test_reattest_escapes_latch(tmp_path, capsys):
@@ -226,13 +299,11 @@ def test_cli_run_check_co_impl_self_bless_rejected(tmp_path):
 
 
 def test_cli_run_check_co_impl_independent_review_passes(tmp_path):
-    """Same co-implemented step converges once the OTHER peer signs an
-    independent review of the self-authored file (BUG-009 fix), proven
-    through the real CLI path."""
-    from peers_ctl.justifications import append_justification
+    """Same co-implemented step converges once the OTHER peer makes a
+    substrate-attested `peers-review: src/b.py` commit (BUG-009 fix / FU-2),
+    proven through the real CLI path."""
     _co_impl_setup(tmp_path)
-    append_justification(tmp_path / ".peers", "src/b.py", 1,
-                         "reviewed codex's impl", "claude")
+    _review_commit_as(tmp_path, "src/b.py", "claude")
     r = _cli_run_check(tmp_path, "checkoff_by_other_peer")
     assert r.returncode == 0, r.stdout + r.stderr
 

@@ -159,7 +159,7 @@ class _Driver:
 
     def _record_tick_accounting(
         self, state: dict[str, Any], success: bool, tick_dt: int,
-        peer: str | None = None,
+        peer: str | None = None, rate_limited: bool = False,
     ) -> None:
         self.events.append("accounting")
         state["iteration"] += 1
@@ -224,7 +224,10 @@ class _Driver:
     ) -> None:
         self.events.append("emit")
 
-    def _update_convergence_counter(self, state: dict[str, Any]) -> None:
+    def _update_convergence_counter(
+        self, state: dict[str, Any], success: bool = True,
+        rate_limited: bool = False,
+    ) -> None:
         self.events.append("convergence")
 
     def _submit_gate_eval(self, sha: str) -> None:
@@ -429,6 +432,34 @@ def test_tick_loop_returns_halt_exit_before_finalizing_tick():
         "control_verify",
         "halt_check",
     ]
+
+
+def test_tick_loop_returns_all_degraded_halt_after_finalizing_tick():
+    state = {"iteration": 0}
+
+    class AllDegradedDriver(_Driver):
+        def _maybe_halt(self, state: dict[str, Any]) -> dict[str, Any]:
+            self.events.append("maybe_halt")
+            return {
+                "reason": "peer-unavailable:all-peers-degraded",
+                "state": state,
+            }
+
+        def _submit_gate_eval(self, sha: str) -> None:
+            self.events.append(f"submit_gate_eval:{sha}")
+
+    driver = AllDegradedDriver()
+
+    result = TickLoop(driver).run(state, _TurnManager(driver.events), None, 0)
+
+    assert result["reason"] == "peer-unavailable:all-peers-degraded"
+    assert state["iteration"] == 1
+    assert driver.events.count("health_invoke") == 1
+    assert "run_log:12:0.5" in driver.events
+    assert "save" in driver.events
+    assert "emit" in driver.events
+    assert not any(e.startswith("submit_gate_eval:") for e in driver.events)
+    assert "pre:1" not in driver.events
 
 
 def test_tick_loop_rejects_incomplete_driver_contract():

@@ -246,6 +246,219 @@ def test_build_container_argv_skips_opencode_when_absent(
     assert "opencode" not in " ".join(argv)
 
 
+def _auth_proxy_home(tmp_path: Path, real_token: str = "REAL-OAUTH-ACCESS-TOKEN"):
+    """A fake $HOME whose ~/.claude/.credentials.json enables the auth-proxy."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude").mkdir(parents=True)
+    (fake_home / ".claude" / ".credentials.json").write_text(
+        '{"claudeAiOauth": {"accessToken": "' + real_token + '"}}',
+        encoding="utf-8",
+    )
+    (fake_home / ".codex").mkdir(parents=True)
+    return fake_home
+
+
+def test_build_container_argv_sets_anthropic_auth_token_in_auth_proxy_mode(
+    tmp_path: Path, monkeypatch,
+):
+    """In auth-proxy mode the workspace must receive a NON-EMPTY
+    ANTHROPIC_AUTH_TOKEN as well as ANTHROPIC_BASE_URL. The claude CLI refuses
+    to issue any request when it has no credential of any kind (apiKeySource
+    "none" -> "Not logged in"), so ANTHROPIC_BASE_URL alone leaves it inert and
+    it never reaches the sidecar. A placeholder bearer makes it authenticate
+    locally and route through the proxy, which strips+replaces Authorization."""
+    from peers_ctl import runner
+    from peers_ctl.runner import _build_container_argv
+    from peers_ctl.store import Project
+    monkeypatch.setattr(runner, "AUTH_PROXY_DISABLED", False)
+    fake_home = _auth_proxy_home(tmp_path)
+    monkeypatch.setattr(runner.Path, "home", staticmethod(lambda: fake_home))
+    (tmp_path / "tgt").mkdir()
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    argv = _build_container_argv(p, max_ticks=1, extra_args=())
+    assert f"ANTHROPIC_BASE_URL={runner.AUTH_PROXY_URL}" in argv
+    tokens = [
+        argv[i + 1] for i, a in enumerate(argv[:-1])
+        if a == "-e" and argv[i + 1].startswith("ANTHROPIC_AUTH_TOKEN=")
+    ]
+    assert tokens, f"ANTHROPIC_AUTH_TOKEN missing in auth-proxy mode: {argv}"
+    value = tokens[0].split("=", 1)[1]
+    assert value.strip(), "ANTHROPIC_AUTH_TOKEN must be non-empty"
+
+
+def test_build_container_argv_auth_token_is_placeholder_not_real_credential(
+    tmp_path: Path, monkeypatch,
+):
+    """SECURITY: podman argv is ps-visible and the workspace is the untrusted
+    side. The ANTHROPIC_AUTH_TOKEN handed to the workspace must be a non-secret
+    placeholder; the REAL OAuth token lives only in the sidecar (which injects
+    it). The host credential must never leak into the container argv."""
+    from peers_ctl import runner
+    from peers_ctl.runner import _build_container_argv
+    from peers_ctl.store import Project
+    monkeypatch.setattr(runner, "AUTH_PROXY_DISABLED", False)
+    fake_home = _auth_proxy_home(tmp_path, real_token="SUPER-SECRET-REAL-TOKEN")
+    monkeypatch.setattr(runner.Path, "home", staticmethod(lambda: fake_home))
+    (tmp_path / "tgt").mkdir()
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    argv = _build_container_argv(p, max_ticks=1, extra_args=())
+    assert "SUPER-SECRET-REAL-TOKEN" not in " ".join(argv), (
+        "real OAuth token leaked into ps-visible container argv"
+    )
+
+
+def test_build_container_argv_omits_auth_token_in_legacy_mode(
+    tmp_path: Path, monkeypatch,
+):
+    """When the auth-proxy is disabled (no host token file), the workspace
+    mounts ~/.claude directly and must NOT carry ANTHROPIC_AUTH_TOKEN /
+    ANTHROPIC_BASE_URL (the CLI reads its own credentials)."""
+    from peers_ctl import runner
+    from peers_ctl.runner import _build_container_argv
+    from peers_ctl.store import Project
+    monkeypatch.setattr(runner, "AUTH_PROXY_DISABLED", False)
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude").mkdir(parents=True)  # dir only, no credentials.json
+    (fake_home / ".codex").mkdir(parents=True)
+    monkeypatch.setattr(runner.Path, "home", staticmethod(lambda: fake_home))
+    (tmp_path / "tgt").mkdir()
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    argv = _build_container_argv(p, max_ticks=1, extra_args=())
+    assert not any(
+        a.startswith("ANTHROPIC_AUTH_TOKEN=") for a in argv
+    ), f"legacy mode must not set ANTHROPIC_AUTH_TOKEN: {argv}"
+
+
+_CLAUDE_CODEX_CFG = """\
+peers:
+  - name: claude
+    argv: ["claude", "-p", "{PROMPT}"]
+    prompt_mode: argv-substitute
+  - name: codex
+    argv: ["codex", "exec", "{PROMPT}"]
+    prompt_mode: argv-substitute
+"""
+
+_CODEX_ONLY_CFG = """\
+peers:
+  - name: codex
+    argv: ["codex", "exec", "{PROMPT}"]
+    prompt_mode: argv-substitute
+"""
+
+
+def _scaffold_peers_config(tmp_path: Path, body: str, name: str = "x"):
+    from peers_ctl.store import Project
+    proj_dir = tmp_path / name
+    (proj_dir / ".peers").mkdir(parents=True)
+    (proj_dir / ".peers" / "config.yaml").write_text(body, encoding="utf-8")
+    return Project(name=name, path=str(proj_dir))
+
+
+class _RecordingSmoke:
+    """A fake probe_claude_smoke that records calls and returns a fixed status."""
+
+    def __init__(self, status: str):
+        self.status = status
+        self.calls = 0
+
+    def __call__(self):
+        from peers_ctl.doctor import ProbeResult
+        self.calls += 1
+        return ProbeResult(
+            status=self.status, label="claude smoke",
+            value="fake-detail", hint="", required=True,
+        )
+
+
+def _patch_claude_smoke(monkeypatch, status: str = "OK") -> None:
+    """Patch the in-container claude smoke the start preflight runs lazily.
+
+    The preflight does ``from peers_ctl.doctor import probe_claude_smoke`` at
+    call time, so patching the doctor-module attribute controls it (survives a
+    ``runner`` reload, which does not reload doctor)."""
+    import peers_ctl.doctor as doctor
+    from peers_ctl.doctor import ProbeResult
+    monkeypatch.setattr(
+        doctor, "probe_claude_smoke",
+        lambda: ProbeResult(
+            status=status, label="claude smoke",
+            value="patched", hint="", required=True,
+        ),
+    )
+
+
+def test_container_preflight_refuses_when_claude_configured_and_smoke_fails(
+    tmp_path: Path,
+):
+    """v26 lesson: a broken in-container claude auth silently degrades the run
+    to codex-solo. The preflight must REFUSE start when a claude peer is
+    configured but the live smoke fails."""
+    from peers_ctl.runner import _ensure_claude_can_authenticate_for_container
+    proj = _scaffold_peers_config(tmp_path, _CLAUDE_CODEX_CFG)
+    smoke = _RecordingSmoke("MISS")
+    with pytest.raises(ValueError, match="claude"):
+        _ensure_claude_can_authenticate_for_container(proj, _smoke=smoke)
+    assert smoke.calls == 1
+
+
+def test_container_preflight_passes_when_claude_smoke_ok(tmp_path: Path):
+    """A configured claude peer with a passing smoke proceeds (smoke is run)."""
+    from peers_ctl.runner import _ensure_claude_can_authenticate_for_container
+    proj = _scaffold_peers_config(tmp_path, _CLAUDE_CODEX_CFG)
+    smoke = _RecordingSmoke("OK")
+    _ensure_claude_can_authenticate_for_container(proj, _smoke=smoke)
+    assert smoke.calls == 1
+
+
+def test_container_preflight_skips_smoke_without_claude_peer(tmp_path: Path):
+    """A codex-only project must NOT run the (slow, API-spending) claude smoke."""
+    from peers_ctl.runner import _ensure_claude_can_authenticate_for_container
+    proj = _scaffold_peers_config(tmp_path, _CODEX_ONLY_CFG)
+    smoke = _RecordingSmoke("MISS")  # would fail — but must never be called
+    _ensure_claude_can_authenticate_for_container(proj, _smoke=smoke)
+    assert smoke.calls == 0
+
+
+def test_container_preflight_skip_flag_bypasses_smoke(tmp_path: Path):
+    """--skip-claude-smoke bypasses the preflight even with a claude peer."""
+    from peers_ctl.runner import _ensure_claude_can_authenticate_for_container
+    proj = _scaffold_peers_config(tmp_path, _CLAUDE_CODEX_CFG)
+    smoke = _RecordingSmoke("MISS")
+    _ensure_claude_can_authenticate_for_container(proj, skip=True, _smoke=smoke)
+    assert smoke.calls == 0
+
+
+def test_build_container_argv_runs_research_subcommand(tmp_path: Path):
+    """A research run reuses ALL the container plumbing (sidecars, auth, mounts)
+    but swaps the peers subcommand: `peers research /work ...` instead of the
+    default `peers run`. No --max-ticks is injected — the research subcmd carries
+    its own args."""
+    from peers_ctl.runner import _build_container_argv
+    from peers_ctl.store import Project
+    (tmp_path / "tgt").mkdir()
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    sub = ["research", "/work", "--modalities", "codebase,web", "--peer", "claude"]
+    argv = _build_container_argv(p, None, (), peers_subcmd=sub)
+    img_idx = argv.index("peers:dev")
+    after = argv[img_idx + 1:]
+    assert after == sub, f"expected research subcmd after image, got {after}"
+    assert "--max-ticks" not in argv
+    assert any(f"{tmp_path / 'tgt'}:/work" in a for a in argv)
+
+
+def test_build_container_argv_default_still_runs_loop(tmp_path: Path):
+    """Without peers_subcmd, the default behavior is unchanged: `peers run`."""
+    from peers_ctl.runner import _build_container_argv
+    from peers_ctl.store import Project
+    (tmp_path / "tgt").mkdir()
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+    argv = _build_container_argv(p, 5, ())
+    after = argv[argv.index("peers:dev") + 1:]
+    assert after[0] == "run"
+    assert "--max-ticks" in after
+
+
 def test_build_container_argv_carries_pids_limit(tmp_path: Path):
     """podman's default pids cgroup
     is 2048, which gets exhausted by claude/codex orphan grandchildren
@@ -492,6 +705,54 @@ def test_build_container_argv_uses_auth_proxy_without_claude_json_mount(
     assert not any(".claude.json:~/.claude.json" in a for a in argv)
 
 
+def test_auth_proxy_enabled_for_relocated_credentials_BUG_510(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Claude Code now stores OAuth tokens in ~/.claude/.credentials.json.
+
+    Auth-proxy mode must activate for that layout even when the legacy
+    ~/.claude.json metadata file is absent; otherwise the peer container runs
+    in legacy auth mode and can see the token-bearing ~/.claude directory.
+    """
+    import peers_ctl.runner as r
+
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / ".credentials.json").write_text("{}")
+    monkeypatch.setattr(r, "AUTH_PROXY_DISABLED", False)
+
+    assert r._auth_proxy_enabled(tmp_path) is True
+
+
+def test_build_container_argv_auth_proxy_hides_claude_dir_BUG_510(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Auth-proxy mode must not mount host ~/.claude into the workspace.
+
+    The relocated credentials file lives inside that directory, so mounting the
+    whole directory gives untrusted peer code direct read/write access to the
+    long-lived OAuth credential the sidecar is meant to isolate.
+    """
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+
+    home_claude = tmp_path / ".claude"
+    home_claude.mkdir()
+    (home_claude / ".credentials.json").write_text("{}")
+    (tmp_path / "tgt").mkdir()
+    monkeypatch.setattr(r.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(r, "AUTH_PROXY_DISABLED", False)
+    p = Project(name="x", path=str(tmp_path / "tgt"))
+
+    argv = r._build_container_argv(p, max_ticks=1, extra_args=())
+
+    env_specs = [argv[i + 1] for i, a in enumerate(argv)
+                 if a in ("-e", "--env") and i + 1 < len(argv)]
+    assert "ANTHROPIC_BASE_URL=http://127.0.0.1:8080" in env_specs
+    host_mount = f"{home_claude}:~/.claude"
+    assert host_mount not in argv
+    assert "~/.claude:rw,nosuid,nodev,size=16m" in argv
+
+
 def _write_openrouter_config(target: Path, *, legacy: bool = False) -> None:
     peer_dir = target / ".peers"
     peer_dir.mkdir(parents=True, exist_ok=True)
@@ -594,6 +855,13 @@ health: {idle_timeout_s: 5, absolute_max_runtime_s: 10}
 """)
 
 
+def _symlink_peers_to_outside(target: Path, outside: Path) -> None:
+    try:
+        (target / ".peers").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable for this platform: {exc}")
+
+
 def _env_specs(argv: list[str]) -> list[str]:
     return [
         argv[i + 1] for i, value in enumerate(argv)
@@ -637,6 +905,73 @@ def test_build_proxy_argv_rejects_invalid_peer_config(tmp_path: Path):
 
     with pytest.raises(ValueError, match="invalid peer config"):
         _build_proxy_argv(Project(name="x", path=str(target)))
+
+
+def test_runner_peer_specs_refuse_symlinked_peers_ancestor_BUG_520(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Sad: project config must not be read through a symlinked .peers dir."""
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+
+    outside = tmp_path / "outside-peers"
+    outside.mkdir()
+    (outside / "config.yaml").write_text("""
+driver: orchestrator
+comm: git
+peers:
+  - name: codex
+    tool: codex
+    argv: ["codex", "exec", "{PROMPT}"]
+    prompt_mode: argv-substitute
+    provider: openrouter
+""")
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _symlink_peers_to_outside(target, outside)
+    monkeypatch.setattr(r.Path, "home", classmethod(lambda cls: tmp_path))
+
+    with pytest.raises(ValueError, match="unsafe project config"):
+        r._build_container_argv(
+            Project(name="x", path=str(target)), max_ticks=1, extra_args=(),
+        )
+
+
+def test_runner_egress_allow_ignores_symlinked_peers_ancestor_BUG_520(
+    tmp_path: Path,
+) -> None:
+    """Edge: fail closed instead of importing allow-list lines from outside."""
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+
+    outside = tmp_path / "outside-peers"
+    outside.mkdir()
+    (outside / "config.yaml").write_text(
+        "egress_allow:\n  - '^attacker.example$'\n"
+    )
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _symlink_peers_to_outside(target, outside)
+
+    assert r._config_egress_allow(Project(name="x", path=str(target))) == ()
+
+
+def test_runner_graphify_opt_in_ignores_symlinked_peers_ancestor_BUG_520(
+    tmp_path: Path,
+) -> None:
+    """Edge: graphify opt-in must come from the real project control dir."""
+    import peers_ctl.runner as r
+    from peers_ctl.store import Project
+
+    outside = tmp_path / "outside-peers"
+    outside.mkdir()
+    (outside / "config.yaml").write_text("graphify_mcp: true\n")
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _symlink_peers_to_outside(target, outside)
+
+    assert r._graphify_enabled(Project(name="x", path=str(target))) is False
 
 
 def test_proxy_image_runtime_filter_files_are_wired_together():
@@ -986,11 +1321,11 @@ def test_start_project_container_writes_starttime(tmp_path: Path,
     stub.write_text(
         "#!/bin/sh\n"
         "case \"$1\" in\n"
-        "  run) echo deadbeefcafe1234 ;;\n"
+        "  run) echo deadbeefcafe1234; : > \"$(dirname \"$0\")/.up\" ;;\n"
         "  logs) sleep 30 ;;\n"
         "  rm) ;;\n"
         "  stop) ;;\n"
-        "  ps) ;;\n"
+        "  ps) [ -f \"$(dirname \"$0\")/.up\" ] && echo peers-egress-proxy_x || : ;;\n"
         "  *) ;;\n"
         "esac\n"
     )
@@ -1003,6 +1338,7 @@ def test_start_project_container_writes_starttime(tmp_path: Path,
     monkeypatch.setattr(
         runner_mod, "check_container_version_drift", lambda: ("ok", "")
     )
+    _patch_claude_smoke(monkeypatch)  # not an auth test — let the preflight pass
 
     pid = runner_mod.start_project(
         store, store.get("x"), max_ticks=1, container=True,
@@ -1092,6 +1428,85 @@ def test_start_project_container_refuses_major_version_drift(
         runner_mod.start_project(store, store.get("x"), container=True)
 
 
+def test_start_project_container_refuses_when_claude_smoke_fails(
+    tmp_path: Path, monkeypatch
+):
+    """Wiring: a container start with a claude peer runs the in-container claude
+    preflight and REFUSES (ValueError) when the smoke fails — the run never
+    launches to silently degrade to codex-solo (the v26 regression)."""
+    from peers_ctl.store import Project, Store
+
+    cfg = tmp_path / "ctl"
+    store = Store(cfg)
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_minimal_peer_config(target)  # configures a claude peer
+    store.add(Project(name="x", path=str(target)))
+
+    stub = tmp_path / "podman_stub.sh"
+    stub.write_text(
+        "#!/bin/sh\ncase \"$1\" in\n"
+        "  run) echo deadbeefcafe1234; : > \"$(dirname \"$0\")/.up\" ;;\n  logs) sleep 30 ;;\n"
+        "  ps) [ -f \"$(dirname \"$0\")/.up\" ] && echo peers-egress-proxy_x || : ;;\n  rm) ;;\n  stop) ;;\nesac\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("PEERS_CTL_PODMAN_BIN", str(stub))
+
+    import importlib
+    import peers_ctl.runner as runner_mod
+    importlib.reload(runner_mod)
+    monkeypatch.setattr(
+        runner_mod, "check_container_version_drift", lambda: ("ok", "")
+    )
+    _patch_claude_smoke(monkeypatch, status="MISS")
+
+    with pytest.raises(ValueError, match="claude smoke"):
+        runner_mod.start_project(store, store.get("x"), container=True)
+    # the preflight refused BEFORE the run was registered as running
+    assert store.get("x").state != "running"
+
+
+def test_start_project_container_skip_claude_smoke_bypasses_preflight(
+    tmp_path: Path, monkeypatch
+):
+    """--skip-claude-smoke (skip_claude_smoke=True) launches even when the smoke
+    would fail — the documented operator bypass for a transient failure."""
+    from peers_ctl.store import Project, Store
+
+    cfg = tmp_path / "ctl"
+    store = Store(cfg)
+    target = tmp_path / "tgt"
+    target.mkdir()
+    _write_minimal_peer_config(target)
+    store.add(Project(name="x", path=str(target)))
+
+    stub = tmp_path / "podman_stub.sh"
+    stub.write_text(
+        "#!/bin/sh\ncase \"$1\" in\n"
+        "  run) echo deadbeefcafe1234; : > \"$(dirname \"$0\")/.up\" ;;\n  logs) sleep 30 ;;\n"
+        "  ps) [ -f \"$(dirname \"$0\")/.up\" ] && echo peers-egress-proxy_x || : ;;\n  rm) ;;\n  stop) ;;\nesac\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("PEERS_CTL_PODMAN_BIN", str(stub))
+
+    import importlib
+    import peers_ctl.runner as runner_mod
+    importlib.reload(runner_mod)
+    monkeypatch.setattr(
+        runner_mod, "check_container_version_drift", lambda: ("ok", "")
+    )
+    _patch_claude_smoke(monkeypatch, status="MISS")  # would refuse without skip
+
+    try:
+        pid = runner_mod.start_project(
+            store, store.get("x"), container=True, skip_claude_smoke=True,
+        )
+        assert pid > 0
+        assert store.get("x").state == "running"
+    finally:
+        runner_mod.stop_project(store, store.get("x"), grace_s=1)
+
+
 def test_start_project_container_warns_on_minor_version_drift(
     tmp_path: Path, monkeypatch, capsys
 ):
@@ -1108,9 +1523,9 @@ def test_start_project_container_warns_on_minor_version_drift(
     stub.write_text(
         "#!/bin/sh\n"
         "case \"$1\" in\n"
-        "  run) echo deadbeefcafe1234 ;;\n"
+        "  run) echo deadbeefcafe1234; : > \"$(dirname \"$0\")/.up\" ;;\n"
         "  logs) sleep 30 ;;\n"
-        "  ps) ;;\n"
+        "  ps) [ -f \"$(dirname \"$0\")/.up\" ] && echo peers-egress-proxy_x || : ;;\n"
         "  rm) ;;\n"
         "  stop) ;;\n"
         "esac\n"
@@ -1123,6 +1538,7 @@ def test_start_project_container_warns_on_minor_version_drift(
     importlib.reload(runner_mod)
     monkeypatch.setattr(runner_mod, "check_container_version_drift",
                         lambda: ("warn", "container peers=1.3.0"))
+    _patch_claude_smoke(monkeypatch)  # not an auth test — let the preflight pass
 
     pid = runner_mod.start_project(store, store.get("x"), container=True)
     try:
@@ -1150,9 +1566,9 @@ def test_start_project_container_cleans_up_when_registry_update_fails(
     stub.write_text(
         "#!/bin/sh\n"
         "case \"$1\" in\n"
-        "  run) echo deadbeefcafe1234 ;;\n"
+        "  run) echo deadbeefcafe1234; : > \"$(dirname \"$0\")/.up\" ;;\n"
         "  logs) sleep 30 ;;\n"
-        "  ps) ;;\n"
+        "  ps) [ -f \"$(dirname \"$0\")/.up\" ] && echo peers-egress-proxy_x || : ;;\n"
         "  rm) ;;\n"
         "  stop) ;;\n"
         "esac\n"
@@ -1183,6 +1599,7 @@ def test_start_project_container_cleans_up_when_registry_update_fails(
     monkeypatch.setattr(store, "update", fail_update)
     monkeypatch.setattr(runner_mod, "_stop_container_best_effort", record_stop)
     monkeypatch.setattr(runner_mod, "_terminate_spawned_process", record_streamer)
+    _patch_claude_smoke(monkeypatch)  # not an auth test — let the preflight pass
 
     with pytest.raises(RuntimeError, match="registry write failed"):
         runner_mod.start_project(store, store.get("x"), container=True)

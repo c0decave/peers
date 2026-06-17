@@ -36,6 +36,14 @@ def _make_acceptance_setup(tmp_path: Path, script_body: str) -> Path:
     return tmp_path
 
 
+def _replace_contracts_sha_with_symlink(tmp_path: Path) -> None:
+    sha_path = tmp_path / ".peers" / "contracts.sha"
+    backup = tmp_path / "contracts-sha-backup.json"
+    backup.write_text(sha_path.read_text(encoding="utf-8"), encoding="utf-8")
+    sha_path.unlink()
+    sha_path.symlink_to(backup)
+
+
 def test_acceptance_pass_exit_zero(tmp_path, capsys):
     _make_acceptance_setup(tmp_path, "#!/bin/sh\nexit 0\n")
     rc = acceptance_pass.main(str(tmp_path))
@@ -90,3 +98,17 @@ def test_acceptance_output_truncation(tmp_path, capsys):
     assert "line_49" in out  # last line included
     assert "line_0" not in out  # first lines truncated
     assert "truncated" in out.lower() or "..." in out  # truncation indicator
+
+
+def test_acceptance_unsafe_contracts_sha_reports_fail_without_traceback_BUG_521(
+    tmp_path, capsys,
+):
+    _make_acceptance_setup(tmp_path, "#!/bin/sh\nexit 0\n")
+    _replace_contracts_sha_with_symlink(tmp_path)
+
+    rc = acceptance_pass.main(str(tmp_path))
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "acceptance-pass FAIL" in out
+    assert "contracts.sha" in out

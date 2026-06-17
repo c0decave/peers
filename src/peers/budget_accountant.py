@@ -2,15 +2,24 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+from peers.safe_io import read_bytes_under_root_no_follow
 
 
 _CONFIGURABLE_BUDGET_LIMITS = (
     "max_iterations", "max_runtime_s", "max_consecutive_failures",
     "max_tokens", "max_usd", "max_usd_mode",
 )
+# cap the operator-override read so a same-UID swap to a huge file
+# cannot exhaust memory in json.loads (defense-in-depth atop the BUG-513
+# no-follow read). Operator overrides are a handful of numeric caps; 64 KiB
+# is enormous headroom.
+_BUDGET_OVERRIDE_MAX_BYTES = 64 * 1024
 
 # Operator budget caps (`peers-ctl start --max-runtime ...`) are persisted
 # here, in `.peers/`, so they survive `_apply_config_budget` — which
@@ -20,6 +29,22 @@ _CONFIGURABLE_BUDGET_LIMITS = (
 # of state.json on purpose so it also works before state.json exists (the
 # first start of a freshly-init'd project).
 OPERATOR_BUDGET_OVERRIDE_FILE = "budget-overrides.json"
+
+
+def _nonnegative_int(value: object) -> int:
+    """Return a trusted non-negative integer counter, or 0."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+def _nonnegative_float(value: object) -> float:
+    """Return a trusted finite non-negative float counter, or 0.0."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        amount = float(value)
+        if math.isfinite(amount) and amount >= 0.0:
+            return amount
+    return 0.0
 
 
 def _parse_codex_json_usage(text: str) -> int | None:
@@ -45,8 +70,7 @@ def _parse_codex_json_usage(text: str) -> int | None:
         s = 0
         for key in ("input_tokens", "output_tokens"):
             v = usage.get(key)
-            if isinstance(v, int):
-                s += v
+            s += _nonnegative_int(v)
         total = (total or 0) + s
     return total
 
@@ -116,7 +140,8 @@ def _parse_claude_json_envelope(text: str) -> tuple[int, float]:
             return None
         if "usage" not in obj and "total_cost_usd" not in obj:
             return None
-        usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+        usage_raw = obj.get("usage")
+        usage = usage_raw if isinstance(usage_raw, dict) else {}
         token_keys = (
             "input_tokens",
             "cache_creation_input_tokens",
@@ -126,10 +151,9 @@ def _parse_claude_json_envelope(text: str) -> tuple[int, float]:
         tok = 0
         for key in token_keys:
             value = usage.get(key)
-            if isinstance(value, int):
-                tok += value
+            tok += _nonnegative_int(value)
         cost = obj.get("total_cost_usd")
-        usd = float(cost) if isinstance(cost, (int, float)) else 0.0
+        usd = _nonnegative_float(cost)
         return tok, usd
 
     for line in text.splitlines():
@@ -188,15 +212,13 @@ def _parse_opencode_tokens(text: str) -> tuple[int, float]:
         if isinstance(tokens, dict):
             tot = tokens.get("total")
             if isinstance(tot, int):
-                total_tok += tot
+                total_tok += _nonnegative_int(tot)
             else:
                 for key in ("input", "output"):
                     v = tokens.get(key)
-                    if isinstance(v, int):
-                        total_tok += v
+                    total_tok += _nonnegative_int(v)
         cost = part.get("cost")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            total_usd += float(cost)
+        total_usd += _nonnegative_float(cost)
     return total_tok, total_usd
 
 
@@ -205,6 +227,90 @@ _TOKEN_PARSERS = {
     "codex": _parse_codex_tokens,
     "opencode": _parse_opencode_tokens,
 }
+
+
+def _argv_emits_token_accounting(tool: str, argv: Sequence[str]) -> bool:
+    """True when ``argv`` selects a structured output mode the matching parser
+    can read tokens/cost from. The parsers (above) only account the JSON /
+    stream-json envelopes; a plain text invocation yields (0, 0.0)."""
+    def _switch_value_in(switch: str, allowed: set[str]) -> bool:
+        for i, arg in enumerate(argv):
+            if arg == switch and i + 1 < len(argv) and argv[i + 1] in allowed:
+                return True
+            if arg.startswith(switch + "=") and arg.split("=", 1)[1] in allowed:
+                return True
+        return False
+
+    if tool == "claude":
+        return _switch_value_in("--output-format", {"json", "stream-json"})
+    if tool == "codex":
+        return any(a == "--json" or a.startswith("--json=") for a in argv)
+    if tool == "opencode":
+        return _switch_value_in("--format", {"json"})
+    # unknown tool: no parser, so we cannot judge — caller must not false-warn.
+    return False
+
+
+def budget_argv_warning(
+    tool: str,
+    argv: Sequence[str],
+    *,
+    max_tokens: int | None = None,
+    max_usd: float | None = None,
+) -> str | None:
+    """BRAIN-09 preflight: warn when a budget cap is configured but the peer's
+    ``argv`` cannot emit the token/cost accounting the cap is enforced from, so
+    the cap would be silently inert. Returns a one-line warning, or ``None``
+    when there is nothing to warn about.
+
+    Stays silent for unknown tools (no parser to reason about) and when no cap
+    is set (a 0/None cap means "unlimited" — nothing to enforce)."""
+    has_cap_tokens = bool(max_tokens)  # 0/None -> unset
+    has_cap_usd = bool(max_usd)
+    if not (has_cap_tokens or has_cap_usd):
+        return None
+    if tool not in _TOKEN_PARSERS:
+        return None
+    if _argv_emits_token_accounting(tool, argv):
+        return None
+    caps = []
+    if has_cap_tokens:
+        caps.append("max_tokens")
+    if has_cap_usd:
+        caps.append("max_usd")
+    hint = {
+        "claude": "--output-format stream-json",
+        "codex": "--json",
+        "opencode": "--format json",
+    }.get(tool, "a JSON output mode")
+    return (
+        f"budget.{'/'.join(caps)} is set but the argv emits no parseable "
+        f"token/cost accounting (add {hint}); the cap will be silently "
+        f"UNENFORCED with this argv."
+    )
+
+
+def budget_argv_warnings(
+    specs: Sequence[Any],
+    *,
+    max_tokens: int | None = None,
+    max_usd: float | None = None,
+) -> list[str]:
+    """Per-peer BRAIN-09 preflight warnings for a run's peer specs. Each spec
+    is expected to expose ``name``, ``tool`` and ``argv``. Returns one
+    ``peer '<name>': <warning>`` line per peer whose argv cannot account for
+    the configured cap (empty when all are fine or no cap is set)."""
+    out: list[str] = []
+    for spec in specs:
+        warn = budget_argv_warning(
+            getattr(spec, "tool", ""),
+            tuple(getattr(spec, "argv", ()) or ()),
+            max_tokens=max_tokens,
+            max_usd=max_usd,
+        )
+        if warn:
+            out.append(f"peer '{getattr(spec, 'name', '<unknown>')}': {warn}")
+    return out
 
 
 class BudgetAccountant:
@@ -251,8 +357,14 @@ class BudgetAccountant:
         success: bool = True,
     ) -> None:
         budget = self.state["budget"]
-        budget["spent_tokens"] = budget.get("spent_tokens", 0) + tokens
-        budget["spent_usd"] = budget.get("spent_usd", 0.0) + usd
+        budget["spent_tokens"] = (
+            _nonnegative_int(budget.get("spent_tokens", 0))
+            + _nonnegative_int(tokens)
+        )
+        budget["spent_usd"] = (
+            _nonnegative_float(budget.get("spent_usd", 0.0))
+            + _nonnegative_float(usd)
+        )
         record_tick_accounting(self.state, success, duration_s)
 
     def snapshot(self) -> dict[str, Any]:
@@ -303,10 +415,20 @@ def read_operator_budget_overrides(repo: Path | str) -> dict[str, Any]:
     dropped, and ``max_usd_mode`` (a string knob, not an operator cap) is
     excluded.
     """
-    path = Path(repo) / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE
+    # read via safe_io so a same-UID symlink swap of the leaf
+    # OR the .peers ancestor cannot redirect this open to attacker-staged
+    # JSON. The controller-side write was hardened by BUG-238; this is the
+    # symmetric peers-side hardening.
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        raw = read_bytes_under_root_no_follow(
+            Path(repo), (".peers", OPERATOR_BUDGET_OVERRIDE_FILE),
+            max_bytes=_BUDGET_OVERRIDE_MAX_BYTES + 1,
+        )
+        # reject wholesale rather than json-parse a truncated prefix.
+        if len(raw) > _BUDGET_OVERRIDE_MAX_BYTES:
+            return {}
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(data, dict):
         return {}
@@ -385,18 +507,20 @@ def account_tokens_usd(
     if parser is None:
         return 0, 0.0
     tokens, usd = parser(run.stdout + run.stderr)
+    tokens = _nonnegative_int(tokens)
+    usd = _nonnegative_float(usd)
     state["budget"]["spent_tokens"] = (
-        state["budget"].get("spent_tokens", 0) + tokens
+        _nonnegative_int(state["budget"].get("spent_tokens", 0)) + tokens
     )
     state["budget"]["spent_usd"] = (
-        state["budget"].get("spent_usd", 0.0) + usd
+        _nonnegative_float(state["budget"].get("spent_usd", 0.0)) + usd
     )
     return tokens, usd
 
 
 def record_tick_accounting(
     state: dict[str, Any], success: bool, tick_dt: int,
-    peer: str | None = None,
+    peer: str | None = None, rate_limited: bool = False,
 ) -> None:
     """Record iteration/runtime counters for one completed tick.
 
@@ -404,12 +528,20 @@ def record_tick_accounting(
     `budget['wasted_runtime_per_tick']` so operators can see WHICH ticks
     burned which budget, not just the running sum. Capped at last 20
     entries (older fail-ticks drop off).
+
+    A `rate_limited` tick is NEUTRAL (full-depth-analysis §6): a transient
+    server 429/5xx must NOT count toward `max_consecutive_failures`. The v17
+    anti-degradation design (peer-health, rotation, backoff) already
+    special-cases it, but the budget layer did not — so an all-peers transient
+    outage would halt the run with `budget:max_consecutive_failures` after 5
+    ticks (`structured_halt`: "a transient error must NOT halt the run").
+    Wall-clock (`spent_iterations`/`spent_runtime_s`) still counts.
     """
     state["iteration"] += 1
     budget = state["budget"]
     budget["spent_iterations"] += 1
     budget["spent_runtime_s"] += tick_dt
-    if not success:
+    if not success and not rate_limited:
         budget["wasted_runtime_s"] = budget.get("wasted_runtime_s", 0) + tick_dt
         per_tick = budget.setdefault("wasted_runtime_per_tick", [])
         per_tick.append({
@@ -420,5 +552,5 @@ def record_tick_accounting(
         if len(per_tick) > 20:
             del per_tick[:-20]
     budget["consecutive_failures"] = (
-        0 if success else budget["consecutive_failures"] + 1
+        0 if (success or rate_limited) else budget["consecutive_failures"] + 1
     )

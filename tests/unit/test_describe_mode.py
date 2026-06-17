@@ -11,6 +11,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from peers.templates.modes.describe.checks import (
     description_converged,
     description_files_present,
@@ -289,6 +291,78 @@ def test_converged_respects_custom_n(tmp_path: Path) -> None:
     _commit_doc_change(repo, "SPEC.md", base + "f1\nf2\nf3\n", "fix 3")
     # Now last 3 commits are all small follow-ups → pass
     assert description_converged.main(str(repo)) == 0
+
+
+def test_read_convergence_n_fails_closed_when_yaml_missing_and_config_exists(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    # FU-1 defense-in-depth: PyYAML is a hard dependency, but if it is ever
+    # unavailable (ImportError -> module-level yaml=None) we cannot parse a
+    # config that may set a STRICTER describe_convergence_n. Silently falling
+    # back to DEFAULT_N would weaken a configured HARD gate, so when a
+    # config.yaml is present we fail CLOSED rather than guess.
+    monkeypatch.setattr(description_converged, "yaml", None)
+    peer_dir = tmp_path / ".peers"
+    peer_dir.mkdir()
+    (peer_dir / "config.yaml").write_text(
+        "goals:\n  describe_convergence_n: 5\n",
+    )
+    with pytest.raises(RuntimeError):
+        description_converged._read_convergence_n(tmp_path)
+
+
+def test_read_convergence_n_yaml_missing_no_config_uses_default(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    # edge: with PyYAML unavailable AND no config.yaml there is nothing
+    # configured to violate, so the gate keeps running with DEFAULT_N rather
+    # than failing closed spuriously (don't over-correct the hardening).
+    monkeypatch.setattr(description_converged, "yaml", None)
+    assert (
+        description_converged._read_convergence_n(tmp_path)
+        == description_converged.DEFAULT_N
+    )
+
+
+def test_converged_refuses_symlinked_config_leaf(
+    tmp_path: Path, capsys,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    peer_dir = repo / ".peers"
+    peer_dir.mkdir()
+    outside = tmp_path / "outside-config.yaml"
+    outside.write_text("goals:\n  describe_convergence_n: 1\n")
+    try:
+        (peer_dir / "config.yaml").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable for this platform: {exc}")
+
+    assert description_converged.main(str(repo)) == 1
+    out = capsys.readouterr().out
+    assert "description_converged FAIL" in out
+    assert "config.yaml unreadable" in out
+
+
+def test_converged_refuses_symlinked_peers_ancestor(
+    tmp_path: Path, capsys,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    outside_peers = tmp_path / "outside-peers"
+    outside_peers.mkdir()
+    (outside_peers / "config.yaml").write_text(
+        "goals:\n  describe_convergence_n: 1\n",
+    )
+    try:
+        (repo / ".peers").symlink_to(outside_peers, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable for this platform: {exc}")
+
+    assert description_converged.main(str(repo)) == 1
+    out = capsys.readouterr().out
+    assert "description_converged FAIL" in out
+    assert "config.yaml unreadable" in out
 
 
 # ---------------- mode discoverability ----------------

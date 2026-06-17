@@ -15,6 +15,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
 from peers.safe_io import read_text_under_root_no_follow
 
@@ -116,7 +117,7 @@ def _read_state(project_path: Path) -> dict | None:
             project_path, (".peers", "state.json"), max_bytes=_MAX_STATE_BYTES,
         )
         state = json.loads(raw)
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError, RecursionError):
         return None
     return state if isinstance(state, dict) else None
 
@@ -138,7 +139,7 @@ def _read_runs_jsonl(project_path: Path) -> list[dict]:
                 continue
             try:
                 entry = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
             # a corrupted / hand-edited runs.jsonl line that
             # decodes to non-dict JSON (list/string/number/bool) would
@@ -212,7 +213,7 @@ def _read_bug_counts(project_path: Path) -> tuple[int, dict[str, int]]:
                     continue
                 sev = str(meta.get("severity", "unknown")).lower()
                 by_severity[sev] += 1
-            except (json.JSONDecodeError, IndexError):
+            except (json.JSONDecodeError, RecursionError, IndexError):
                 by_severity["unknown"] += 1
     finally:
         os.close(bugs_fd)
@@ -231,7 +232,7 @@ def _safe_int(value: object, default: int | None = 0) -> int | None:
     if isinstance(value, bool):
         return default
     try:
-        return int(value)  # type: ignore[arg-type]
+        return int(cast(Any, value))
     except (TypeError, ValueError, OverflowError):
         return default
 

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import yaml
 
-from peers.safe_io import read_text_no_symlink
+from peers.safe_io import read_bytes_no_symlink, read_text_no_symlink
 
 _KINDS = {"module", "class", "function", "method"}
 _REQUIRED = ("id", "kind", "file", "line")
@@ -23,6 +23,7 @@ _REQUIRED = ("id", "kind", "file", "line")
 # generously — typical CODEMAP.yaml is well under 1 MiB.
 _CODEMAP_MAX_BYTES = 8 * 1024 * 1024
 _ARCHITECTURE_MAX_BYTES = 4 * 1024 * 1024
+_SOURCE_MAX_BYTES = 8 * 1024 * 1024
 
 
 class CodeMapError(Exception):
@@ -168,6 +169,9 @@ def iter_public_entries(project_dir: Path) -> list[Entry]:
     for py in sorted(src.rglob("*.py")):
         if "__pycache__" in py.parts:
             continue
+        idx = index_module(py)
+        if idx is None:
+            continue
         parts = list(py.relative_to(src).with_suffix("").parts)
         if parts and parts[-1] == "__init__":
             parts = parts[:-1]
@@ -176,9 +180,6 @@ def iter_public_entries(project_dir: Path) -> list[Entry]:
             continue
         rel = py.relative_to(project_dir).as_posix()
         out.append(Entry(id=module_id, kind="module", file=rel, line=1))
-        idx = index_module(py)
-        if idx is None:
-            continue
         for qual, info in sorted(idx.items()):
             if any(seg.startswith("_") for seg in qual.split(".")):
                 continue
@@ -204,7 +205,23 @@ def check_complete(project_dir: Path, codemap: CodeMap) -> list[str]:
     clean) — i.e. undocumented public surface."""
     documented = {e.id for e in codemap.entries}
     missing = enumerate_public_symbols(project_dir) - documented
-    return [f"missing from CODEMAP: {sid}" for sid in sorted(missing)]
+    out = [f"missing from CODEMAP: {sid}" for sid in sorted(missing)]
+    # full-depth-analysis #15: a source file `index_module` cannot parse (oversized
+    # >8 MiB or SyntaxError) silently drops ALL its public symbols from the required
+    # set, so they never appear as "missing" — the gate could pass over genuinely
+    # undocumented public surface. Flag the dropped file so completeness fails
+    # CLOSED rather than under-counting (an agent can't shrink the required set by
+    # growing/breaking a public-API file).
+    src = Path(project_dir) / "src"
+    if src.is_dir():
+        for py in sorted(src.rglob("*.py")):
+            if "__pycache__" in py.parts:
+                continue
+            if index_module(py) is None:
+                rel = py.relative_to(project_dir).as_posix()
+                out.append(f"unparseable/oversized source excluded from "
+                           f"completeness: {rel}")
+    return out
 
 
 # Vacuous summaries that `complete`/`grounded` would pass but that document
@@ -387,7 +404,10 @@ def index_module(path: Path) -> dict[str, SymbolInfo] | None:
     """
     path = Path(path)
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        data = read_bytes_no_symlink(path, max_bytes=_SOURCE_MAX_BYTES + 1)
+        if len(data) > _SOURCE_MAX_BYTES:
+            return None
+        tree = ast.parse(data.decode("utf-8"))
     except (OSError, SyntaxError, ValueError):
         return None
     idx: dict[str, SymbolInfo] = {}

@@ -323,12 +323,80 @@ def test_load_goals_rejects_bool_consensus_needed(tmp_path: Path):
         load_goals(p)
 
 
+def test_load_goals_accepts_boolean_execution_flags(tmp_path: Path):
+    p = tmp_path / "g.yaml"
+    p.write_text(
+        "goals:\n"
+        "  - id: x\n"
+        "    type: hard\n"
+        "    cmd: 'true'\n"
+        "    pass_when: 'exit_code == 0'\n"
+        "    cacheable: true\n"
+        "    expensive: false\n"
+    )
+
+    g = load_goals(p)[0]
+
+    assert g.cacheable is True
+    assert g.expensive is False
+
+
+def test_load_goals_defaults_execution_flags_false(tmp_path: Path):
+    p = tmp_path / "g.yaml"
+    p.write_text(
+        "goals:\n"
+        "  - id: x\n"
+        "    type: hard\n"
+        "    cmd: 'true'\n"
+        "    pass_when: 'exit_code == 0'\n"
+    )
+
+    g = load_goals(p)[0]
+
+    assert g.cacheable is False
+    assert g.expensive is False
+
+
+def test_load_goals_rejects_non_bool_execution_flags_BUG_760(
+    tmp_path: Path,
+):
+    for field in ("cacheable", "expensive"):
+        p = tmp_path / f"{field}.yaml"
+        p.write_text(
+            "goals:\n"
+            "  - id: x\n"
+            "    type: hard\n"
+            "    cmd: 'true'\n"
+            "    pass_when: 'exit_code == 0'\n"
+            f"    {field}: 'false'\n"
+        )
+
+        with pytest.raises(ValueError, match=rf"{field}.*boolean.*str"):
+            load_goals(p)
+
+
 def test_dsl_rejects_bare_method_attribute_result():
-    """M9: pass_when must return bool/numeric, not a bound method.
+    """M9: pass_when must return bool, not a bound method.
     `stdout.strip` (no parens) would otherwise be truthy and always pass."""
     ctx = {"exit_code": 0, "stdout": "x", "stderr": "", "cwd": Path(".")}
     with pytest.raises(ValueError, match="comparison"):
         evaluate_pass_when("stdout.strip", ctx)
+
+
+def test_dsl_rejects_bare_numeric_exit_code_BUG_759():
+    """BUG-759 sad path: a bare nonzero exit_code must not pass by bool(1)."""
+    ctx = {"exit_code": 1, "stdout": "", "stderr": "", "cwd": Path(".")}
+
+    with pytest.raises(ValueError, match="pass_when must return bool"):
+        evaluate_pass_when("exit_code", ctx)
+
+
+def test_dsl_rejects_bare_numeric_int_conversion_BUG_759():
+    """BUG-759 edge path: numeric helper results need an explicit comparison."""
+    ctx = {"exit_code": 0, "stdout": "3", "stderr": "", "cwd": Path(".")}
+
+    with pytest.raises(ValueError, match="pass_when must return bool"):
+        evaluate_pass_when("int(stdout.strip())", ctx)
 
 
 def test_jsonview_supports_len(tmp_path: Path):

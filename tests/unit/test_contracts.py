@@ -173,6 +173,23 @@ def test_malformed_contracts_sha_raises_mismatch(tmp_path: Path) -> None:
         verify_contracts(plan_dir)
 
 
+def test_deep_malformed_contracts_sha_raises_mismatch_BUG_516(
+    tmp_path: Path,
+) -> None:
+    plan_dir = tmp_path / ".peers"
+    plan_dir.mkdir()
+    write_frozen_contracts(
+        plan_dir,
+        "pytest",
+        None,
+        "# F\n## Meta\nsurfaces: [cli]\nacceptance: pytest\n## Steps\n- [ ] [STEP-1] x\n",
+    )
+    (plan_dir / "contracts.sha").write_text("[" * 10000)
+
+    with pytest.raises(ContractsMismatch, match="contracts.sha malformed"):
+        verify_contracts(plan_dir)
+
+
 def test_wrong_shape_contracts_sha_raises_mismatch(tmp_path: Path) -> None:
     plan_dir = tmp_path / ".peers"
     plan_dir.mkdir()

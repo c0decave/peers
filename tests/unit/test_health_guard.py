@@ -446,6 +446,33 @@ def test_invoke_structured_halt_from_claude_result_envelope(tmp_path):
     assert "usage limit" in r.matched_error_snippet
 
 
+def test_invoke_structured_halt_from_claude_not_logged_in_result(tmp_path):
+    """Claude 2.1.145 reports a missing login as is_error + result text,
+    not as an authentication_failed string in the terminal result envelope."""
+    hg = HealthGuard(cwd=tmp_path)
+    script = tmp_path / "fake_claude_not_logged_in.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":"
+        "\"text\",\"text\":\"Not logged in · Please run /login\"}]},"
+        "\"error\":\"authentication_failed\"}'\n"
+        "echo '{\"type\":\"result\",\"subtype\":\"success\","
+        "\"is_error\":true,\"result\":\"Not logged in · Please run /login\","
+        "\"api_error_status\":null,\"terminal_reason\":\"completed\"}'\n"
+        "exit 1\n"
+    )
+    script.chmod(0o755)
+    r = hg.invoke(
+        [str(script)], prompt="ignored",
+        idle_timeout_s=10, absolute_max_runtime_s=10, tool="claude",
+    )
+    assert r.halt_required is True
+    assert r.classification == "api-error"
+    assert r.matched_error_source == "structured"
+    assert r.matched_error_pattern.startswith("structured:claude:")
+    assert "Not logged in" in r.matched_error_snippet
+
+
 def test_invoke_structured_ignores_echoed_error_in_claude_text_event(tmp_path):
     """Option C echo immunity end-to-end: a claude run whose assistant/text
     event echoes a git-log subject containing ERROR + quota-exhausted, but

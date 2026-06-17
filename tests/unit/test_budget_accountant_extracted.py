@@ -166,6 +166,101 @@ def test_read_operator_budget_overrides_absent_and_malformed(tmp_path):
     assert read_operator_budget_overrides(repo) == {}
 
 
+def test_read_operator_budget_overrides_rejects_oversize_file_BUG_516(tmp_path):
+    """BUG-516: a huge (e.g. same-UID-swapped) budget-overrides.json must be
+    rejected wholesale, not read + json.loads'd unbounded (memory DoS). The
+    read is capped at _BUDGET_OVERRIDE_MAX_BYTES; over-cap content yields {}."""
+    import json
+    from pathlib import Path
+    from peers.budget_accountant import (
+        read_operator_budget_overrides,
+        OPERATOR_BUDGET_OVERRIDE_FILE,
+        _BUDGET_OVERRIDE_MAX_BYTES,
+    )
+
+    repo = Path(tmp_path)
+    (repo / ".peers").mkdir()
+    payload = {"max_runtime_s": 999, "_pad": "x" * _BUDGET_OVERRIDE_MAX_BYTES}
+    (repo / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE).write_text(
+        json.dumps(payload), encoding="utf-8",
+    )
+    assert read_operator_budget_overrides(repo) == {}
+
+
+def test_read_operator_budget_overrides_accepts_normal_after_cap_BUG_516(tmp_path):
+    """A normal small override still works with the cap in place."""
+    import json
+    from pathlib import Path
+    from peers.budget_accountant import (
+        read_operator_budget_overrides,
+        OPERATOR_BUDGET_OVERRIDE_FILE,
+    )
+
+    repo = Path(tmp_path)
+    (repo / ".peers").mkdir()
+    (repo / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE).write_text(
+        json.dumps({"max_runtime_s": 43200}), encoding="utf-8",
+    )
+    assert read_operator_budget_overrides(repo) == {"max_runtime_s": 43200}
+
+
+def test_read_operator_budget_overrides_refuses_symlinked_leaf_BUG_513(
+    tmp_path,
+):
+    """BUG-513 (defense-in-depth, sad path): the inner orchestrator's read
+    of `.peers/budget-overrides.json` must refuse a same-UID symlink swap,
+    matching the safe_io pattern the rest of the substrate uses for every
+    other `.peers/*` read (BUG-185/198/224/238/240 family). A prompt-
+    injected peer that swaps the file for a symlink to attacker-staged
+    JSON outside `.peers/` would otherwise silently override operator
+    budget caps (`--max-usd`, `--max-runtime`) at the next loop start —
+    the controller-side write (`_persist_budget_override`) was hardened
+    by BUG-238 but this reader was not."""
+    import json
+    from pathlib import Path
+    from peers.budget_accountant import (
+        read_operator_budget_overrides,
+        OPERATOR_BUDGET_OVERRIDE_FILE,
+    )
+
+    repo = Path(tmp_path) / "proj"
+    repo.mkdir()
+    (repo / ".peers").mkdir()
+    attacker = Path(tmp_path) / "attacker.json"
+    attacker.write_text(json.dumps({"max_usd": 9999.99}))
+    leaf = repo / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE
+    leaf.symlink_to(attacker)
+
+    # Pre-fix: plain `path.read_text()` follows the symlink and surfaces
+    # attacker-controlled max_usd. Post-fix: safe_io refuses the symlinked
+    # leaf and returns {} so the operator's real cap survives.
+    assert read_operator_budget_overrides(repo) == {}
+
+
+def test_read_operator_budget_overrides_deep_json_returns_empty_BUG_514(
+    tmp_path,
+):
+    """BUG-514: deeply nested malformed JSON must fail closed.
+
+    `json.loads()` raises RecursionError rather than JSONDecodeError for
+    sufficiently deep arrays, and the operator-override reader promises {}
+    for malformed sidecars instead of crashing orchestration startup.
+    """
+    from pathlib import Path
+    from peers.budget_accountant import (
+        read_operator_budget_overrides,
+        OPERATOR_BUDGET_OVERRIDE_FILE,
+    )
+
+    repo = Path(tmp_path)
+    (repo / ".peers").mkdir()
+    (repo / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE).write_text(
+        "[" * 10000, encoding="utf-8",
+    )
+
+    assert read_operator_budget_overrides(repo) == {}
+
+
 def test_parse_codex_tokens_from_json_usage():
     """Option C (codex --json): tokens come from the `turn.completed` event's
     `usage` (input+output), summed across turns — verified against codex-cli
@@ -221,3 +316,21 @@ def test_parse_opencode_tokens_sums_multiple_steps():
 def test_parse_opencode_tokens_empty_returns_zero():
     from peers.budget_accountant import _parse_opencode_tokens
     assert _parse_opencode_tokens("not json\n{bad") == (0, 0.0)
+
+
+def test_rate_limited_tick_is_neutral_for_consecutive_failures():
+    # full-depth-analysis #6: a transient rate-limited tick must NOT count toward
+    # budget consecutive_failures (else an all-peers outage halts the run the v17
+    # design exists to survive). Wall-clock still counts; wasted-runtime does not.
+    state = _state()
+    state["budget"]["consecutive_failures"] = 0
+    base_iter = state["budget"]["spent_iterations"]
+    for _ in range(7):                       # 7 > default max_consecutive_failures (5)
+        record_tick_accounting(state, success=False, tick_dt=3, peer="claude",
+                               rate_limited=True)
+    assert state["budget"]["consecutive_failures"] == 0          # never accumulates
+    assert state["budget"]["spent_iterations"] == base_iter + 7  # wall-clock counts
+    assert state["budget"].get("wasted_runtime_s", 0) == 0       # not a wasted fail
+    # a genuine (non-rate-limited) failure still increments
+    record_tick_accounting(state, success=False, tick_dt=3, peer="claude")
+    assert state["budget"]["consecutive_failures"] == 1

@@ -194,6 +194,10 @@ def _load_pins(plan_dir: Path) -> dict[str, str]:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         raise ContractsMismatch(f"contracts.sha malformed: {e.msg}") from None
+    except RecursionError:
+        raise ContractsMismatch(
+            "contracts.sha malformed: nesting too deep",
+        ) from None
     if not isinstance(data, dict) or not all(
         isinstance(k, str) and isinstance(v, str) for k, v in data.items()
     ):

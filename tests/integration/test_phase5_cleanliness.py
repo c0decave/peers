@@ -25,6 +25,29 @@ def _run_check(name: str, project_dir: Path):
     )
 
 
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          capture_output=True, text=True, check=True).stdout
+
+
+def _git_init_commit(repo: Path) -> None:
+    _git(repo, "init", "-q")
+    _git(repo, "config", "commit.gpgsign", "false")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+
+
+def _attested_review(repo: Path, artifact: str, peer: str) -> None:
+    """FU-2: the OTHER peer signs off via a substrate-attested peers-review
+    commit (replaces the forgeable justifications.log reviewer field)."""
+    _git(repo, "commit", "-q", "--allow-empty",
+         "-m", f"peers-review: {artifact}\n\nLGTM")
+    sha = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "notes", "--ref=peers-attest", "add", "-f", "-m", peer, sha)
+
+
 def _setup_clean_src(tmp_path: Path) -> Path:
     """Materialise a minimal clean src/ + tests/ tree for happy-path checks.
 
@@ -96,24 +119,22 @@ def test_x(): pass
     assert "test_x" in res.stdout or "skip" in res.stdout.lower()
 
 
-def test_justified_marker_with_signoff_passes(tmp_path):
-    """`# JUSTIFIED:` annotation + reviewer-signed log entry => pass."""
-    from peers_ctl.justifications import append_justification
+def test_justified_marker_with_review_commit_passes(tmp_path):
+    """FU-2: `# JUSTIFIED:` annotation + an independent, substrate-attested
+    `peers-review: src/a.py` commit by the other peer => pass."""
     src = tmp_path / "src"
     src.mkdir()
     (src / "a.py").write_text("# TODO: needs upstream  # JUSTIFIED: waits on issue 42\n")
-
-    plan_dir = tmp_path / ".peers"
-    plan_dir.mkdir()
-    append_justification(plan_dir, "src/a.py", 1, "waits on issue 42", "codex@p.local")
+    _git_init_commit(tmp_path)
+    _attested_review(tmp_path, "src/a.py", "codex")
 
     res = _run_check("no_shortcut_markers", tmp_path)
-    assert res.returncode == 0
+    assert res.returncode == 0, res.stdout + res.stderr
 
 
-def test_skip_reason_with_signoff_passes(tmp_path):
-    """`# SKIP-REASON:` annotation + signed log entry => pass for skips."""
-    from peers_ctl.justifications import append_justification
+def test_skip_reason_with_review_commit_passes(tmp_path):
+    """FU-2: `# SKIP-REASON:` annotation + an independent attested
+    `peers-review: tests/test_a.py` commit => pass for skips."""
     tests = tmp_path / "tests"
     tests.mkdir()
     (tests / "test_a.py").write_text("""import pytest
@@ -122,13 +143,11 @@ def test_skip_reason_with_signoff_passes(tmp_path):
 def test_x():
     pass
 """)
-
-    plan_dir = tmp_path / ".peers"
-    plan_dir.mkdir()
-    append_justification(plan_dir, "tests/test_a.py", 3, "waits on upstream", "codex@p.local")
+    _git_init_commit(tmp_path)
+    _attested_review(tmp_path, "tests/test_a.py", "codex")
 
     res = _run_check("no_skipped_tests", tmp_path)
-    assert res.returncode == 0
+    assert res.returncode == 0, res.stdout + res.stderr
 
 
 def test_justifications_chain_tampering_detected(tmp_path):

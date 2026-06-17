@@ -34,7 +34,12 @@ class Mode:
 
 
 def _builtin_modes_dir() -> Path:
-    return (Path(__file__).parent / "templates" / "modes").resolve()
+    # This module is `peers/modes/__init__.py`, so `Path(__file__).parent`
+    # is `peers/modes/`; the builtin templates live at `peers/templates/
+    # modes/`, one directory up from here. (Before STEP-1 this code lived
+    # in `peers/modes.py`, where a single `.parent` reached `peers/`; the
+    # module->package move added a directory level, hence `.parent.parent`.)
+    return (Path(__file__).parent.parent / "templates" / "modes").resolve()
 
 
 def _user_modes_dir() -> Path:
@@ -226,6 +231,9 @@ def merge(
             if not isinstance(goal, dict) or "id" not in goal:
                 continue
             gid = goal["id"]
+            if not isinstance(gid, str) or not gid:
+                continue                    # #14: a non-str/unhashable id must not
+                                            # raise a raw TypeError out of `peers init`
             prior = goals_by_id.get(gid)
             if prior is None:
                 goals_by_id[gid] = (goal, mode.name)
@@ -282,15 +290,15 @@ def merge(
             if not f.is_file():
                 continue
             content = read_bytes_no_symlink(f, max_bytes=1024 * 1024)
-            prior = check_by_name.get(f.name)
-            if prior is None:
+            prior_check = check_by_name.get(f.name)
+            if prior_check is None:
                 check_by_name[f.name] = (f, content, mode.name)
                 continue
-            if prior[1] == content:
+            if prior_check[1] == content:
                 continue
             raise ValueError(
                 f"conflicting check file {f.name!r} in modes "
-                f"[{prior[2]}, {mode.name}]"
+                f"[{prior_check[2]}, {mode.name}]"
             )
     checks = [p for p, _content, _src in check_by_name.values()]
     return merged_goals, checks

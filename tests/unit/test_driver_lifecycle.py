@@ -153,6 +153,52 @@ def test_verify_peer_dir_identity_detects_swap_under_us_edge(tmp_path):
         drv._verify_peer_dir_identity()
 
 
+def test_close_peer_dir_identity_fd_closes_handle_and_is_idempotent(tmp_path):
+    # the fd-backed identity guard must not leak its directory fd after
+    # a run ends or an early lock-held return fires.
+    import os
+
+    peer_dir = tmp_path / ".peers"
+    peer_dir.mkdir()
+    drv = _FakeDriver(peer_dir)
+    drv._verify_peer_dir_identity()
+    fd = drv._peer_dir_identity_fd
+    assert fd is not None
+    os.fstat(fd)
+
+    drv._close_peer_dir_identity_fd()
+
+    assert drv._peer_dir_identity_fd is None
+    with pytest.raises(OSError):
+        os.fstat(fd)
+    drv._close_peer_dir_identity_fd()
+
+
+def test_verify_peer_dir_identity_reopens_fd_for_reused_driver_edge(tmp_path):
+    # after a run closes the identity fd, reusing the same driver
+    # must restore the fd-backed guard instead of falling back to a stale
+    # dev/inode tuple alone.
+    import os
+
+    peer_dir = tmp_path / ".peers"
+    peer_dir.mkdir()
+    drv = _FakeDriver(peer_dir)
+    drv._verify_peer_dir_identity()
+    first_fd = drv._peer_dir_identity_fd
+    assert first_fd is not None
+
+    drv._close_peer_dir_identity_fd()
+    drv._verify_peer_dir_identity()
+
+    second_fd = drv._peer_dir_identity_fd
+    assert second_fd is not None
+    os.fstat(second_fd)
+    if second_fd != first_fd:
+        with pytest.raises(OSError):
+            os.fstat(first_fd)
+    drv._close_peer_dir_identity_fd()
+
+
 # --- _verify_no_control_symlinks / checks manifest ------------------------
 
 def _write_checks_manifest(peer_dir: Path, entries: dict[str, str]) -> None:

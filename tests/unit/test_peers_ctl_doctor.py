@@ -602,3 +602,40 @@ def test_doctor_parser_accepts_claude_smoke_flag():
 
     args2 = parser.parse_args(["doctor"])
     assert args2.claude_smoke is False
+
+
+# ---------------------------------------------------------------------------
+# probe_sandbox_root (root + --dangerously-skip-permissions needs IS_SANDBOX=1)
+# ---------------------------------------------------------------------------
+
+
+def test_probe_sandbox_root_warns_root_without_is_sandbox(monkeypatch):
+    monkeypatch.setattr(doctor_mod, "_is_root", lambda: True)
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    r = doctor_mod.probe_sandbox_root()
+    assert r.status == "WARN"
+    assert "IS_SANDBOX" in r.hint
+    assert r.required is False  # advisory: must not flip exit code on its own
+
+
+def test_probe_sandbox_root_ok_when_is_sandbox_set(monkeypatch):
+    monkeypatch.setattr(doctor_mod, "_is_root", lambda: True)
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    r = doctor_mod.probe_sandbox_root()
+    assert r.status == "OK"
+
+
+def test_probe_sandbox_root_ok_when_not_root(monkeypatch):
+    monkeypatch.setattr(doctor_mod, "_is_root", lambda: False)
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    r = doctor_mod.probe_sandbox_root()
+    assert r.status == "OK"
+    assert r.value == "not root"
+
+
+def test_doctor_warn_only_sandbox_root_does_not_fail_exit_code(monkeypatch):
+    """A root host without IS_SANDBOX must WARN, not refuse (required=False)."""
+    monkeypatch.setattr(doctor_mod, "_is_root", lambda: True)
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    rc = doctor_mod.run_doctor(probes=(doctor_mod.probe_sandbox_root,))
+    assert rc == 0

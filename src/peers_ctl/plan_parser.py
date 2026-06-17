@@ -45,6 +45,7 @@ import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 from peers.safe_io import read_bytes_no_symlink
 
@@ -161,14 +162,18 @@ def parse_plan(path: Path) -> Plan:
     input_domains = _parse_bullet_list(sections.get("Input Domains", []))
     steps = _parse_steps(sections["Steps"])
 
+    # _parse_meta validates each field's runtime type (surfaces -> non-empty
+    # list[str]; acceptance -> non-empty str; mutation_testing -> bool;
+    # convergence_n -> int; e2e/honesty_audit_peer -> str|None) but returns
+    # dict[str, object]; cast at this validated boundary rather than re-checking.
     plan = Plan(
         name=name,
-        surfaces=meta["surfaces"],
-        acceptance=meta["acceptance"],
-        e2e=meta.get("e2e"),
-        mutation_testing=meta.get("mutation_testing", False),
-        convergence_n=meta.get("convergence_n", 5),
-        honesty_audit_peer=meta.get("honesty_audit_peer"),
+        surfaces=cast("list[str]", meta["surfaces"]),
+        acceptance=cast(str, meta["acceptance"]),
+        e2e=cast("str | None", meta.get("e2e")),
+        mutation_testing=cast(bool, meta.get("mutation_testing", False)),
+        convergence_n=cast(int, meta.get("convergence_n", 5)),
+        honesty_audit_peer=cast("str | None", meta.get("honesty_audit_peer")),
         architecture=architecture,
         input_domains=input_domains,
         steps=steps,

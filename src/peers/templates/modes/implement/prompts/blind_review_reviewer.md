@@ -14,8 +14,12 @@ You are REVIEWING in this tick. Your job:
    changed, test coverage observed.
 
 4. AFTER your REVIEW_NOTES.md is written and committed, compare it to
-   IMPLEMENTATION_NOTES.md. Any divergence → add `[BLIND-REVIEW-MISMATCH]`
-   line to `CONCERNS.md` with the specific discrepancy.
+   IMPLEMENTATION_NOTES.md. Any divergence → file a `[BLIND-REVIEW-MISMATCH]`
+   entry in `CONCERNS.md` with the specific discrepancy. **Put the marker at the
+   START of its own line** (optionally a heading or list item, e.g.
+   `- [BLIND-REVIEW-MISMATCH] reviewer says X is absent`). The gate counts only a
+   line-leading marker as a filing; merely mentioning the marker mid-sentence
+   (e.g. describing this protocol) does NOT trip the gate.
 
 5. If checkoffs are warranted (all of: code matches claim, tests
    match step touches:, no blocking concerns), update PLAN.md to mark

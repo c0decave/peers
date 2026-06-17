@@ -7,12 +7,25 @@ off smaller responsibilities without moving the whole driver at once.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import subprocess
 import sys
 import time
-from typing import Any, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Protocol, Sequence
 
-from peers.model_provider import build_peer_argv
+from peers.model_provider import apply_graphify_mcp, build_peer_argv
 from peers.rate_limit import rate_limit_backoff_s
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+def _safe_head_sha(comm: Any) -> str | None:
+    """`comm.head_sha()` that degrades to None instead of crashing the tick on an
+    unborn/corrupt/transient `git rev-parse HEAD` failure (full-depth-analysis #13)."""
+    try:
+        return comm.head_sha()
+    except subprocess.CalledProcessError:
+        return None
 
 
 class _Comm(Protocol):
@@ -39,26 +52,54 @@ class _HealthInvoker(Protocol):
 
 
 class _PeerSpec(Protocol):
-    argv: Sequence[str]
-    prompt_mode: str
-    tool: str
+    # Read-only members: the concrete ``PeerSpec`` is a frozen dataclass, so its
+    # attributes are read-only — a settable Protocol member would not match it.
+    @property
+    def argv(self) -> Sequence[str]:
+        ...
+
+    @property
+    def prompt_mode(self) -> str:
+        ...
+
+    @property
+    def tool(self) -> str:
+        ...
 
 
 class _TurnManager(Protocol):
-    def advance(self, *, success: bool) -> None:
+    def advance(self, *, success: bool, rate_limited: bool = False) -> None:
         ...
 
 
 class TickLoopDriver(Protocol):
     """Adapter surface that TickLoop needs from OrchestratorDriver."""
 
-    comm: _Comm
-    health: _HealthInvoker
+    # Read-only members so a concrete driver whose attribute types are
+    # narrower than these structural surfaces (e.g. ``comm: GitCommLayer |
+    # HybridCommLayer`` <: ``_Comm``; ``error_patterns: list[str]`` <:
+    # ``Sequence[str]``) still satisfies the Protocol — a settable member is
+    # invariant and would reject the narrower concrete type.
+    @property
+    def comm(self) -> _Comm:
+        ...
+
+    @property
+    def health(self) -> _HealthInvoker:
+        ...
+
+    @property
+    def error_patterns(self) -> Sequence[str]:
+        ...
+
+    @property
+    def halt_patterns(self) -> Sequence[str]:
+        ...
+
+    peer_dir: Path
     idle_timeout_s: int
     absolute_max_runtime_s: int
     hang_kill_s: int | None
-    error_patterns: Sequence[str]
-    halt_patterns: Sequence[str]
     buf_cap_bytes: int
     _head_before_invoke: str | None
 
@@ -81,7 +122,7 @@ class TickLoopDriver(Protocol):
     def _prepare_tick_prompt(
         self,
         state: dict[str, Any],
-        turn_manager: _TurnManager,
+        turn_manager: Any,
         results: dict[str, Any],
     ) -> tuple[str, _PeerSpec, str]:
         ...
@@ -117,6 +158,7 @@ class TickLoopDriver(Protocol):
 
     def _record_tick_accounting(
         self, state: dict[str, Any], success: bool, tick_dt: int,
+        peer: str | None = None, rate_limited: bool = False,
     ) -> None:
         ...
 
@@ -127,6 +169,7 @@ class TickLoopDriver(Protocol):
 
     def _update_peer_health(
         self, state: dict[str, Any], peer: str, success: bool,
+        rate_limited: bool = False,
     ) -> None:
         ...
 
@@ -136,7 +179,7 @@ class TickLoopDriver(Protocol):
     def _detect_tampering(self, state: dict[str, Any]) -> None:
         ...
 
-    def _maybe_halt(self, state: dict[str, Any]) -> None:
+    def _maybe_halt(self, state: dict[str, Any]) -> dict[str, Any] | None:
         ...
 
     def _refresh_goals_after_tick(
@@ -155,7 +198,11 @@ class TickLoopDriver(Protocol):
         peer: str,
         run: Any,
         success: bool,
-        **kwargs: Any,
+        tokens_this_tick: int = 0,
+        usd_this_tick: float = 0.0,
+        head_before: str | None = None,
+        head_after: str | None = None,
+        warnings_emitted: list[str] | None = None,
     ) -> None:
         ...
 
@@ -173,7 +220,18 @@ class TickLoopDriver(Protocol):
     ) -> None:
         ...
 
-    def _update_convergence_counter(self, state: dict[str, Any]) -> None:
+    def _update_convergence_counter(
+        self, state: dict[str, Any], success: bool = True,
+        rate_limited: bool = False,
+    ) -> None:
+        ...
+
+    def _attest_tick_commits(
+        self, peer: str, head_before: str | None, head_after: str,
+    ) -> None:
+        ...
+
+    def _submit_gate_eval(self, sha: str) -> None:
         ...
 
 
@@ -271,7 +329,11 @@ class TickLoop:
             if halt_exit is not None:
                 return halt_exit
 
-            self._finalize_tick(state, turn_manager, invocation)
+            finalize_exit = self._finalize_tick(
+                state, turn_manager, invocation,
+            )
+            if finalize_exit is not None:
+                return finalize_exit
             ticks += 1
 
     def _prepare_next_tick(
@@ -310,8 +372,13 @@ class TickLoop:
         )
 
         tick_t0 = time.monotonic()
-        driver._head_before_invoke = driver.comm.head_sha()
+        driver._head_before_invoke = _safe_head_sha(driver.comm)
         peer_argv, extra_env = build_peer_argv(spec)
+        # Opt-in graphify MCP: when the control plane brought up the caged
+        # graph sidecar it exported GRAPHIFY_MCP_ENDPOINT + GRAPHIFY_API_KEY;
+        # splice the per-peer MCP flags (and codex's key env) here. No-op and
+        # byte-identical when graphify is off (env unset) -- fail-open.
+        peer_argv, extra_env = apply_graphify_mcp(peer_argv, extra_env, spec.tool)
         # Expose the current peer name to the peer's subprocess (and thus to
         # any git hooks it triggers) so peer attribution does not depend on
         # the git author identity — which is frequently a single shared
@@ -334,6 +401,15 @@ class TickLoop:
         }
         if extra_env:
             invoke_kwargs["extra_env"] = extra_env
+        # Wave-2 TUI live tee (§5.1): when enabled, mirror this peer's live
+        # stdout/stderr into `.peers/log/peers/tick-<N>-<peer>.stream.jsonl`
+        # (same dir + 5-digit naming as the post-tick peer logs) so the TUI
+        # Live-Stream can tail codex/opencode uniformly. Default OFF →
+        # invoke() receives no tee args → byte-identical. Fail-closed inside
+        # health_guard's reader thread (a tee error can't disturb liveness).
+        if getattr(driver, "tee_stream", False):
+            invoke_kwargs["tee_dir"] = driver.peer_dir / "log" / "peers"
+            invoke_kwargs["tee_tag"] = f"tick-{upcoming_tick:05d}-{peer}"
         run = driver.health.invoke(peer_argv, **invoke_kwargs)
         driver._verify_peer_dir_identity()
         driver._verify_no_control_symlinks()
@@ -372,7 +448,7 @@ class TickLoop:
         state: dict[str, Any],
         turn_manager: _TurnManager,
         invocation: _TickInvocation,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         driver = self.driver
         peer = invocation.peer
         run = invocation.run
@@ -398,7 +474,8 @@ class TickLoop:
         # when every peer is being rate-limited at once.
         rate_limited = getattr(run, "classification", None) == "rate-limited"
         turn_manager.advance(success=success, rate_limited=rate_limited)
-        driver._record_tick_accounting(state, success, invocation.tick_dt, peer=peer)
+        driver._record_tick_accounting(state, success, invocation.tick_dt, peer=peer,
+                                       rate_limited=rate_limited)
 
         tokens_this_tick, usd_this_tick = driver._account_tokens_usd(
             state, invocation.spec.tool, run,
@@ -409,17 +486,18 @@ class TickLoop:
         state["dirty_worktree"] = driver._dirty_worktree(state)
         if success:
             driver._detect_tampering(state)
-        driver._maybe_halt(state)
+        halt_exit = driver._maybe_halt(state)
 
         new_warnings = list(state.get("warnings", []))
         driver._append_warnings_history(state, new_warnings)
-        head_after_sha = driver.comm.head_sha()
+        head_after_sha = _safe_head_sha(driver.comm)
         # attribute this tick's commits to the running peer by the
         # observed HEAD-delta (agent-unforgeable), before any later goal check
         # reads the attestation. No live agent runs here.
-        driver._attest_tick_commits(
-            peer, driver._head_before_invoke, head_after_sha,
-        )
+        if head_after_sha is not None:
+            driver._attest_tick_commits(
+                peer, driver._head_before_invoke, head_after_sha,
+            )
         if success and invocation.pre_tick_failed_goal_ids:
             driver._refresh_goals_after_tick(
                 state,
@@ -437,11 +515,15 @@ class TickLoop:
         driver._emit_tick_end(
             state, peer, run, success, invocation.tick_dt, head_after_sha,
         )
-        driver._update_convergence_counter(state)
+        driver._update_convergence_counter(state, success, rate_limited)
         # Tier-1 Part B: kick off the expensive-gate eval for the SHA this tick
         # just produced, so it runs (in a frozen-SHA worktree) during the next
-        # peer turn instead of blocking the loop. No-op when pipelining is off.
-        driver._submit_gate_eval(head_after_sha)
+        # peer turn instead of blocking the loop. On a terminal post-tick halt
+        # there is no next peer turn, so avoid launching pointless background
+        # gate work.
+        if halt_exit is None and head_after_sha is not None:
+            driver._submit_gate_eval(head_after_sha)
+        return halt_exit
 
     def _apply_rate_limit_backoff(
         self, state: dict[str, Any], rate_limited: bool, peer: str,

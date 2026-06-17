@@ -49,11 +49,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from peers.attest import attested_peer
-from peers_ctl.justifications import (
-    JustificationError,
-    signers_for_file,
-    verify_log_chain,
+from peers.attest import (
+    attested_authors_of_file,
+    attested_peer,
+    find_review_commit,
 )
 from peers_ctl.plan_parser import PlanValidationError, parse_plan
 
@@ -248,31 +247,40 @@ def _last_impl_identity(
 
 
 def _has_independent_review(
-    plan_dir: Path, path: str, impl_id: CommitIdentity
+    project_root: Path, path: str, impl_id: CommitIdentity
 ) -> bool:
-    """True when a signed justification for ``path`` was made by a peer OTHER
-    than the file's implementer — i.e. an independent review exists, satisfying
-    the two-key rule for a co-implemented file the checkoff peer also authored.
+    """True when an independent reviewer signed off on ``path`` via a
+    substrate-attested ``peers-review: <path>`` commit — i.e. the two-key rule
+    is satisfied for a co-implemented file the checkoff peer also authored.
 
     Only honored when the implementer has a peer identity (the normal
     attested/``Peer:``-trailer case). For legacy email-only commits we cannot
-    reliably attribute a peer-name reviewer, so no justification escape applies
-    (the step must then be checked off by a genuinely different peer).
+    attribute a peer-name implementer to exclude, so no escape applies (the
+    step must then be checked off by a genuinely different peer).
 
-    NB (FU-2, docs/plans/2026-06-07-justification-baseline-integrity-followups):
-    the justifications.log reviewer field is keyless-chain-signed, so it is
-    tamper-evident but not authorship-bound — a peer could forge an entry naming
-    the other peer. This escape runs at the subsystem's established trust level
-    (same as no_shortcut/no_skipped); the gate's PRIMARY identity check stays the
-    unforgeable peers-attest note. Authorship binding is tracked separately.
+    FU-2 (P0 review 2026-06-12): the previous escape consulted the
+    justifications.log reviewer field, which is agent-authored free text bound
+    to no unforgeable identity — a peer could forge an entry naming the other
+    peer (a self-bless). The escape is now bound to the unforgeable
+    ``refs/notes/peers-attest`` note via :func:`peers.attest.find_review_commit`,
+    which searches REACHABLE history for a ``peers-review: <path>`` commit the
+    substrate attributed to a peer OTHER than the implementer. The agent never
+    chooses the sha (mirroring ``_find_checkoff_commit``), so the dangling-note,
+    no-backing, and cite-an-unrelated-commit forges are all closed.
     """
     impl_peer = impl_id[0]
     if not impl_peer:
         return False
-    return any(
-        f"peer:{signer.lower()}" != impl_peer
-        for signer in signers_for_file(plan_dir, path)
-    )
+    # Exclude EVERY attested author of the file, not just the implementer — a
+    # peer could otherwise author the file, have a co-peer make a trivial edit
+    # (becoming the "last editor"), then self-review (the original author would
+    # no longer be excluded). The checkoff gate is file-level (touches:), so we
+    # exclude the whole-file author set, plus the resolved implementer
+    # (impl_peer is "peer:<name>"; find_review_commit compares against the raw
+    # peers-attest note value).
+    exclude = attested_authors_of_file(project_root, path)
+    exclude.add(impl_peer.split(":", 1)[1] if ":" in impl_peer else impl_peer)
+    return find_review_commit(project_root, path, exclude_peer=exclude) is not None
 
 
 def main(project_dir: str = ".") -> int:
@@ -303,16 +311,6 @@ def main(project_dir: str = ".") -> int:
         print("checkoff-by-other-peer: clean (no enforceable checkoffs)")
         return 0
 
-    # A tampered justifications log must not silently bless a self-checkoff: if
-    # the chain is broken we proceed as if there were NO justifications (fail
-    # closed — self-blessed files then surface as violations).
-    plan_dir = project_root / ".peers"
-    try:
-        verify_log_chain(plan_dir)
-        justifications_ok = True
-    except JustificationError:
-        justifications_ok = False
-
     violations: list[str] = []
     for step in checked_with_touches:
         checkoff_sha = _find_checkoff_commit(project_root, step.id)
@@ -335,18 +333,16 @@ def main(project_dir: str = ".") -> int:
                 # independently reviewed by the checkoff itself. OK.
                 continue
             # the same peer implemented AND checked off this file (the
-            # norm for co-implemented steps). Valid only if the OTHER peer
-            # signed an independent review of the file in
-            # .peers/justifications.log — otherwise it is a self-bless.
-            if justifications_ok and _has_independent_review(
-                plan_dir, tf, impl_id
-            ):
+            # norm for co-implemented steps). Valid only if the OTHER peer made
+            # an independent, substrate-attested `peers-review: <file>` commit
+            # (FU-2) — otherwise it is a self-bless.
+            if _has_independent_review(project_root, tf, impl_id):
                 continue
             violations.append(
                 f"  {step.id}: {tf} implemented and checked off by the same "
                 f"peer ({_identity_label(impl_id)}) with no independent "
-                f"review — the other peer must sign off in "
-                f".peers/justifications.log"
+                f"review — the OTHER peer must sign off with a "
+                f"`peers-review: {tf}` commit"
             )
 
     if violations:

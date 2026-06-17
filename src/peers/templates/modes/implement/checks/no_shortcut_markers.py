@@ -27,18 +27,24 @@ Skip-listed paths
 
 Escape via reviewer sign-off
 ----------------------------
-Two ingredients are required, both at the same ``file:line``:
+Two ingredients are required:
 
 1. The offending line ends with ``# JUSTIFIED: <reason>`` (the comment
    may also contain the original marker, e.g. ``# TODO  # JUSTIFIED:
    waits on issue 42``).
-2. ``.peers/justifications.log`` has a reviewer-signed entry for
-   ``<relpath>:<lineno>``. See :mod:`peers_ctl.justifications` for
-   the chain-linked log format.
+2. An independent ``peers-review: <relpath>`` commit by the OTHER peer
+   (FU-2). The reviewer signs off by making a commit whose message carries
+   ``peers-review: <relpath>``; the substrate attributes it via the
+   unforgeable ``refs/notes/peers-attest`` note, and the gate SEARCHES
+   reachable history for it (:func:`peers.attest.find_review_commit`),
+   excluding the file's own author so a peer cannot self-bless.
 
 Missing either half is a violation. The annotation alone is rejected
 on purpose -- otherwise the implementer could simply tack
-``# JUSTIFIED: lazy`` onto every TODO they introduce.
+``# JUSTIFIED: lazy`` onto every TODO they introduce. This replaces the
+previous escape, which trusted an agent-authored (forgeable)
+``.peers/justifications.log`` reviewer field; that log is no longer
+consulted for this gate.
 
 NotImplementedError AST exception
 ---------------------------------
@@ -66,10 +72,10 @@ import ast
 import sys
 from pathlib import Path
 
-from peers_ctl.justifications import (
-    JustificationError,
-    is_justified,
-    verify_log_chain,
+from peers.attest import (
+    attested_authors_of_file,
+    attested_line_author_peers,
+    find_review_commit,
 )
 
 
@@ -140,15 +146,37 @@ def _line_in_any_range(lineno: int, ranges: list[tuple[int, int]]) -> bool:
     return any(start <= lineno <= end for start, end in ranges)
 
 
+def _line_independently_reviewed(
+    project_root: Path, relpath: str, lineno: int,
+) -> bool:
+    """True when an independent peer signed off on ``relpath`` via a
+    substrate-attested ``peers-review: <relpath>`` commit (FU-2).
+
+    The peer that AUTHORED the justified marker line is excluded so it cannot
+    self-bless its own shortcut. We exclude by the MARKER LINE's author
+    (``git blame``) rather than the file's last editor — the latter is
+    launderable (a co-peer's trivial edit to another line flips the exclusion
+    target away from the real author). A co-peer who only edited OTHER lines is
+    therefore still a valid reviewer. If the marker line cannot be attributed
+    (uncommitted / unattested), we fall back to the whole-file author set
+    (stricter, fail-closed).
+    """
+    exclude = attested_line_author_peers(project_root, relpath, [lineno])
+    if not exclude:
+        exclude = attested_authors_of_file(project_root, relpath)
+    return find_review_commit(
+        project_root, relpath, exclude_peer=exclude) is not None
+
+
 def _scan_python_file(
     path: Path,
     relpath: str,
-    plan_dir: Path,
+    project_root: Path,
 ) -> list[str]:
     """Return a list of violation messages for ``path``.
 
     Each message is ``<relpath>:<lineno>: <marker>: <snippet>``.
-    Annotated + signed lines are filtered out; AST-allowed
+    Annotated + independently-reviewed lines are filtered out; AST-allowed
     NotImplementedError occurrences (abstract / Protocol bases) are
     filtered out.
     """
@@ -196,19 +224,19 @@ def _scan_python_file(
         if not hits and not_impl_hit is None:
             continue
 
-        # Annotation + sign-off check: if the line carries the
-        # JUSTIFIED tag AND the log has a signed entry for
-        # <relpath>:<lineno>, all markers on this line are forgiven.
+        # Annotation + sign-off check: if the line carries the JUSTIFIED tag
+        # AND an independent peer signed off on the file via a
+        # substrate-attested `peers-review: <relpath>` commit (FU-2), all
+        # markers on this line are forgiven.
         if _JUSTIFIED_TAG in line:
-            signed, _signer = is_justified(plan_dir, relpath, lineno)
-            if signed:
+            if _line_independently_reviewed(project_root, relpath, lineno):
                 continue
-            # Annotated but unsigned -- explicit message so the
-            # operator knows the next step (get the reviewer to
-            # append to .peers/justifications.log).
+            # Annotated but not independently reviewed -- explicit message so
+            # the operator knows the next step (the OTHER peer must make a
+            # `peers-review: <relpath>` commit).
             snippet = line.strip()[:120]
             violations.append(
-                f"{relpath}:{lineno}: JUSTIFIED-but-unsigned: {snippet}",
+                f"{relpath}:{lineno}: JUSTIFIED-but-unreviewed: {snippet}",
             )
             continue
 
@@ -244,31 +272,23 @@ def main(project_dir: str = ".") -> int:
     """Forbid shortcuts in ``src/``: TODO / FIXME / XXX / HACK /
     PLACEHOLDER / STUB / NotImplementedError outside Protocol/ABC.
 
-    Escape via ``# JUSTIFIED: <reason>`` annotation on the same line
-    AND a reviewer-signed entry in ``.peers/justifications.log``.
+    Escape via ``# JUSTIFIED: <reason>`` annotation on the same line AND an
+    independent ``peers-review: <relpath>`` commit by the OTHER peer (FU-2:
+    substrate-attested, agent-unforgeable — replaces the forgeable
+    justifications.log reviewer field).
     """
     project_root = Path(project_dir).resolve()
     src_root = project_root / "src"
-    plan_dir = project_root / ".peers"
 
     if not src_root.is_dir():
         print("no-shortcut-markers: clean (no src/ to scan)")
         return 0
 
-    # fail closed if the justifications log is tampered or
-    # syntactically broken. is_justified() is a pure lookup and would
-    # otherwise accept a hand-written entry whose chain prefix is bogus.
-    try:
-        verify_log_chain(plan_dir)
-    except JustificationError as e:
-        print(f"no-shortcut-markers FAIL: justifications log chain broken: {e}")
-        return 1
-
     all_violations: list[str] = []
     files = _iter_src_files(src_root)
     for path in files:
         rel = path.relative_to(project_root).as_posix()
-        all_violations.extend(_scan_python_file(path, rel, plan_dir))
+        all_violations.extend(_scan_python_file(path, rel, project_root))
 
     if all_violations:
         print(
@@ -279,8 +299,8 @@ def main(project_dir: str = ".") -> int:
             print(f"  {v}")
         print(
             "  hint: each violation needs a `# JUSTIFIED: <reason>` "
-            "annotation on the same line AND a reviewer-signed entry "
-            "in .peers/justifications.log"
+            "annotation on the same line AND an independent "
+            "`peers-review: <relpath>` commit by the OTHER peer"
         )
         return 1
 

@@ -35,7 +35,7 @@ def main(project_dir: str = ".") -> int:
     plan_dir = Path(project_dir) / ".peers"
     try:
         verify_contracts(plan_dir)
-    except ContractsMismatch as e:
+    except (ContractsMismatch, OSError) as e:
         print(f"contracts-unchanged FAIL: {e}")
         return 1
     print("contracts-unchanged: clean")

@@ -13,10 +13,11 @@ from peers.async_gate_runner import (
     AsyncGateRunner,
     prune_stale_gate_worktrees,
 )
+from peers.driver_host import _DriverHost
 from peers.goal_engine import GoalResult
 
 
-class DriverGatePipelineMixin:
+class DriverGatePipelineMixin(_DriverHost):
     """Gate pipelining. The host class must set ``self.engine``, ``self.repo``
     and ``self.peer_dir`` before calling ``_init_gate_pipeline``."""
 

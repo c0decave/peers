@@ -1,12 +1,33 @@
 """Convergence and post-convergence skeptic state helpers."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 
 PHASE_B_SKEPTIC_GATES = (
     "blind-review", "honesty-audit", "concerns-resolved",
 )
+DEFAULT_PHASE_A_N = 5
+
+
+def implement_phase_a_n(repo: Path, peer_dir: Path) -> int:
+    """Return implement-mode Phase A threshold from frozen PLAN metadata.
+
+    The live PLAN.md is peer-editable during checkoff. Prefer the frozen
+    operator-supplied copy, falling back to live PLAN.md only for older
+    scaffolds that lack .peers/PLAN.original.md.
+    """
+    from peers_ctl.plan_parser import PlanValidationError, parse_plan
+
+    for path in (peer_dir / "PLAN.original.md", repo / "PLAN.md"):
+        try:
+            plan = parse_plan(path)
+        except PlanValidationError:
+            continue
+        if plan.convergence_n >= 0:
+            return plan.convergence_n
+    return DEFAULT_PHASE_A_N
 
 
 def _resolve_convergence_state(
@@ -40,7 +61,7 @@ class SkepticEngine:
         self,
         mode_name: str,
         phase_b_skeptic_gates: tuple[str, ...] = PHASE_B_SKEPTIC_GATES,
-        phase_a_n: int = 5,
+        phase_a_n: int = DEFAULT_PHASE_A_N,
         phase_b_n: int = 2,
     ) -> None:
         self.mode_name = mode_name

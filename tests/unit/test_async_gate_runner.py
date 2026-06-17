@@ -136,6 +136,73 @@ def test_poll_latest_none_when_nothing_submitted(tmp_path: Path) -> None:
     assert runner.poll_latest() is None
 
 
+def test_invalidate_drops_completed_same_sha_verdict_bug_504(
+    tmp_path: Path,
+) -> None:
+    # an expensive-gate future computed against the OLD goal set
+    # must not be trusted after a goals reload, even when its SHA equals
+    # the current HEAD. After invalidate_in_flight(), poll_latest()/take()
+    # must report the prior verdict as absent so callers fall back to a
+    # sync eval against the fresh goal set.
+    repo, sha = _init_repo(tmp_path)
+    g = Goal(id="m", type="hard",
+             cmd="test -f marker.txt", pass_when="exit_code == 0")
+    runner = AsyncGateRunner(repo=repo, peers_dir=repo / ".peers",
+                             goals=[g], expensive_ids={"m"})
+    runner.submit(sha)
+    # Wait until the worker has finished — this is the at-risk window: the
+    # future is DONE for `sha`, but the goal set is about to be replaced.
+    for _ in range(200):
+        if runner._futures[sha].done():
+            break
+        time.sleep(0.02)
+    assert runner._futures[sha].done()
+
+    runner.invalidate_in_flight()
+
+    assert runner.poll_latest() is None
+    assert runner.take(sha) is None
+    assert runner._futures == {}
+    assert runner._order == []
+
+
+def test_invalidate_with_new_submit_returns_fresh_verdict(
+    tmp_path: Path,
+) -> None:
+    # kind: happy
+    # BUG-504 follow-up: after invalidate_in_flight(), a subsequent submit
+    # for the same SHA must produce a NEW future that poll_latest will
+    # honour. Without this, the loop could permanently lose its overlap
+    # benefit after the first goals reload.
+    repo, sha = _init_repo(tmp_path)
+    g = Goal(id="m", type="hard",
+             cmd="test -f marker.txt", pass_when="exit_code == 0")
+    runner = AsyncGateRunner(repo=repo, peers_dir=repo / ".peers",
+                             goals=[g], expensive_ids={"m"})
+    runner.submit(sha)
+    runner.invalidate_in_flight()
+    runner.submit(sha)
+    got = runner.take(sha)
+    assert got is not None and got["m"].state == "pass"
+
+
+def test_invalidate_no_in_flight_is_safe(tmp_path: Path) -> None:
+    # kind: edge
+    # Edge: invalidate_in_flight on an idle runner must be a no-op (no
+    # exception, no state corruption). This pins the contract so callers
+    # need not guard with hasattr/empty-check before calling.
+    repo, _sha = _init_repo(tmp_path)
+    runner = AsyncGateRunner(repo=repo, peers_dir=repo / ".peers",
+                             goals=[], expensive_ids=set())
+    pre_gen = runner._goals_generation
+    runner.invalidate_in_flight()
+    runner.invalidate_in_flight()
+    assert runner._goals_generation == pre_gen + 2
+    assert runner._futures == {}
+    assert runner._order == []
+    assert runner.poll_latest() is None
+
+
 def test_prune_stale_gate_worktrees(tmp_path: Path) -> None:
     from peers.async_gate_runner import prune_stale_gate_worktrees
     repo, sha = _init_repo(tmp_path)

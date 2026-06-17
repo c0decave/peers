@@ -22,6 +22,15 @@ def test_load_refuses_symlinked_state_file(tmp_path: Path):
         StateStore(tmp_path / "state.json").load()
 
 
+def test_load_refuses_dangling_symlinked_state_file_BUG_507(tmp_path: Path):
+    """Sad path: a dangling state.json symlink is still a symlinked
+    control-plane file, not a missing state file."""
+    (tmp_path / "state.json").symlink_to(tmp_path / "missing.json")
+
+    with pytest.raises(OSError):
+        StateStore(tmp_path / "state.json").load()
+
+
 def test_persists_and_reloads(tmp_path: Path):
     path = tmp_path / "state.json"
     store = StateStore(path)
@@ -233,7 +242,78 @@ def test_load_merges_default_under_partial_file(tmp_path: Path):
     assert loaded["budget"]["max_iterations"] == 200
     assert loaded["peers"]["claude"]["state"] == "healthy"
     assert loaded["peers"]["codex"]["state"] == "healthy"
+    assert loaded["goals_status"] == {}
     assert loaded["stuck_counter"] == {}
+
+
+def test_save_defaults_missing_state_sections_BUG_707(tmp_path: Path):
+    path = tmp_path / "state.json"
+
+    StateStore(path).save({
+        "iteration": 1,
+        "peer_order": ["claude", "codex"],
+        "turn_index": 0,
+        "peers": {"claude": {"state": "healthy"},
+                  "codex": {"state": "healthy"}},
+    })
+
+    on_disk = json.loads(path.read_text())
+    assert on_disk["budget"]["max_iterations"] == 200
+    assert on_disk["goals_status"] == {}
+    assert on_disk["stuck_counter"] == {}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("budget", None, "budget must be a mapping"),
+        ("iteration", "1", "iteration must be a non-negative integer"),
+        ("iteration", True, "iteration must be a non-negative integer"),
+        ("iteration", -1, "iteration must be a non-negative integer"),
+        ("turn_index", True, "turn_index"),
+        ("goals_status", [], "goals_status must be a mapping"),
+        ("stuck_counter", "nope", "stuck_counter must be a mapping"),
+    ],
+)
+def test_load_rejects_corrupt_top_level_state_shapes_BUG_707(
+    tmp_path: Path, field: str, value: object, match: str,
+):
+    path = tmp_path / "state.json"
+    state = {
+        "schema_version": SCHEMA_VERSION,
+        "iteration": 1,
+        "peer_order": ["claude", "codex"],
+        "turn_index": 0,
+        "budget": {},
+        "goals_status": {},
+        "stuck_counter": {},
+        "peers": {"claude": {"state": "healthy"},
+                  "codex": {"state": "healthy"}},
+    }
+    state[field] = value
+    path.write_text(json.dumps(state))
+
+    with pytest.raises(RuntimeError, match=match):
+        StateStore(path).load()
+
+
+def test_save_rejects_corrupt_budget_BUG_707(tmp_path: Path):
+    path = tmp_path / "state.json"
+    state = {
+        "iteration": 1,
+        "peer_order": ["claude", "codex"],
+        "turn_index": 0,
+        "budget": None,
+        "goals_status": {},
+        "stuck_counter": {},
+        "peers": {"claude": {"state": "healthy"},
+                  "codex": {"state": "healthy"}},
+    }
+
+    with pytest.raises(RuntimeError, match="budget must be a mapping"):
+        StateStore(path).save(state)
+
+    assert not path.exists()
 
 
 def test_load_raises_on_corrupt_json(tmp_path: Path):

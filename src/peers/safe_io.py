@@ -145,6 +145,45 @@ def _ensure_private_child_dir_fd(
         raise
 
 
+def ensure_private_dir_under_root(root: Path, rel_parts: Sequence[str]) -> Path:
+    """Create ``root/<rel_parts>`` at mode 0o700, refusing a symlink on ANY
+    component under ``root``.
+
+    Unlike :func:`_ensure_private_dir` — whose ``mkdir(parents=True)`` follows a
+    symlinked ancestor — this walks one component at a time relative to a dir-fd
+    on ``root``: each component is ``mkdir``'d then re-opened ``O_NOFOLLOW`` with
+    a dev/ino check, so a symlinked or concurrently-swapped component is rejected
+    (BUG-514 follow-up). ``root`` and its ancestors are trusted and MAY legitimately
+    live under a symlinked path (e.g. ``/tmp`` -> ``/private/tmp``); only the
+    operator-untrusted ``rel_parts`` below it are no-follow-enforced.
+
+    Returns the created leaf path. Raises ``OSError`` on a refused component and
+    ``ValueError`` on empty/invalid ``rel_parts``.
+    """
+    rel = list(rel_parts)
+    if not rel:
+        raise ValueError("rel_parts must include at least one path component")
+    for name in rel:
+        _validate_single_path_component(name, "path component")
+    fds: list[int] = []
+    leaf = Path(root)
+    try:
+        parent_fd = _open_dir_fd_no_symlink(Path(root))
+        fds.append(parent_fd)
+        for name in rel:
+            leaf = leaf / name
+            child_fd = _ensure_private_child_dir_fd(parent_fd, name, leaf)
+            fds.append(child_fd)
+            parent_fd = child_fd
+        return leaf
+    finally:
+        for fd in reversed(fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _open_private_nested_dir_fd_no_symlink(
     root: Path, dirnames: Sequence[str],
 ) -> int:
@@ -406,9 +445,9 @@ def read_bytes_under_root_no_follow(
             if fd >= 0:
                 os.close(fd)
     finally:
-        for f in reversed(fds_to_close):
+        for fd_close in reversed(fds_to_close):
             try:
-                os.close(f)
+                os.close(fd_close)
             except OSError:
                 pass
 

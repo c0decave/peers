@@ -54,7 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Iterable
 
-from peers.safe_io import read_text_no_symlink
+from peers.safe_io import read_text_no_symlink, read_text_under_root_no_follow
 from peers_ctl.store import Store, validate_project_name
 
 # cap prompt-file reads so a runaway file (or a hostile prompt
@@ -76,6 +76,73 @@ _MAX_RUNS_BYTES = 32 * 1024 * 1024
 # and abbreviated forms are at least 4. We deliberately do NOT resolve
 # the ref — the goal is to keep replay read-only and side-effect free.
 _HEX_SHA_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
+_RUNS_REL = (".peers", "log", "runs.jsonl")
+
+
+def _root_and_rel_for_tail(
+    path: Path, tail: tuple[str, ...],
+) -> tuple[Path, tuple[str, ...]] | None:
+    parts = Path(path).parts
+    if len(parts) <= len(tail):
+        return None
+    if tuple(parts[-len(tail):]) != tail:
+        return None
+    root_parts = parts[:-len(tail)]
+    if not root_parts:
+        return None
+    return Path(*root_parts), tail
+
+
+def _open_dir_under_root_no_follow(root: Path, rel_parts: tuple[str, ...]) -> int:
+    """Open ``root/rel_parts`` as a directory, refusing symlink components."""
+    if not rel_parts:
+        raise ValueError("rel_parts must include at least one directory")
+    for name in rel_parts:
+        if name in ("", ".", "..") or Path(name).name != name:
+            raise ValueError(f"rel_parts must be plain components: {name!r}")
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    root_fd = os.open(str(root), flags)
+    fds_to_close: list[int] = [root_fd]
+    try:
+        root_lst = root.lstat()
+        root_st = os.fstat(root_fd)
+        if stat.S_ISLNK(root_lst.st_mode):
+            raise OSError(f"refusing symlinked root: {root}")
+        if not stat.S_ISDIR(root_st.st_mode):
+            raise OSError(f"refusing non-directory root: {root}")
+        if (root_st.st_dev, root_st.st_ino) != (
+            root_lst.st_dev, root_lst.st_ino
+        ):
+            raise OSError(f"refusing swapped root: {root}")
+        parent_fd = root_fd
+        display = root
+        for name in rel_parts:
+            display = display / name
+            child_lst = os.stat(
+                name, dir_fd=parent_fd, follow_symlinks=False,
+            )
+            if stat.S_ISLNK(child_lst.st_mode):
+                raise OSError(f"refusing symlinked dir: {display}")
+            if not stat.S_ISDIR(child_lst.st_mode):
+                raise OSError(f"refusing non-directory: {display}")
+            child_fd = os.open(name, flags, dir_fd=parent_fd)
+            fds_to_close.append(child_fd)
+            child_st = os.fstat(child_fd)
+            if (child_st.st_dev, child_st.st_ino) != (
+                child_lst.st_dev, child_lst.st_ino
+            ):
+                raise OSError(f"refusing swapped dir: {display}")
+            parent_fd = child_fd
+        return os.dup(parent_fd)
+    finally:
+        for fd in reversed(fds_to_close):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 # --- options dataclass --------------------------------------------------
@@ -148,14 +215,21 @@ def _resolve_project_dir(name: str, config_dir: Path | None) -> Path | None:
 def _read_runs(path: Path) -> Iterable[dict]:
     """Yield JSON objects from a runs.jsonl file. Bad lines skipped.
 
-    BUG-191: route through read_text_no_symlink with a byte cap so a
-    project-controlled runs.jsonl cannot be a symlink redirecting the
-    read to another same-user file, nor a giant file that exhausts the
-    operator's memory.
+    BUG-191/518: route project-shaped paths through a root-walking
+    no-follow read with a byte cap so neither the leaf nor `.peers/log`
+    ancestors can redirect replay outside the project or exhaust memory.
     """
     try:
-        raw = read_text_no_symlink(path, max_bytes=_MAX_RUNS_BYTES)
-    except OSError:
+        root_rel = _root_and_rel_for_tail(Path(path), _RUNS_REL)
+        if root_rel is not None:
+            root, rel_parts = root_rel
+            # protect the `.peers` and `log` ancestors too.
+            raw = read_text_under_root_no_follow(
+                root, rel_parts, max_bytes=_MAX_RUNS_BYTES,
+            )
+        else:
+            raw = read_text_no_symlink(path, max_bytes=_MAX_RUNS_BYTES)
+    except (OSError, ValueError):
         return
     for line in raw.splitlines():
         line = line.strip()
@@ -163,10 +237,30 @@ def _read_runs(path: Path) -> Iterable[dict]:
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
         if isinstance(entry, dict):
             yield entry
+
+
+def _runs_history_error(path: Path) -> str | None:
+    """Return a user-facing reason when ``path`` is absent or unsafe.
+
+    This mirrors ``_read_runs`` but reads zero bytes: replay_project needs to
+    fail closed before rendering a successful-looking empty replay.
+    """
+    try:
+        root_rel = _root_and_rel_for_tail(Path(path), _RUNS_REL)
+        if root_rel is not None:
+            root, rel_parts = root_rel
+            read_text_under_root_no_follow(root, rel_parts, max_bytes=0)
+        else:
+            read_text_no_symlink(path, max_bytes=0)
+    except FileNotFoundError:
+        return f"missing {path}"
+    except (OSError, ValueError) as e:
+        return f"unsafe tick history at {path}: {e}"
+    return None
 
 
 def _format_duration(ms: object) -> str:
@@ -326,54 +420,56 @@ def _render_prompts(proj_dir: Path, iteration: object,
     if not isinstance(iteration, int):
         out.write("  prompt: (skipped — iteration not an int)\n")
         return
-    prompts_dir = proj_dir / ".peers" / "log" / "prompts" / f"iter-{iteration}"
+    rel_dir = (".peers", "log", "prompts", f"iter-{iteration}")
+    prompts_dir = proj_dir.joinpath(*rel_dir)
     try:
-        dir_lst = os.lstat(prompts_dir)
+        dir_fd = _open_dir_under_root_no_follow(proj_dir, rel_dir)
     except FileNotFoundError:
         out.write(f"  prompt: (no prompt directory at {prompts_dir})\n")
         return
     except OSError as e:
-        out.write(f"  prompt: (cannot stat {prompts_dir}: {e})\n")
-        return
-    if stat.S_ISLNK(dir_lst.st_mode):
-        out.write(
-            f"  prompt: (refusing symlinked prompt directory: {prompts_dir})\n"
-        )
-        return
-    if not stat.S_ISDIR(dir_lst.st_mode):
-        out.write(f"  prompt: (no prompt directory at {prompts_dir})\n")
-        return
-    try:
-        names = sorted(os.listdir(prompts_dir))
-    except OSError as e:
         out.write(f"  prompt: (cannot list {prompts_dir}: {e})\n")
         return
-    files: list[Path] = []
-    for name in names:
-        child = prompts_dir / name
+    try:
         try:
-            lst = os.lstat(child)
-        except OSError:
-            continue
-        if stat.S_ISLNK(lst.st_mode):
-            out.write(
-                f"  prompt: (refusing symlinked prompt file: {child})\n"
-            )
-            continue
-        if stat.S_ISREG(lst.st_mode):
-            files.append(child)
-    if not files:
-        out.write(f"  prompt: (empty prompt directory at {prompts_dir})\n")
-        return
-    for f in files:
-        out.write(f"  prompt ({f.name}):\n")
-        try:
-            text = read_text_no_symlink(f, max_bytes=_MAX_PROMPT_BYTES)
+            names = sorted(os.listdir(dir_fd))
         except OSError as e:
-            out.write(f"    (cannot read: {e})\n")
-            continue
-        for line in text.splitlines():
-            out.write(f"    {line}\n")
+            out.write(f"  prompt: (cannot list {prompts_dir}: {e})\n")
+            return
+        files: list[str] = []
+        for name in names:
+            if Path(name).name != name:
+                continue
+            child = prompts_dir / name
+            try:
+                lst = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISLNK(lst.st_mode):
+                out.write(
+                    f"  prompt: (refusing symlinked prompt file: {child})\n"
+                )
+                continue
+            if stat.S_ISREG(lst.st_mode):
+                files.append(name)
+        if not files:
+            out.write(f"  prompt: (empty prompt directory at {prompts_dir})\n")
+            return
+        for name in files:
+            out.write(f"  prompt ({name}):\n")
+            try:
+                text = read_text_under_root_no_follow(
+                    proj_dir,
+                    (*rel_dir, name),
+                    max_bytes=_MAX_PROMPT_BYTES,
+                )
+            except (OSError, ValueError) as e:
+                out.write(f"    (cannot read: {e})\n")
+                continue
+            for line in text.splitlines():
+                out.write(f"    {line}\n")
+    finally:
+        os.close(dir_fd)
 
 
 def _filter_by_range(entry: dict, lo: int | None,
@@ -418,10 +514,11 @@ def replay_project(name: str, options: ReplayOptions) -> int:
         return 1
 
     runs_path = proj_dir / ".peers" / "log" / "runs.jsonl"
-    if not runs_path.is_file():
+    history_error = _runs_history_error(runs_path)
+    if history_error is not None:
         options.out.write(
             f"peers-ctl replay: no tick history "
-            f"(missing {runs_path})\n"
+            f"({history_error})\n"
         )
         return 1
 

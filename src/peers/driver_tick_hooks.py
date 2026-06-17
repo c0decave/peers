@@ -22,16 +22,19 @@ from peers.driver_helpers import (
     _hash_goals_yaml,
     _load_phase_prompt,
     _record_goal_results,
+    _read_hybrid_inbox_snippet,
     _resolve_peer_role,
     _resolve_phase,
     _should_checkpoint,
 )
+from peers.driver_host import _DriverHost
 from peers.goal_engine import GoalResult
+from peers.graphify_mcp import graphify_runtime
 from peers.health_guard import RunResult
 from peers.peer_spec import PeerSpec
 from peers.prompt_builder import build_prompt
-from peers.safe_io import atomic_write_text_in_dir_no_symlink, read_text_no_symlink
-from peers.skeptic_engine import PHASE_B_SKEPTIC_GATES, SkepticEngine
+from peers.safe_io import atomic_write_text_in_dir_no_symlink
+import peers.skeptic_engine as skeptic_engine
 from peers.turn_manager import TurnManager
 
 
@@ -45,7 +48,7 @@ from peers.stuck_progress import (  # noqa: E402
 )
 
 
-class DriverTickHooksMixin:
+class DriverTickHooksMixin(_DriverHost):
     def _attest_tick_commits(
         self, peer: str, head_before: str | None, head_after: str,
     ) -> None:
@@ -144,19 +147,18 @@ class DriverTickHooksMixin:
         )
         return self._exit_with_fresh_results(state, reason, ticks)
 
-    def _update_convergence_counter(self, state: dict[str, Any]) -> None:
-        """thorough-mode convergence counter. Counts ticks that
-        landed WITHOUT a new crit/high/med Bug-Report or weak-fix/shallow-
-        fix flag-bug since the tick started. Cheap to compute every tick
-        (single `git log <range>`); the actual gating is in
-        `convergence_reached.py`. Wrapped to never crash the main loop on
-        an audit-side glitch.
-
-        Skipped in dry_run because commits were reset above; counting
-        commits in an empty range would increment trivially every tick
-        and make convergence-reached pass without doing real work.
-        """
-        if self.dry_run:
+    def _update_convergence_counter(
+        self, state: dict[str, Any], success: bool = True,
+        rate_limited: bool = False,
+    ) -> None:
+        """convergence counter. Only a SUCCESSFUL tick is clean evidence: a
+        failed/no-commit tick (empty since..HEAD) used to bump the streak, greening
+        `convergence_reached` on FAILURE — now RESETS; `rate-limited` NEUTRAL (§4)."""
+        if self.dry_run or rate_limited:    # rate-limited is neutral (no count/reset)
+            return
+        if not success:                     # a non-productive tick is not clean evidence
+            state["consecutive_clean_ticks"] = 0
+            self._save_state(state)
             return
         since = self._head_before_invoke
         if since is None:
@@ -220,6 +222,11 @@ class DriverTickHooksMixin:
         # modes (strict backward-compat).
         self._update_two_phase_counters(state, results)
         if self._converged_after_fresh_recheck(state, results):
+            # CAP-14 FINDING-1 DE-SCOPE: the convergence-time
+            # ARCHITECTURE.actual.md auto-regenerator was UN-WIRED here (it made
+            # the soft architecture-coherent gate WARN permanently — structural
+            # .actual vs prose .intended). See driver_lifecycle.py and the PLAN's
+            # STEP-4/5 follow-up note.
             if self.mode_name == "hunt-open-ended":
                 state.setdefault("warnings", []).append(
                     "hunt-open-ended: convergence signals are progress "
@@ -258,7 +265,7 @@ class DriverTickHooksMixin:
             return {"reason": "complete", "state": state}, results
         return None, results
 
-    _PHASE_B_SKEPTIC_GATES = PHASE_B_SKEPTIC_GATES
+    _PHASE_B_SKEPTIC_GATES = skeptic_engine.PHASE_B_SKEPTIC_GATES
 
     def _update_two_phase_counters(
         self, state: dict[str, Any], results: dict[str, GoalResult],
@@ -270,9 +277,9 @@ class DriverTickHooksMixin:
         mode runs only. Other modes are short-circuited so their
         state.json carries no Task 6.5 fields.
         """
-        SkepticEngine(
-            self.mode_name,
-            phase_b_skeptic_gates=self._PHASE_B_SKEPTIC_GATES,
+        skeptic_engine.SkepticEngine(
+            self.mode_name, self._PHASE_B_SKEPTIC_GATES,
+            skeptic_engine.implement_phase_a_n(self.repo, self.peer_dir),
         ).update_two_phase_counters(state, results)
 
     def _account_tokens_usd(
@@ -347,6 +354,7 @@ class DriverTickHooksMixin:
             soft_reviews_pending=self._soft_reviews_pending(state, peer),
             comm_variant=self.comm_variant,
             all_peer_names=list(self.peer_names),
+            graphify_mcp=graphify_runtime() is not None,
         )
         # Tasks 4.2-4.4: implement-mode Phase 0 prompt overlay. When
         # the current phase has a shipped template (recon / alignment /
@@ -431,9 +439,10 @@ class DriverTickHooksMixin:
 
     def _record_tick_accounting(
         self, state: dict[str, Any], success: bool, tick_dt: int,
-        peer: str | None = None,
+        peer: str | None = None, rate_limited: bool = False,
     ) -> None:
-        record_tick_accounting(state, success, tick_dt, peer=peer)
+        record_tick_accounting(state, success, tick_dt, peer=peer,
+                               rate_limited=rate_limited)
 
     def _record_results(self, state: dict[str, Any],
                         results: dict[str, GoalResult], *,
@@ -493,13 +502,9 @@ class DriverTickHooksMixin:
 
         # in `comm: hybrid` mode the
         # driver previously WROTE-but-never-READ from the file channel.
-        # Peers were instructed (via HYBRID_COMM_BLOCK in the prompt)
-        # to drop markdown files at .peers/comms/<from>-to-<to>/ but
-        # the substrate ingested none of them — the channel was
-        # effectively write-only. Fix: when hybrid is active AND we
-        # know which peer is about to run (receiver), fetch their inbox
-        # files from each other peer, surface them in the prompt's
-        # inbox section, and archive them once consumed.
+        # Hybrid comm: when hybrid is active AND we know which peer is about to
+        # run (receiver), fetch their inbox files from each other peer, surface
+        # them in the prompt's inbox section, and archive them once consumed.
         if isinstance(self.comm, HybridCommLayer) and receiver is not None:
             self._verify_peer_dir_identity()
             for other in others:
@@ -512,16 +517,19 @@ class DriverTickHooksMixin:
                     continue
                 for p in paths:
                     try:
-                        text = read_text_no_symlink(p, max_bytes=4001)
-                    except OSError as e:
+                        # full-depth-analysis #7: ANCESTOR-no-follow read (BUG-185/186) —
+                        # a same-UID .peers/comms ancestor symlink swap would else redirect.
+                        rel = ("comms", f"{other}-to-{receiver}", p.name)
+                        snippet, decode_warning = _read_hybrid_inbox_snippet(
+                            self.peer_dir, rel)
+                    except (OSError, UnicodeDecodeError) as e:
                         state.setdefault("warnings", []).append(
-                            f"hybrid inbox skipped {p.name}: {e}"
-                        )
+                            f"hybrid inbox skipped {p.name}: {e}")
                         continue
-                    # Trim — long bodies bloat the prompt without value.
-                    snippet = text[:4000]
-                    if len(text) > 4000:
-                        snippet += "\n... (truncated)"
+                    if decode_warning is not None:
+                        state.setdefault("warnings", []).append(
+                            f"hybrid inbox truncated {p.name}: {decode_warning}"
+                        )
                     msgs.append(
                         f"[{other} → file {p.name}]\n{snippet}"
                     )
@@ -678,13 +686,6 @@ class DriverTickHooksMixin:
         (less specific, more prone to false positives).
         """
         return self._anti_cheat_guard().classify_cheating(state)
-
-    def _stderr_text(e: subprocess.CalledProcessError) -> str:
-        if e.stderr is None:
-            return str(e)
-        if isinstance(e.stderr, bytes):
-            return e.stderr.decode("utf-8", errors="replace").strip()
-        return str(e.stderr).strip()
 
     def _revert_handoff(self, reason: str) -> bool:
         """Run `git revert --no-commit <since>..HEAD` then commit the

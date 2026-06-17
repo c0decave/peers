@@ -3,6 +3,43 @@
 driver: orchestrator          # orchestrator | hooks (peers tick) | sessions
 comm: git                     # git | hybrid (git for code + files for messages)
 
+# Opt-in caged graphify code knowledge-graph MCP (off by default). When true,
+# `peers-ctl start` builds an offline AST graph of the repo inside a
+# supply-chain cage and serves it to the peers over an api-key-gated MCP, so
+# agents can prefer graph navigation (callers / blast-radius / shortest-path)
+# over grep. Fail-open: any failure (no podman/image) continues with no graph.
+# In --container runs it shares the egress/auth-proxy network; with all proxies
+# off (e.g. PODMAN_NETWORK=host) there is no shared netns to join, so it
+# fail-opens to no-graph. The PEERS_CTL_NO_GRAPHIFY=1 kill-switch forces it off.
+graphify_mcp: false
+
+# Extra egress hosts the --container peers may reach, as tinyproxy host-regex
+# strings appended to the egress-proxy allow-list (on top of the LLM API hosts).
+# Use this to let a peer fetch a spec / research source. Anchor each pattern.
+# Off by default (no extra egress). Example (e.g. for an RFC/spec review):
+#   egress_allow:
+#     - '^rfc-editor\.org$'
+#     - '^datatracker\.ietf\.org$'
+#     - '^www\.w3\.org$'
+
+# Opt-in web modality for `peers research --modalities codebase,web`. OFF by
+# default (codebase-only research is honest but produces no URL-cited report).
+# When enabled, the research frontend fetches the operator's seed_urls through an
+# allowlisted, SSRF-guarded, fail-closed fetcher (host must match an anchored
+# `allow` regex AND not be loopback/private/link-local). seed_urls are the sources
+# the operator scopes research to (no search-engine API is used). Set `proxy` to
+# route through the egress proxy. Deny-by-default: an empty allow fetches nothing.
+#   research:
+#     web:
+#       enabled: true
+#       allow:
+#         - '^rfc-editor\.org$'
+#         - '^datatracker\.ietf\.org$'
+#       seed_urls:
+#         - 'https://www.rfc-editor.org/rfc/rfc8259'
+#       proxy: null        # or 'http://127.0.0.1:8080' for the egress proxy
+#       max_bytes: 5242880
+
 # declare peers as an ordered list so n>=2 setups are
 # possible. Legacy `tools: {claude: ..., codex: ...}` shape is also
 # accepted and auto-promoted.
@@ -169,6 +206,17 @@ health:
     # substrate's own goal text.
     - "(?m)^[^\"\\n]*?\\b(ERROR|FATAL)\\b[^\"\\n]*?\\bhit your usage limit\\b"
 
+# Operator observability knobs (host-side; never affect the loop's
+# decisions). Default OFF -> a normal launch is byte-identical.
+observability:
+  # Wave-2 TUI live tee: mirror each peer's live stdout/stderr into
+  # `.peers/log/peers/tick-<N>-<peer>.stream.jsonl` AS IT HAPPENS, so the
+  # `peers-ctl tui` Live-Stream window can tail codex/opencode in real time
+  # (claude is already live via its session jsonl). Fail-closed: a tee error
+  # can never disturb the peer's liveness/idle-timeout. Also enableable
+  # without editing config via `PEERS_TEE_STREAM=1`.
+  tee_stream: false
+
 # Hard-goal commands (pytest, ruff, custom checks) run with a
 # per-command wall-clock timeout. Default 120 s suffices for small
 # projects; raise it for large repos whose `pytest -q` legitimately
@@ -186,6 +234,8 @@ goals:
   # forgiven whenever a PLAN step is completed on a tick — so a run only
   # halts on genuine NO-progress, not on a terminal gate that is red by
   # design while a multi-step build is still in flight. Implement-mode
-  # defaults to ["tests-pass"]; other modes default to [] (there a red
-  # tests-pass IS a real stuck signal). Set [] to disable, or add gates.
-  # stuck_progress_reset_gates: ["tests-pass"]
+  # defaults to the full watched-halt set ["tests-pass",
+  # "no-prior-regression"] (both are env-fragile / red-by-design during a
+  # multi-step build); other modes default to [] (there a red gate IS a
+  # real stuck signal). Set [] to disable, or override the list.
+  # stuck_progress_reset_gates: ["tests-pass", "no-prior-regression"]

@@ -607,3 +607,33 @@ def test_all_peers_healthy_fails_closed_on_non_list_exit_events_BUG_248(
         assert "all_peers_healthy FAIL" in r.stdout
         assert "state.exit_events is not a list" in r.stdout
         assert "Traceback" not in r.stderr
+
+
+# --- full-depth-analysis #4: only a SUCCESSFUL tick counts as clean convergence
+def test_convergence_counter_failed_tick_resets_not_increments():
+    # sad: a failed/no-commit tick leaves HEAD unmoved (empty since..HEAD range);
+    # it must NOT be counted as a clean convergence tick (that fail-OPENS the
+    # convergence_reached gate on agent FAILURE). It RESETS the streak.
+    import types
+    from peers.driver_tick_hooks import DriverTickHooksMixin
+    drv = types.SimpleNamespace(dry_run=False, _head_before_invoke="deadbeef",
+                                repo="/nonexistent", _save_state=lambda s: None)
+    state = {"consecutive_clean_ticks": 2}
+    DriverTickHooksMixin._update_convergence_counter(drv, state, success=False)
+    assert state["consecutive_clean_ticks"] == 0
+    for _ in range(3):                       # 3 dead ticks never accumulate to threshold
+        DriverTickHooksMixin._update_convergence_counter(drv, state, success=False)
+    assert state["consecutive_clean_ticks"] == 0
+
+
+def test_convergence_counter_rate_limited_tick_is_neutral():
+    # edge: a transient rate-limited tick is NEUTRAL — neither clean evidence nor a
+    # productive failure (matches peer-health/rotation special-casing).
+    import types
+    from peers.driver_tick_hooks import DriverTickHooksMixin
+    drv = types.SimpleNamespace(dry_run=False, _head_before_invoke="deadbeef",
+                                repo="/nonexistent", _save_state=lambda s: None)
+    state = {"consecutive_clean_ticks": 2}
+    DriverTickHooksMixin._update_convergence_counter(
+        drv, state, success=False, rate_limited=True)
+    assert state["consecutive_clean_ticks"] == 2

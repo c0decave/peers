@@ -8,15 +8,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-_TEST_ONLY_PATH_RE = re.compile(
-    r"(^tests?/|.*/tests?/|(^|/)test_[^/]+\.py$|(^|/)[^/]+_test\.py$|"
-    r".*_test\.go$|.*\.test\.[a-zA-Z]+$)"
-)
-
 _TEST_PATH_RE = re.compile(
-    r"(^|/)(tests?/|test_[^/]+\.py$|.*_test\.go$|.*\.test\."
-    r"[a-zA-Z]+$)"
+    r"((?i:^tests?/)|"            # top-level test/ tests/ (any case: Tests/, TEST/)
+    r"(?i:.*/tests?/)|"          # test/ tests/ dir anywhere (any case)
+    r"(^|/)test_[^/]+\.py$|"     # pytest test_*.py
+    r"(^|/)[^/]+_test\.py$|"     # *_test.py
+    r"(^|/)conftest\.py$|"       # pytest fixtures/config
+    r"(^|/)[^/]+_spec\.rb$|"     # RSpec *_spec.rb
+    r"(^|/)spec/.+\.rb$|"        # Ruby files under a spec/ dir;
+    r".*_test\.go$|"             #   non-.rb under spec/ (spec/openapi.yaml)
+    r".*\.test\.[a-zA-Z]+$)"     #   stays SOURCE on purpose.
 )
+_TEST_ONLY_PATH_RE = _TEST_PATH_RE
 
 MAX_RECENT_DIFF_STATS = 50
 
@@ -39,7 +42,7 @@ def is_test_only_commit(repo: Path, ref: str) -> bool:
         for line in result.stdout.splitlines()
         if line.strip()
     ]
-    return bool(files) and all(_TEST_ONLY_PATH_RE.search(path) for path in files)
+    return bool(files) and all(_is_test_path(path) for path in files)
 
 
 class AntiCheatGuard:
@@ -153,7 +156,7 @@ class AntiCheatGuard:
                 delta = int(add) + int(rem)
             except ValueError:
                 continue
-            if _TEST_PATH_RE.search(path):
+            if _is_test_path(path):
                 test_lines += delta
             else:
                 src_lines += delta
@@ -275,3 +278,7 @@ class AntiCheatGuard:
         if isinstance(exc.stderr, bytes):
             return exc.stderr.decode("utf-8", errors="replace").strip()
         return str(exc.stderr).strip()
+
+
+def _is_test_path(path: str) -> bool:
+    return bool(_TEST_PATH_RE.search(path))

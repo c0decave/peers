@@ -96,6 +96,56 @@ def test_collect_with_bugs_and_runs(tmp_path: Path) -> None:
     assert m.stop_reason == "complete"
 
 
+def test_collect_tolerates_wave2_gates_field(tmp_path: Path) -> None:
+    """Fix #3 (consumer backward-compat lock): runs.jsonl CONSUMERS must
+    tolerate the new Wave-2 per-tick ``gates`` map. A mixed log — Wave-2 lines
+    WITH ``gates``, one pre-Wave-2 line WITHOUT it, plus the synthetic exit line
+    — must produce the SAME counts as if ``gates`` were absent: the unknown key
+    is ignored, never crashes, never miscounts."""
+    proj = tmp_path / "v13"
+    _seed_state(proj, iteration=12, runtime_s=100, max_runtime_s=43200,
+                wasted_s=0, clean_ticks=3, stop_reason="complete")
+    _seed_runs(proj, [
+        # Wave-2 lines carry a `gates` map (hard verdicts + soft "n/m" + the
+        # truncation marker) alongside the established fields.
+        {"iteration": 1, "peer": "claude", "classification": "success",
+         "success": True, "peer_state_after": "healthy",
+         "gates": {"hard": {"tests": "pass"}, "soft": {"review": "2/2"},
+                   "_truncated": True}},
+        {"iteration": 2, "peer": "codex", "classification": "success",
+         "success": True, "peer_state_after": "healthy",
+         "gates": {"hard": {"tests": "fail"}}},
+        # A pre-Wave-2 line WITHOUT any `gates` field (old run / old substrate).
+        {"iteration": 9, "peer": "claude", "classification": "success",
+         "success": False, "peer_state_after": "healthy"},  # no-handoff
+        {"iteration": 11, "peer": "claude", "classification": "idle-timeout",
+         "success": False, "peer_state_after": "degraded"},
+        # The synthetic exit line (carries no tick fields).
+        {"event": "exit", "reason": "complete", "ticks_in_run": 4,
+         "ts": "2026-06-11T00:01:00+00:00"},
+    ])
+    # Consumer 1: peers_ctl.compare.collect_project_metrics — counts must match
+    # what the same log would yield with no `gates` keys at all.
+    m = collect_project_metrics("v13", proj)
+    assert m.success_ticks == 2
+    assert m.no_handoffs == 1
+    assert m.idle_timeouts == 1
+    assert m.degraded_events == 1
+    assert m.stop_reason == "complete"
+
+    # Consumer 2 (defense in depth): the TUI reader.tick_entries — it parses the
+    # SAME log, surfaces the exit line via is_exit, and ignores the unknown
+    # `gates` key without error.
+    from peers_ctl.tui import reader as R
+
+    entries = R.tick_entries(proj / ".peers" / "log" / "runs.jsonl")
+    ticks = [e for e in entries if not e.is_exit]
+    exits = [e for e in entries if e.is_exit]
+    assert len(ticks) == 4 and len(exits) == 1
+    assert [t.iteration for t in ticks] == [1, 2, 9, 11]
+    assert exits[0].exit_reason == "complete"
+
+
 def test_render_two_project_table(tmp_path: Path) -> None:
     v11 = tmp_path / "v11"
     v12 = tmp_path / "v12"

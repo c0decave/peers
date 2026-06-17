@@ -74,6 +74,52 @@ def test_parse_trailers_requires_contiguous_block_at_end():
     assert parse_commit_trailers(msg) == {}
 
 
+def test_parse_trailers_tolerates_cherry_pick_footer():
+    # `git cherry-pick -x` appends `(cherry picked from commit <sha>)`
+    # AFTER trailers; the parser must skip that footer line, not treat it as
+    # a stop marker. git's own `interpret-trailers --parse` tolerates it; ours
+    # must match.
+    msg = textwrap.dedent("""\
+        Resolve BUG-X: do the thing
+
+        ## Bug-Resolution
+        {"resolves":"BUG-X","status":"fixed","note":"n"}
+
+        Peer: codex
+        Bug-Resolves: BUG-X
+        (cherry picked from commit b0c880cdd79d17a627c61c9fb5a317b65a047042)
+    """)
+    t = parse_commit_trailers(msg)
+    assert t == {"Peer": ["codex"], "Bug-Resolves": ["BUG-X"]}
+
+
+def test_parse_trailers_tolerates_cherry_pick_footer_short_sha():
+    # Same shape but with a 7-char abbreviated sha; the parser must still
+    # recognise the git-generated footer line.
+    msg = textwrap.dedent("""\
+        subj
+
+        Peer: claude
+        Bug-Report: BUG-Y
+        (cherry picked from commit 1234abc)
+    """)
+    t = parse_commit_trailers(msg)
+    assert t == {"Peer": ["claude"], "Bug-Report": ["BUG-Y"]}
+
+
+def test_parse_trailers_rejects_non_cherry_pick_parenthetical():
+    # A parenthetical that ISN'T the git-generated cherry-pick footer should
+    # still break parsing — we only whitelist that one specific footer.
+    msg = textwrap.dedent("""\
+        subj
+
+        Peer: claude
+        Bug-Report: BUG-Z
+        (some random parenthetical that is not a trailer)
+    """)
+    assert parse_commit_trailers(msg) == {}
+
+
 # ---------------- summarize end-to-end -------------------------------
 
 

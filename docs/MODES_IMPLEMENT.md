@@ -247,9 +247,11 @@ Plus the **cleanliness gates** (Schicht 5): `no-shortcut-markers`
 `NotImplementedError`), `no-empty-bodies` (AST-scan for pass/.../docstring-only
 bodies), `no-skipped-tests` (forbids pytest.mark.skip / xit and
 friends). Legitimate escapes require **both** a code-side
-`# JUSTIFIED:` / `# SKIP-REASON:` annotation **and** a reviewer-signed
-entry in `.peers/justifications.log` (hash-chained — see
-`src/peers_ctl/justifications.py`).
+`# JUSTIFIED:` / `# SKIP-REASON:` annotation **and** an independent
+`peers-review: <relpath>` commit by the **other** peer (FU-2 — the
+substrate attributes it via the unforgeable `refs/notes/peers-attest`
+note; the gate searches reachable history for it, excluding the file's
+own author so a peer cannot self-bless).
 
 ---
 
@@ -312,7 +314,7 @@ and appends a hash-chained `<chain16> <iso8601> amend acceptance: ... | reason: 
 line to `.peers/contracts.log`. The audit trail is preserved; the
 gate goes green on the next tick.
 
-### `# JUSTIFIED:` + signed entry — keep a TODO/FIXME
+### `# JUSTIFIED:` + independent review commit — keep a TODO/FIXME
 
 Some shortcuts are deliberate (deferred to a future PR, gated on
 external work, performance tradeoff). Two-key escape:
@@ -324,9 +326,22 @@ external work, performance tradeoff). Two-key escape:
        raise NotImplementedError
    ```
 
-2. Reviewer-signed entry in `.peers/justifications.log` (one line per
-   `file:line`, hash-chained). The reviewer peer (or operator) appends
-   via `peers_ctl.justifications.append_justification(...)`.
+2. An independent **review commit** by the *other* peer (FU-2). During
+   the reviewer's own tick they make a commit whose message carries a
+   `peers-review: <relpath>` line for the file being justified:
+
+   ```sh
+   git commit --allow-empty -m "peers-review: src/auth/oauth.py
+
+   reviewed STEP-7 OAuth stub; deferral is sound"
+   ```
+
+   The substrate attributes that commit to the reviewer via the
+   unforgeable `refs/notes/peers-attest` note. The gate
+   searches **reachable** history for it and excludes the file's own
+   author, so a peer cannot self-bless. (This replaces the old
+   `.peers/justifications.log` sign-off, whose reviewer field was
+   agent-authored free text and therefore forgeable — P0 review.)
 
 `no-shortcut-markers` only passes when **both** halves are present
 for every match.
@@ -342,8 +357,8 @@ def test_kernel_fusion() -> None:
     ...
 ```
 
-Plus a signed entry in `.peers/justifications.log` for that line.
-`no-skipped-tests` honours both halves.
+Plus an independent `peers-review: tests/<relpath>` commit by the other
+peer (as above). `no-skipped-tests` honours both halves.
 
 ---
 

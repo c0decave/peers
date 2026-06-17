@@ -1,11 +1,12 @@
 [project]
 name = "peers"
-version = "1.6.0"
+version = "1.6.7"
 requires-python = ">=3.11"
 dependencies = ["pyyaml>=6.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.5"]
+dev = ["pytest>=8.0", "pytest-xdist>=3.0", "pytest-asyncio>=0.23", "ruff>=0.5"]
+tui = ["textual>=5.1.0,<6", "textual-window>=0.8"]
 
 [project.scripts]
 peers = "peers.cli:main"
@@ -20,3 +21,13 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 peers = ["templates/**/*"]
+
+[tool.mypy]
+exclude = "^src/peers/templates/modes/.*/checks/convergence_reached\\.py$"
+
+# The default type-check env deliberately treats a few third-party packages as
+# untyped: the optional TUI stack is absent unless ``peers[tui]`` is installed,
+# and distro-managed Python environments do not guarantee PyYAML stubs.
+[[tool.mypy.overrides]]
+module = ["rich.*", "textual.*", "textual_window", "textual_window.*", "yaml", "yaml.*"]
+ignore_missing_imports = true

@@ -26,24 +26,26 @@ form for the gate to see them.
 
 Escape via reviewer sign-off
 ----------------------------
-Two ingredients are required, both at the same ``file:line``:
+Two ingredients are required:
 
 1. A ``# SKIP-REASON: <text>`` comment on the line *immediately
    before* the skip marker (decorator or call) explaining why.
-2. ``.peers/justifications.log`` has a reviewer-signed entry for
-   ``tests/<relpath>:<lineno>`` where ``<lineno>`` is the line of
-   the skip marker itself (not the SKIP-REASON line).
+2. An independent ``peers-review: <relpath>`` commit by the OTHER peer
+   (FU-2). The reviewer signs off by making a commit whose message carries
+   ``peers-review: tests/<relpath>``; the substrate attributes it via the
+   unforgeable ``refs/notes/peers-attest`` note. The gate SEARCHES reachable
+   history for it (:func:`peers.attest.find_review_commit`), excluding the
+   file's own author, so a peer cannot self-bless its skip.
 
-Missing either half is a violation. We reuse the
-:func:`peers_ctl.justifications.is_justified` lookup from Task 5.2
-so a single ``justifications.log`` covers both shortcut-marker and
-skipped-test escapes.
+Missing either half is a violation. This replaces the previous escape, which
+trusted an agent-authored (forgeable) ``.peers/justifications.log`` reviewer
+field; the log is no longer consulted for this gate.
 
 Exit codes
 ----------
-* ``0`` -- ``tests/`` is clean, or every skip is annotated+signed,
-  or no ``tests/`` directory exists.
-* ``1`` -- at least one unsigned skip; stdout lists each violation
+* ``0`` -- ``tests/`` is clean, or every skip is annotated + independently
+  reviewed, or no ``tests/`` directory exists.
+* ``1`` -- at least one un-reviewed skip; stdout lists each violation
   as ``<relpath>:<lineno>: <kind>``.
 """
 from __future__ import annotations
@@ -52,12 +54,13 @@ import ast
 import hashlib
 import re
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
-from peers_ctl.justifications import (
-    JustificationError,
-    is_justified,
-    verify_log_chain,
+from peers.attest import (
+    attested_authors_of_file,
+    attested_line_author_peers,
+    find_review_commit,
 )
 
 
@@ -68,6 +71,7 @@ _SKIP_REASON_TAG = "# SKIP-REASON:"
 # decorators we can easily AST-match. BUG-011 (eco-run): match the call as a
 # WHOLE WORD (`\bxit\b\s*\(`), not a substring -- the old `"xit(" in line`
 # false-flagged every `sys.exit(`, `os._exit(`, or `...xit(` identifier.
+# CAP14-REDEPLOY: BUG-011 whole-word xit/xdescribe fix is the canonical deployable gate
 _TEXTUAL_SKIP_RE = re.compile(r"\b(xit|xdescribe)\b\s*\(")
 
 
@@ -160,7 +164,8 @@ def _node_source(text: str, node: ast.AST) -> str:
 
 
 def _enclosing_def_source(
-    defs: list[ast.AST], text: str, lineno: int
+    defs: Sequence[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef],
+    text: str, lineno: int,
 ) -> str:
     """Source of the innermost function/class def whose span (decorators
     included) contains ``lineno`` — the test a ``pytest.skip()`` call guards."""
@@ -241,8 +246,9 @@ def _iter_file_skips(
                     node.targets if isinstance(node, ast.Assign)
                     else [node.target]
                 )
-                if any(isinstance(t, ast.Name) and t.id == "pytestmark"
-                       for t in targets):
+                if node.value is not None and any(
+                        isinstance(t, ast.Name) and t.id == "pytestmark"
+                        for t in targets):
                     for lineno, kind in _pytestmark_skip_marks(node.value):
                         _add(lineno, kind, "<module-level pytestmark>", "")
 
@@ -262,8 +268,29 @@ def _format_violation(relpath: str, lineno: int, kind: str,
     return f"{relpath}:{lineno}: {kind}: target={target}"
 
 
+def _skip_independently_reviewed(
+    project_root: Path, relpath: str, lineno: int,
+) -> bool:
+    """True when an independent peer signed off on ``relpath`` via a
+    substrate-attested ``peers-review: <relpath>`` commit (FU-2).
+
+    The peer(s) that authored the skip marker line AND its ``# SKIP-REASON:``
+    line (the line immediately above) are excluded so a peer cannot self-bless
+    its own skip. We exclude by those LINES' authors (``git blame``), not the
+    file's last editor — the latter is launderable via a co-peer's trivial edit
+    elsewhere in the file. Falls back to the whole-file author set (stricter)
+    when the lines cannot be attributed.
+    """
+    exclude = attested_line_author_peers(
+        project_root, relpath, [lineno, lineno - 1])
+    if not exclude:
+        exclude = attested_authors_of_file(project_root, relpath)
+    return find_review_commit(
+        project_root, relpath, exclude_peer=exclude) is not None
+
+
 def _scan_python_file(
-    path: Path, relpath: str, plan_dir: Path, baseline: frozenset[str],
+    path: Path, relpath: str, project_root: Path, baseline: frozenset[str],
 ) -> list[str]:
     try:
         text = path.read_text(encoding="utf-8")
@@ -281,11 +308,10 @@ def _scan_python_file(
         if sig in baseline:
             continue
         if _line_has_skip_reason(text_lines, lineno):
-            signed, _signer = is_justified(plan_dir, relpath, lineno)
-            if signed:
+            if _skip_independently_reviewed(project_root, relpath, lineno):
                 continue
             violations.append(
-                f"{relpath}:{lineno}: SKIP-REASON-but-unsigned: {kind}"
+                f"{relpath}:{lineno}: SKIP-REASON-but-unreviewed: {kind}"
             )
             continue
         violations.append(_format_violation(relpath, lineno, kind, target))
@@ -364,20 +390,14 @@ def main(project_dir: str = ".", snapshot: bool = False) -> int:
         )
         return 0
 
-    # verify chain before consulting the log. is_justified() is
-    # a pure lookup and accepts forged entries with a bogus chain prefix.
-    try:
-        verify_log_chain(plan_dir)
-    except JustificationError as e:
-        print(f"no-skipped-tests FAIL: justifications log chain broken: {e}")
-        return 1
-
     baseline = _load_baseline(plan_dir)
     all_violations: list[str] = []
     files = _iter_test_files(tests_root)
     for path in files:
         rel = path.relative_to(project_root).as_posix()
-        all_violations.extend(_scan_python_file(path, rel, plan_dir, baseline))
+        all_violations.extend(
+            _scan_python_file(path, rel, project_root, baseline)
+        )
 
     if all_violations:
         print(
@@ -388,8 +408,8 @@ def main(project_dir: str = ".", snapshot: bool = False) -> int:
             print(f"  {v}")
         print(
             "  hint: each skip needs a `# SKIP-REASON: <text>` comment "
-            "on the line above AND a reviewer-signed entry in "
-            ".peers/justifications.log for the skip marker line"
+            "on the line above AND an independent `peers-review: <relpath>` "
+            "commit by the OTHER peer (FU-2: substrate-attested signoff)"
         )
         return 1
 

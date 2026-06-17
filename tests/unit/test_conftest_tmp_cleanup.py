@@ -35,14 +35,14 @@ from __future__ import annotations
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
-import pytest
 
 
 # Import the hook from the suite's own conftest. We do this lazily
 # inside each test because conftest.py is loaded by pytest itself and
 # not normally importable by name.
-def _load_hook():
+def _load_conftest_module():
     import importlib.util
 
     conftest_path = Path(__file__).resolve().parent.parent / "conftest.py"
@@ -52,7 +52,11 @@ def _load_hook():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module._restore_basetemp_writable
+    return module
+
+
+def _load_hook():
+    return _load_conftest_module()._restore_basetemp_writable
 
 
 def _make_tree(root: Path) -> None:
@@ -132,3 +136,45 @@ def test_sad_basetemp_is_file_does_not_raise(tmp_path):
     f.write_text("hi")
     hook = _load_hook()
     hook(f)
+
+
+# --- session-START heal (BUG-266 layer 2: hard-killed prior sessions) ---
+# pytest_sessionfinish only restores THIS session's tree on a clean exit.
+# A session killed by SIGKILL/OOM/CI-timeout never runs it, leaving a
+# 0o555 tree that pytest's retention GC then cannot rm (read-only parent),
+# so it accumulates until the tmpfs fills. pytest_sessionstart heals the
+# whole pytest-of-<user> parent at the next session's START to close that
+# gap (it runs after the tmpdir plugin's configure, so _tmp_path_factory
+# is guaranteed present — unlike pytest_configure hook ordering).
+
+
+def _fake_session(getbasetemp):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            _tmp_path_factory=SimpleNamespace(getbasetemp=getbasetemp)
+        )
+    )
+
+
+def test_sessionstart_restores_killed_session_sibling(tmp_path):
+    """A 0o555 tree left by a hard-killed prior session is restored to
+    writable at session start so pytest can later reclaim it."""
+    # tmp_path stands in for the pytest-of-<user> parent.
+    leftover = tmp_path / "pytest-7"  # the killed session's basetemp
+    leftover.mkdir()
+    _make_tree(leftover)  # 0o555 dirs under leftover/a
+    current = tmp_path / "pytest-8"  # this session's fresh basetemp
+    current.mkdir()
+
+    session = _fake_session(lambda: current)
+    _load_conftest_module().pytest_sessionstart(session)
+
+    for d in (leftover / "a", leftover / "a" / "sub"):
+        mode = stat.S_IMODE(d.stat().st_mode)
+        assert mode & stat.S_IWUSR, f"{d} not restored (mode={oct(mode)})"
+
+
+def test_sessionstart_missing_factory_does_not_raise():
+    """The session-start heal is best-effort: a session without a temp-path
+    factory (or any error reaching it) must never fail pytest startup."""
+    _load_conftest_module().pytest_sessionstart(SimpleNamespace())

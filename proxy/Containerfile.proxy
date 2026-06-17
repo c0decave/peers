@@ -14,7 +14,12 @@
 
 FROM alpine:3.20
 
-RUN apk add --no-cache tinyproxy ca-certificates
+# iptables/ip6tables: install the in-netns egress lockdown (the entrypoint
+#   forces all egress through tinyproxy; see entrypoint.sh + _build_proxy_argv).
+# su-exec: drop root -> tinyproxy for the long-lived daemon AFTER the firewall
+#   is installed (the lockdown needs CAP_NET_ADMIN, which a non-root uid in the
+#   container's userns cannot exercise; tinyproxy itself runs unprivileged).
+RUN apk add --no-cache tinyproxy ca-certificates iptables su-exec
 
 COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
 COPY filter-allow.txt /etc/tinyproxy/filter
@@ -28,7 +33,12 @@ RUN mkdir -p /run/tinyproxy /var/log/tinyproxy \
     && chown -R tinyproxy:tinyproxy /run/tinyproxy /var/log/tinyproxy \
     && chmod 0755 /usr/local/bin/peers-egress-entrypoint
 
-USER tinyproxy
+# The entrypoint runs as root to install the firewall lockdown, then drops to
+# the unprivileged `tinyproxy` user via su-exec for the daemon itself. The
+# container is still hardened from the outside: --cap-drop=ALL keeps only
+# NET_ADMIN/SETUID/SETGID (see _build_proxy_argv), --no-new-privileges,
+# --read-only, and a keep-id userns (so this "root" is a mapped, unprivileged
+# host uid, not real root).
 EXPOSE 3128
 
 ENTRYPOINT ["/usr/local/bin/peers-egress-entrypoint"]

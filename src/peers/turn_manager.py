@@ -19,7 +19,11 @@ from typing import Any
 from peers.safe_io import (
     _ensure_private_dir,
     atomic_write_text_in_dir_no_symlink,
+    read_bytes_no_symlink,
 )
+
+
+_LEGACY_HANDOFF_MAX_BYTES = 64 * 1024
 
 
 def _handoff_msg_path(project_root: Path) -> Path:
@@ -51,9 +55,12 @@ def sweep_legacy_handoff_msg(project_root: Path) -> None:
     for name in (".handoff-msg.txt", "handoff-msg.txt"):
         legacy = root / name
         try:
-            if not legacy.exists() or legacy.is_symlink():
+            data = read_bytes_no_symlink(
+                legacy, max_bytes=_LEGACY_HANDOFF_MAX_BYTES + 1,
+            )
+            if len(data) > _LEGACY_HANDOFF_MAX_BYTES:
                 continue
-            text = legacy.read_text(encoding="utf-8", errors="replace")
+            text = data.decode("utf-8", errors="replace")
             if not target.exists():
                 write_handoff_msg(root, text)
             legacy.unlink()

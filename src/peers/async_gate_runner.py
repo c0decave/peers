@@ -75,6 +75,12 @@ class AsyncGateRunner:
         )
         self._futures: dict[str, Future] = {}
         self._order: list[str] = []
+        # BUG-504 defense layer: every submit is tagged with the goals
+        # generation at submit-time. invalidate_in_flight() bumps the
+        # generation so poll_latest can drop stale verdicts even if the
+        # clear missed (e.g. a future that finished after the bump).
+        self._goals_generation: int = 0
+        self._gen_for: dict[str, int] = {}
 
     def submit(self, sha: str) -> None:
         """Kick off background evaluation of the expensive gates on ``sha``.
@@ -89,6 +95,20 @@ class AsyncGateRunner:
             return
         self._futures[sha] = self._ex.submit(self._run, sha)
         self._order.append(sha)
+        self._gen_for[sha] = self._goals_generation
+
+    def invalidate_in_flight(self) -> None:
+        """BUG-504: drop all in-flight verdicts after a goals reload so a
+        future computed against the OLD goal set can never be trusted as a
+        fresh verdict for the SAME SHA. Cancels pending work (a running
+        worker is not interruptible but its result is discarded by the
+        generation bump). Idempotent."""
+        for fut in list(self._futures.values()):
+            fut.cancel()
+        self._futures.clear()
+        self._order.clear()
+        self._gen_for.clear()
+        self._goals_generation += 1
 
     def take(self, sha: str, block: bool = True):
         """Return the ``{goal_id: GoalResult}`` dict for ``sha``'s expensive
@@ -98,6 +118,7 @@ class AsyncGateRunner:
         fut = self._futures.pop(sha, None)
         if sha in self._order:
             self._order.remove(sha)
+        self._gen_for.pop(sha, None)
         if fut is None:
             return None
         try:
@@ -110,17 +131,32 @@ class AsyncGateRunner:
         submitted SHA whose eval has FINISHED, discarding it and any older
         (now superseded) pending evals. Returns ``None`` when nothing has
         finished yet. This is how the loop consumes the freshest available
-        expensive verdict without ever blocking on the next peer turn."""
+        expensive verdict without ever blocking on the next peer turn.
+
+        BUG-504: entries whose recorded goals-generation is below the
+        current one (because a goals reload invalidated them) are skipped
+        and dropped — the caller will fall back to a sync eval against the
+        fresh goal set instead of trusting an old-goal verdict."""
         for i in range(len(self._order) - 1, -1, -1):
             sha = self._order[i]
             fut = self._futures.get(sha)
-            if fut is not None and fut.done():
+            gen = self._gen_for.get(sha)
+            if fut is None:
+                continue
+            if gen is not None and gen != self._goals_generation:
+                # Stale-generation entry; drop it and keep scanning.
+                self._futures.pop(sha, None)
+                self._gen_for.pop(sha, None)
+                self._order.pop(i)
+                continue
+            if fut.done():
                 try:
                     result = fut.result()
                 except Exception:
                     result = GATE_EVAL_FAILED
                 for old in self._order[: i + 1]:
                     self._futures.pop(old, None)
+                    self._gen_for.pop(old, None)
                 self._order = self._order[i + 1:]
                 return (sha, result)
         return None

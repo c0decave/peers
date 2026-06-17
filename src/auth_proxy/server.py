@@ -10,7 +10,7 @@ import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from auth_proxy.oauth_refresh import OAuthRefreshError, load_claude_oauth
 from auth_proxy.oauth_refresh import refresh_claude_config
@@ -118,6 +118,47 @@ def _clean_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
         for key, value in headers.items()
         if key.lower() not in _DROP_RESPONSE_HEADERS
     }
+
+
+def _header_parts(headers: Any, name: str) -> list[str]:
+    values = (
+        headers.get_all(name)
+        if hasattr(headers, "get_all") else None
+    )
+    if values is None:
+        raw = headers.get(name)
+        values = [raw] if raw is not None else []
+    return [part.strip() for value in values for part in str(value).split(",")]
+
+
+def _content_length_parts(headers: Any) -> list[str]:
+    return _header_parts(headers, "Content-Length")
+
+
+def _request_transfer_encoding_error(headers: Any) -> str | None:
+    # BaseHTTPRequestHandler does not decode chunked request bodies.
+    # Any Transfer-Encoding present means the on-the-wire body would be read as
+    # zero bytes (no Content-Length) and a truncated/empty request forwarded
+    # upstream, so reject it up front rather than silently drop the body.
+    parts = [part.lower() for part in _header_parts(headers, "Transfer-Encoding")]
+    if any(part for part in parts):
+        return "unsupported Transfer-Encoding"
+    return None
+
+
+def _parse_content_length(headers: Any) -> tuple[int, str | None]:
+    parts = _content_length_parts(headers)
+    if not parts:
+        return 0, None
+    if len(set(parts)) > 1:
+        return 0, "conflicting Content-Length"
+    try:
+        length = int(parts[0])
+    except ValueError:
+        return 0, "invalid Content-Length"
+    if length < 0:
+        return 0, "invalid Content-Length"
+    return length, None
 
 
 def _upstream_url(upstream_base: str, path: str) -> str:
@@ -261,29 +302,20 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 self.send_error(503, "auth proxy concurrency cap reached")
                 return
         try:
+            # reject chunked/transfer-encoded request bodies the
+            # handler cannot decode (they would forward empty/truncated).
+            transfer_error = _request_transfer_encoding_error(self.headers)
+            if transfer_error is not None:
+                self.send_error(501, transfer_error)
+                return
             # a request that arrives with two conflicting
             # Content-Length values is an HTTP smuggling / framing error
             # (RFC 9112 §6.3). self.headers is an HTTPMessage and
             # get_all() reveals duplicates; dict-like fallback (test
             # harnesses) just returns the single value.
-            cl_all = (
-                self.headers.get_all("Content-Length")
-                if hasattr(self.headers, "get_all") else None
-            )
-            if cl_all is not None and len(cl_all) > 1:
-                # Multiple values can legally be a comma-separated list
-                # iff every part is identical; mismatch is rejected.
-                parts = {p.strip() for v in cl_all for p in v.split(",")}
-                if len(parts) > 1:
-                    self.send_error(400, "conflicting Content-Length")
-                    return
-            try:
-                length = int(self.headers.get("Content-Length", "0") or "0")
-            except ValueError:
-                self.send_error(400, "invalid Content-Length")
-                return
-            if length < 0:
-                self.send_error(400, "invalid Content-Length")
+            length, length_error = _parse_content_length(self.headers)
+            if length_error is not None:
+                self.send_error(400, length_error)
                 return
             if length > self.max_request_bytes:
                 self.send_error(
@@ -305,7 +337,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 response = forward_request(
                     self.command,
                     self.path,
-                    self.headers,
+                    dict(self.headers.items()),
                     body,
                     self.token_store,
                     upstream_base=self.upstream_base,
@@ -366,35 +398,66 @@ class _AuthProxyThreadingHTTPServer(ThreadingHTTPServer):
     """
 
     daemon_threads = True
+    # Set on the instance by ``serve()``; declared here so the assignments and
+    # the getattr(...) reads type-check. Bare annotations create no class
+    # attribute, so the getattr(..., None) fallbacks are unchanged at runtime.
+    auth_proxy_semaphore: threading.BoundedSemaphore | None
+    auth_proxy_accept_semaphore: threading.BoundedSemaphore | None
+
+    @staticmethod
+    def _release_accept_slot(
+        sem: threading.BoundedSemaphore | None,
+    ) -> None:
+        if sem is None:
+            return
+        try:
+            sem.release()
+        except ValueError:
+            # BoundedSemaphore release > capacity raises; swallow so a
+            # defensive release in an exceptional path cannot crash the
+            # accept loop.
+            pass
+
+    def _reject_request(self, request) -> None:
+        try:
+            request.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: 0\r\n\r\n",
+            )
+        except OSError:
+            pass
+        self.shutdown_request(request)
 
     def process_request(self, request, client_address):  # type: ignore[override]
         sem = getattr(self, "auth_proxy_accept_semaphore", None)
+        acquired = False
         if sem is not None and not sem.acquire(blocking=False):
-            try:
-                request.sendall(
-                    b"HTTP/1.1 503 Service Unavailable\r\n"
-                    b"Connection: close\r\n"
-                    b"Content-Length: 0\r\n\r\n",
-                )
-            except OSError:
-                pass
-            self.shutdown_request(request)
+            self._reject_request(request)
             return
-        super().process_request(request, client_address)
+        acquired = sem is not None
+        # BUG-505 (v22 harvest): if worker-thread spawn (or any pre-thread
+        # step) fails AFTER we took the accept slot, release it here — else
+        # the slot leaks and the accept loop wedges after `max_concurrent`
+        # such failures. process_request_thread's finally only runs once the
+        # thread actually started.
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            if acquired:
+                self._release_accept_slot(sem)
+                self.handle_error(request, client_address)
+                self._reject_request(request)
+                return
+            raise
 
     def process_request_thread(self, request, client_address):  # type: ignore[override]
         try:
             super().process_request_thread(request, client_address)
         finally:
-            sem = getattr(self, "auth_proxy_accept_semaphore", None)
-            if sem is not None:
-                try:
-                    sem.release()
-                except ValueError:
-                    # BoundedSemaphore release > capacity raises;
-                    # swallow so a refusal path that already
-                    # released doesn't crash the accept loop.
-                    pass
+            self._release_accept_slot(
+                getattr(self, "auth_proxy_accept_semaphore", None),
+            )
 
 
 def make_server(

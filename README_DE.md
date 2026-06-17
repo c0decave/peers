@@ -229,6 +229,33 @@ peers-ctl start <name> --no-codemap
 # Den substrate-only Pre-Tick-CODEMAP-Schritt überspringen (kein LLM-Aufruf, kostenlos).
 ```
 
+### Config-Datei-Optionen (`.peers/config.yaml`)
+
+Einige Fähigkeiten sind per `.peers/config.yaml` opt-in (die generierte Datei
+ist kommentiert; die wichtigsten):
+
+- `graphify_mcp: true` — gibt den Peers einen opt-in, supply-chain-gekäfigten
+  Code-Wissensgraphen, den sie statt `grep` über MCP abfragen (Aufrufer /
+  Blast-Radius / kürzester Pfad / „wer nutzt X / wie erreicht A B"), damit
+  Code-Navigation günstiger und präziser ist. Standardmäßig aus; **fail-open**
+  (jeder Fehler läuft ohne Graph weiter, byte-identisch zu aus). Braucht
+  `podman` + das `graphify-sandbox`-Image; `PEERS_CTL_NO_GRAPHIFY=1` erzwingt
+  aus. Im `--container`-Modus teilt es das Egress/Auth-Proxy-Netzwerk.
+- `egress_allow: ['^host\.example$', ...]` — zusätzliche Hosts, die die
+  `--container`-Peers erreichen dürfen (tinyproxy-Host-Regexes, an die
+  Egress-Allow-Liste angehängt, zusätzlich zu den LLM-API-Hosts), z.B. damit
+  ein Peer eine Spezifikation oder Quelle abrufen kann. Standardmäßig aus;
+  jedes Muster verankern.
+- `observability.tee_stream: true` — **opt-in, standardmäßig aus.** Spiegelt
+  den Live-stdout jedes Peers in eine tail-bare Datei
+  `.peers/log/peers/tick-<N>-<peer>.stream.jsonl`, damit **codex / opencode im
+  `peers-ctl tui` Live-Stream-Fenster live sichtbar** sind (claude ist über
+  sein Session-jsonl ohnehin live). Auch ohne Config-Edit per
+  `PEERS_TEE_STREAM=1` aktivierbar. Ein normaler Start mit dem Schalter aus ist
+  byte-identisch; **fail-closed** — ein Tee-Fehler kann die Loop oder die
+  Liveness/Idle-Erkennung nie stören, und die Stream-Dateien werden wie die
+  übrigen Per-Tick-Logs rotiert.
+
 ### Container-Modus (`--container`)
 
 Wenn z.B. codex auf dem Host nicht installiert ist, aber im
@@ -513,6 +540,55 @@ git log --oneline
 cat .peers/HALTED.md
 # falls beide / alle Peers degraded sind, steht hier die Diagnose
 ```
+
+### `peers-ctl tui` — Live-Cockpit auf dem Host
+
+```sh
+pip install -e .[tui]      # einmalig: das optionale TUI-Extra installieren
+peers-ctl tui              # das Host-seitige Live-Cockpit starten
+```
+
+Ein dunkles, zustandsgefärbtes Master-Detail-„Mission Control" für eine
+peers-Flotte: Projekte starten, den Agenten bei der Arbeit zusehen, lesen,
+was sie sagen und wie sie sich gegenseitig prüfen, und Gates / Steps / Tasks,
+gefundene Bugs sowie erzeugte Diffs sehen — plus ein vorausschauender Blick
+auf die agentic-os-Autonomie-Schicht.
+
+- **Optionales Extra.** Das TUI ist ein Textual-UI hinter dem optionalen
+  `[tui]`-Extra (`pip install -e .[tui]` zieht Textual + textual-window) —
+  der Kern bleibt `pyyaml`-only. Ohne das Extra gibt `peers-ctl tui` einen
+  freundlichen Installationshinweis aus und beendet sich, ohne Absturz.
+- **Nur lesend; handelt über das Substrat.** Das Cockpit *liest* nur die
+  dateibasierten Signale (`projects.yaml`, Per-Run-Zustand,
+  git-Trailer/Attestierung, `bugs.jsonl`, `runs.jsonl`, das Spine-Ledger).
+  Jede *Aktion* ruft die bestehenden `peers-ctl`-Verben auf, damit die Guards
+  und Hash-Ketten des Substrats maßgeblich bleiben — das TUI implementiert
+  keine Schreib-Logik neu, schreibt nie in `.peers/` und fügt keine neue
+  Vertrauensfläche hinzu. CONVERGED- / Gate- / Integritäts-Urteile werden
+  stets aus dem Substrat **neu abgeleitet** und trauen nie dem
+  agent-beschreibbaren gespeicherten `independence`-Flag.
+- **Fenster.** Eine Fleet-Seitenleiste plus verschiebbare / vergrößerbare /
+  ein-/ausblendbare + herauslösbare Fenster — Peers, Gates (mit
+  History-Scrubber: mit `[` / `]` durch vergangene Ticks blättern, mit
+  absoluter + relativer Zeit), Tasks/Steps, Live-Stream, Tick-Verlauf,
+  Budget, Bugs, Konsens/Attestierung (mit Fälschungs-Badge), Log, Diff — plus
+  vorausschauende Autonomie-Fenster (Autonomie-Ledger, Spine-Gates,
+  Propagations-DAG, Autonomie-Feed, Eskalations-Banner), die einen ehrlichen
+  Leerzustand zeigen, bis das Spine an einen operator-startbaren Modus
+  angebunden ist.
+- **Sicheres Handeln.** Ein doctor-geprüfter, off-thread laufender
+  Start-Assistent legt Projekte an und startet sie; Eingriffs-Dialoge
+  (stop / resume / ack-block / amend) zeigen das exakte Verb und verlangen
+  Tippen-zum-Bestätigen bei vertrags-berührenden Operationen.
+- **Tasten + Layout.** vim + Pfeile + Buchstaben (`?` für die In-App-Hilfe);
+  das Layout wird in `~/.config/peers-ctl/tui-layout.json` persistiert.
+
+Gespeist wird das Cockpit von drei additiven, fail-closed Substrat-Erweiterungen:
+der **Live-Tee** (`observability.tee_stream`, opt-in, siehe oben) für live
+codex/opencode-Streams; dem **Per-Tick-`gates`-Snapshot** in `runs.jsonl`
+(always-on, abwärtskompatibel) für den Gate-History-Scrubber; und der
+**`.peers/spine-runs/<mode_run>.json`-Registry** (nur-observierend), die die
+Autonomie-Fenster aufleuchten lässt, sobald das Spine operator-startbar wird.
 
 ---
 

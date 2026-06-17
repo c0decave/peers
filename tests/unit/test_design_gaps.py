@@ -266,12 +266,69 @@ def test_soft_review_fail_resets_consensus(tmp_path: Path):
 
     drv._record_soft_review_from_commit(
         state,
-        _Commit('{"pass": false}',
+        _Commit('## Review\n\n{"pass": false}',
                 {"Peer-Review-Of": "g", "Peer": "claude"}, "c" * 40),
         reviewer="claude",
     )
     assert state["soft_status"]["g"]["consensus_count"] == 0
     assert state["soft_status"]["g"]["last_pass"] is False
+
+
+def test_soft_review_rejects_non_boolean_pass_BUG_511(tmp_path: Path):
+    from peers.goals import Goal
+    repo = _init_repo(tmp_path / "r")
+    soft = Goal(id="g", type="soft", prompt="p", reviewer="other",
+                consensus_needed=2)
+    drv = OrchestratorDriver(
+        repo=repo, peer_dir=repo / ".peers",
+        goals=[soft],
+        peer_specs=_specs("claude", "codex"),
+    )
+    state = copy.deepcopy(DEFAULT_STATE)
+
+    ingested = drv._record_soft_review_from_commit(
+        state,
+        _Commit('## Review\n\n{"pass": "false", "notes": "malformed"}',
+                {"Peer-Review-Of": "g", "Peer": "claude"}, "d" * 40),
+        reviewer="claude",
+    )
+
+    assert ingested is False
+    assert "soft_status" not in state
+    assert state["warnings"] == [
+        "soft-review ignored: commit dddddddd for goal 'g' has "
+        "non-boolean `pass` value 'false'. Re-emit with pass:true or "
+        "pass:false."
+    ]
+
+
+def test_soft_review_requires_review_section_BUG_512(tmp_path: Path):
+    from peers.goals import Goal
+    repo = _init_repo(tmp_path / "r")
+    soft = Goal(id="g", type="soft", prompt="p", reviewer="other",
+                consensus_needed=2)
+    drv = OrchestratorDriver(
+        repo=repo, peer_dir=repo / ".peers",
+        goals=[soft],
+        peer_specs=_specs("claude", "codex"),
+    )
+    state = copy.deepcopy(DEFAULT_STATE)
+
+    ingested = drv._record_soft_review_from_commit(
+        state,
+        _Commit(
+            '{"pass": true, "notes": "missing required section"}',
+            {"Peer-Review-Of": "g", "Peer": "claude"}, "e" * 40,
+        ),
+        reviewer="claude",
+    )
+
+    assert ingested is False
+    assert "soft_status" not in state
+    assert state["warnings"] == [
+        "soft-review ignored: commit eeeeeeee for goal 'g' is missing "
+        "a `## Review` section before its JSON object."
+    ]
 
 
 # --- G7: goal-mutation lock --------------------------------------------
@@ -749,7 +806,7 @@ def test_reviewer_quorum_passes_after_threshold(tmp_path: Path):
     for i, reviewer in enumerate(["claude", "codex", "claude-2"]):
         drv._record_soft_review_from_commit(
             state,
-            _Commit('{"pass": true}',
+            _Commit('## Review\n\n{"pass": true}',
                     {"Peer-Review-Of": "q", "Peer": reviewer},
                     str(i) * 40),
             reviewer=reviewer,
@@ -779,7 +836,7 @@ def test_reviewer_both_requires_per_peer_consensus(tmp_path: Path):
     # Only claude has reviewed → not green yet.
     drv._record_soft_review_from_commit(
         state,
-        _Commit('{"pass": true}',
+        _Commit('## Review\n\n{"pass": true}',
                 {"Peer-Review-Of": "b", "Peer": "claude"}, "a" * 40),
         reviewer="claude",
     )
@@ -789,7 +846,7 @@ def test_reviewer_both_requires_per_peer_consensus(tmp_path: Path):
     # codex also reviews → now consensus is reached.
     drv._record_soft_review_from_commit(
         state,
-        _Commit('{"pass": true}',
+        _Commit('## Review\n\n{"pass": true}',
                 {"Peer-Review-Of": "b", "Peer": "codex"}, "b" * 40),
         reviewer="codex",
     )
@@ -924,7 +981,7 @@ def test_soft_review_record_repairs_malformed_goal_status_BUG_258(
 
     assert drv._record_soft_review_from_commit(
         state,
-        _Commit('{"pass": true, "notes": "ok"}',
+        _Commit('## Review\n\n{"pass": true, "notes": "ok"}',
                 {"Peer-Review-Of": "repair", "Peer": "claude"},
                 "c" * 40),
         reviewer="claude",
@@ -967,7 +1024,7 @@ def test_reviewer_alternating_picks_correct_peer(tmp_path: Path):
     # A review by claude advances cursor.
     drv._record_soft_review_from_commit(
         state,
-        _Commit('{"pass": true}',
+        _Commit('## Review\n\n{"pass": true}',
                 {"Peer-Review-Of": "alt", "Peer": "claude"}, "a" * 40),
         reviewer="claude",
     )

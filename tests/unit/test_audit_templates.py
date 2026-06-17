@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import yaml
 
+from peers.templates.modes.audit.checks import deps_justified
 from peers_ctl.cli import cmd_new, main
 
 
@@ -234,3 +236,86 @@ def test_audit_templates_unknown_lang_falls_back_to_python(
     assert "falling back to python" in capsys.readouterr().err
     checks = tmp_path / "test-x" / ".peers" / "checks"
     assert (checks / "coverage_3class.py").is_file()
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], check=True,
+                   capture_output=True, text=True)
+
+
+def _commit_all(repo: Path, message: str) -> None:
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", message)
+
+
+def _deps_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.test")
+    _git(repo, "config", "user.name", "Test User")
+    (repo / "pyproject.toml").write_text(
+        "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        encoding="utf-8",
+    )
+    _commit_all(repo, "baseline")
+    _git(repo, "tag", "peers-baseline")
+    return repo
+
+
+def test_deps_justified_ignores_pyproject_tool_config_BUG_510(tmp_path):
+    """BUG-510: tool config in pyproject is not a dependency addition."""
+    repo = _deps_repo(tmp_path)
+    (repo / "pyproject.toml").write_text(
+        "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+        "[tool.mypy]\nexclude = \"^src/templates/\"\n\n"
+        "[[tool.mypy.overrides]]\n"
+        "module = \"yaml\"\nignore_missing_imports = true\n",
+        encoding="utf-8",
+    )
+    _commit_all(repo, "add mypy config")
+
+    assert deps_justified.changed_dep_lines(str(repo)) == []
+    assert deps_justified.main(str(repo)) == 0
+
+
+def test_deps_justified_still_requires_real_pyproject_dependencies(tmp_path):
+    repo = _deps_repo(tmp_path)
+    (repo / "pyproject.toml").write_text(
+        "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n"
+        "dependencies = [\"requests>=2.32\", \"PyYAML>=6.0\"]\n",
+        encoding="utf-8",
+    )
+    _commit_all(repo, "add deps")
+
+    assert deps_justified.changed_dep_lines(str(repo)) == [
+        "requests>=2.32",
+        "PyYAML>=6.0",
+    ]
+    assert deps_justified.main(str(repo)) == 1
+
+    _git(
+        repo, "commit", "--allow-empty", "-m", "justify deps",
+        "-m", "Dependency-Justification: requests needed for HTTP tests\n"
+              "Dependency-Justification: pyyaml exercised by config tests",
+    )
+    assert deps_justified.main(str(repo)) == 0
+
+
+def test_deps_justified_handles_no_newline_diff_markers(tmp_path):
+    repo = _deps_repo(tmp_path)
+    (repo / "pyproject.toml").write_text(
+        "[tool.demo]\nvalue = \"old\"",
+        encoding="utf-8",
+    )
+    _commit_all(repo, "replace baseline without trailing newline")
+    _git(repo, "tag", "-f", "peers-baseline")
+    (repo / "pyproject.toml").write_text(
+        "[project]\nname = \"demo\"\n"
+        "dependencies = [\"requests>=2.32\"]\n",
+        encoding="utf-8",
+    )
+    _commit_all(repo, "add real dependency")
+
+    assert deps_justified.changed_dep_lines(str(repo)) == ["requests>=2.32"]
+    assert deps_justified.main(str(repo)) == 1

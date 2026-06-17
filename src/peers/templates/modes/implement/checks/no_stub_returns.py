@@ -147,15 +147,44 @@ def _scan_python_file(path: Path, relpath: str) -> list[str]:
     return _scan_tree(tree, relpath)
 
 
+_NON_IMPL_DIRS = frozenset({
+    "tests", "test", "testing", "docs", "doc", "examples", "example",
+    "tools", "viewer", "schema", "vendor", "third_party", "node_modules",
+    "build", "dist",
+})
+
+
+def _impl_roots(project_root: Path) -> list[Path]:
+    """Implementation roots to scan. Conventional ``src/`` layout when present;
+    otherwise every top-level *package* directory (one with ``__init__.py``)
+    that is not a tests/tooling/vendor dir. This covers flat package layouts
+    (e.g. ``scene3dx/`` / ``shell3d/``) that otherwise made the soft gate pass
+    vacuously ("no src/ to scan") with zero coverage of the implementation.
+
+    Limitation (advisory, soft gate): a flat *single-module* project (a top-level
+    ``.py`` with no package dir) or a PEP-420 *namespace* package (no
+    ``__init__.py``) is still not discovered and remains unscanned."""
+    src = project_root / "src"
+    if src.is_dir():
+        return [src]
+    roots: list[Path] = []
+    for child in sorted(project_root.iterdir()):
+        if (child.is_dir() and not child.name.startswith(".")
+                and child.name not in _NON_IMPL_DIRS
+                and (child / "__init__.py").is_file()):
+            roots.append(child)
+    return roots
+
+
 def main(project_dir: str = ".") -> int:
     """Soft scan: warn on functions whose only body is a stub return."""
     project_root = Path(project_dir).resolve()
-    src_root = project_root / "src"
-    if not src_root.is_dir():
-        print("no-stub-returns: clean (no src/ to scan)")
+    roots = _impl_roots(project_root)
+    if not roots:
+        print("no-stub-returns: clean (no implementation package to scan)")
         return 0
     findings: list[str] = []
-    files = sorted(p for p in src_root.rglob("*.py") if p.is_file())
+    files = sorted(p for r in roots for p in r.rglob("*.py") if p.is_file())
     for path in files:
         rel = path.relative_to(project_root).as_posix()
         findings.extend(_scan_python_file(path, rel))

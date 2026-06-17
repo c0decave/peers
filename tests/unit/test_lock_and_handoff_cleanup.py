@@ -35,6 +35,31 @@ def test_sweep_legacy_handoff_msg_moves_dotfile(tmp_path: Path):
     assert (tmp_path / ".peers" / "handoff-msg.txt").read_text() == "legacy"
 
 
+def test_sweep_legacy_handoff_msg_refuses_hardlinked_dotfile(tmp_path: Path):
+    """Sad path: legacy migration must not copy hard-linked scratch files."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("sensitive")
+    legacy = tmp_path / ".handoff-msg.txt"
+    os.link(victim, legacy)
+
+    sweep_legacy_handoff_msg(tmp_path)
+
+    assert victim.read_text() == "sensitive"
+    assert legacy.exists()
+    assert not (tmp_path / ".peers" / "handoff-msg.txt").exists()
+
+
+def test_sweep_legacy_handoff_msg_refuses_oversized_dotfile(tmp_path: Path):
+    """Edge path: oversized legacy scratch is left alone rather than copied."""
+    legacy = tmp_path / ".handoff-msg.txt"
+    legacy.write_text("x" * (64 * 1024 + 1))
+
+    sweep_legacy_handoff_msg(tmp_path)
+
+    assert legacy.exists()
+    assert not (tmp_path / ".peers" / "handoff-msg.txt").exists()
+
+
 def test_write_handoff_msg_overwrites_existing(tmp_path: Path):
     """Happy path: rewriting replaces content (atomic temp+rename)."""
     write_handoff_msg(tmp_path, "first")

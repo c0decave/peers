@@ -19,7 +19,7 @@ def main(project_dir: str = ".", codemap: str | None = None) -> int:
     except CodeMapError as e:
         print(f"grounded FAIL: {e}")
         return 1
-    violations = check_grounded(project_dir, cm)
+    violations = check_grounded(Path(project_dir), cm)
     if violations:
         print(f"grounded FAIL: {len(violations)} ungrounded entr"
               f"{'y' if len(violations) == 1 else 'ies'}:")

@@ -1,4 +1,5 @@
 import copy
+import fcntl
 import json
 import os
 import subprocess
@@ -543,6 +544,44 @@ def test_run_refuses_symlinked_run_lock_before_truncating(tmp_path: Path):
     assert bait.read_text() == "keep me"
 
 
+def test_run_lock_held_closes_peer_dir_identity_fd(tmp_path: Path):
+    target = _make_repo(tmp_path / "t")
+    peer_dir = target / ".peers"
+    peer_dir.mkdir()
+    lock_fp = (peer_dir / "run.lock").open("a")
+    try:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        drv = OrchestratorDriver(
+            repo=target, peer_dir=peer_dir, goals=[],
+            peer_specs=_specs("claude", "codex"),
+            recon_enabled=False, codemap_enabled=False,
+        )
+
+        result = drv.run(max_ticks=0)
+
+        assert result["reason"] == "lock-held"
+        assert drv._peer_dir_identity_fd is None
+    finally:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+        lock_fp.close()
+
+
+def test_run_max_ticks_closes_peer_dir_identity_fd(tmp_path: Path):
+    target = _make_repo(tmp_path / "t")
+    peer_dir = target / ".peers"
+    peer_dir.mkdir()
+    drv = OrchestratorDriver(
+        repo=target, peer_dir=peer_dir, goals=[],
+        peer_specs=_specs("claude", "codex"),
+        recon_enabled=False, codemap_enabled=False,
+    )
+
+    result = drv.run(max_ticks=0)
+
+    assert result["reason"] == "max_ticks"
+    assert drv._peer_dir_identity_fd is None
+
+
 def test_append_run_log_refuses_late_symlink_swap(tmp_path: Path):
     target = _make_repo(tmp_path / "t")
     peer_dir = target / ".peers"
@@ -710,8 +749,9 @@ def test_halted_md_written_when_all_degraded(tmp_path: Path):
     s = copy.deepcopy(DEFAULT_STATE)
     s["peers"]["claude"]["state"] = "degraded"
     s["peers"]["codex"]["state"] = "degraded"
-    drv._maybe_halt(s)
+    halt = drv._maybe_halt(s)
     halted = peer_dir / "HALTED.md"
+    assert halt == {"reason": "peer-unavailable:all-peers-degraded", "state": s}
     assert halted.exists()
     assert "all peers degraded" in halted.read_text()
 
@@ -733,11 +773,12 @@ def test_halted_md_n3_requires_all_three_degraded(tmp_path: Path):
                            "recent_fails": 0, "recent_runs": []}
     s["peers"]["claude-2"] = {"state": "healthy", "consecutive_fails": 0,
                               "recent_fails": 0, "recent_runs": []}
-    drv._maybe_halt(s)
+    assert drv._maybe_halt(s) is None
     assert not (peer_dir / "HALTED.md").exists()
     # Mark the third as degraded → now we halt.
     s["peers"]["claude-2"]["state"] = "degraded"
-    drv._maybe_halt(s)
+    halt = drv._maybe_halt(s)
+    assert halt == {"reason": "peer-unavailable:all-peers-degraded", "state": s}
     assert (peer_dir / "HALTED.md").exists()
 
 

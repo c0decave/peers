@@ -1,6 +1,7 @@
 """Test no-shortcut-markers check (Task 5.1)."""
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from peers.templates.modes.implement.checks import no_shortcut_markers
@@ -15,6 +16,32 @@ def _setup(tmp_path: Path, src_files: dict[str, str]) -> Path:
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(body)
     return tmp_path
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          capture_output=True, text=True, check=True).stdout
+
+
+def _git_setup(tmp_path: Path, src_files: dict[str, str]) -> Path:
+    """_setup + git init + initial commit (so FU-2 review commits resolve)."""
+    proj = _setup(tmp_path, src_files)
+    _git(proj, "init", "-q")
+    _git(proj, "config", "commit.gpgsign", "false")
+    _git(proj, "config", "user.email", "t@t")
+    _git(proj, "config", "user.name", "t")
+    _git(proj, "add", "-A")
+    _git(proj, "commit", "-q", "-m", "init")
+    return proj
+
+
+def _attested_review(repo: Path, artifact: str, peer: str) -> str:
+    """The OTHER peer signs off via a substrate-attested peers-review commit."""
+    _git(repo, "commit", "-q", "--allow-empty",
+         "-m", f"peers-review: {artifact}\n\nLGTM")
+    sha = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "notes", "--ref=peers-attest", "add", "-f", "-m", peer, sha)
+    return sha
 
 
 def test_clean_src_passes(tmp_path, capsys):
@@ -83,14 +110,15 @@ class Foo(Protocol):
     assert rc == 0
 
 
-def test_justified_marker_passes_with_signed_entry(tmp_path, capsys):
-    from peers_ctl.justifications import append_justification
-    _setup(tmp_path, {"a.py": "def f():\n    pass  # TODO  # JUSTIFIED: waits on issue 42\n"})
-    plan_dir = tmp_path / ".peers"
-    plan_dir.mkdir()
-    # Line 2 has TODO -- justify it
-    append_justification(plan_dir, "src/a.py", 2, "waits on issue 42", "codex@p.local")
-    rc = no_shortcut_markers.main(str(tmp_path))
+def test_justified_marker_passes_with_review_commit(tmp_path, capsys):
+    # FU-2: the JUSTIFIED line is forgiven once an independent peer (codex)
+    # signs off on src/a.py via a substrate-attested peers-review commit.
+    proj = _git_setup(
+        tmp_path,
+        {"a.py": "def f():\n    pass  # TODO  # JUSTIFIED: waits on issue 42\n"},
+    )
+    _attested_review(proj, "src/a.py", "codex")
+    rc = no_shortcut_markers.main(str(proj))
     assert rc == 0
 
 
@@ -127,29 +155,81 @@ def test_skips_peer_template_check_implementations(tmp_path, capsys):
     assert rc == 0
 
 
-def test_forged_justification_with_broken_chain_fails_closed_BUG_173(
-    tmp_path, capsys,
-):
-    """A forged log entry whose hash is not chain-valid must fail the gate.
-
-    The annotated line is *syntactically* covered by a log entry, but
-    the chain prefix does not match sha256(prev + payload)[:16]. Without
-    chain verification at gate entry, ``is_justified`` returns True and
-    the violation is silently waived. The fix runs ``verify_log_chain``
-    first and fails closed on tamper.
+def test_forged_log_entry_does_not_bless_FU_2(tmp_path, capsys):
+    """FU-2 (supersedes BUG-173): a justifications.log entry no longer grants
+    the escape at all — the forgeable, agent-authored log is not the mechanism.
+    Only a substrate-attested peers-review commit forgives a JUSTIFIED marker,
+    so a hand-written (even chain-valid-looking) entry waives nothing.
     """
-    _setup(
+    proj = _git_setup(
         tmp_path,
         {"a.py": "def f():\n    pass  # TODO  # JUSTIFIED: forged\n"},
     )
-    plan_dir = tmp_path / ".peers"
+    plan_dir = proj / ".peers"
     plan_dir.mkdir()
-    # Hand-write a log entry with a deliberately wrong chain prefix.
-    # `is_justified` would happily accept this; the chain check must not.
     (plan_dir / "justifications.log").write_text(
         "0000000000000000 src/a.py:2 attacker forged reason\n",
     )
-    rc = no_shortcut_markers.main(str(tmp_path))
+    rc = no_shortcut_markers.main(str(proj))
     assert rc == 1
-    out = capsys.readouterr().out
-    assert "chain" in out.lower() or "tamper" in out.lower()
+    assert "src/a.py" in capsys.readouterr().out
+
+
+def test_multi_author_laundering_does_not_bless_FU_2(tmp_path, capsys):
+    # CRITICAL (adversarial review): A (claude) authors+justifies the marker on
+    # line 2; B (codex) makes a trivial edit to ANOTHER line (becoming the
+    # 'last editor'); A self-reviews. Excluding only the last editor (codex)
+    # would let A self-bless — the guard must exclude the MARKER LINE's author.
+    proj = _git_setup(
+        tmp_path,
+        {"a.py": "def f():\n    pass  # TODO  # JUSTIFIED: deferred\n"},
+    )
+    init = _git(proj, "rev-parse", "HEAD").strip()
+    _git(proj, "notes", "--ref=peers-attest", "add", "-f", "-m", "claude", init)
+    # codex appends a blank line (line 3) — does NOT touch the marker on line 2
+    (proj / "src" / "a.py").write_text(
+        "def f():\n    pass  # TODO  # JUSTIFIED: deferred\n\n")
+    _git(proj, "add", "-A")
+    _git(proj, "commit", "-q", "-m", "codex trivial")
+    edit = _git(proj, "rev-parse", "HEAD").strip()
+    _git(proj, "notes", "--ref=peers-attest", "add", "-f", "-m", "codex", edit)
+    _attested_review(proj, "src/a.py", "claude")  # A (marker author) self-reviews
+    rc = no_shortcut_markers.main(str(proj))
+    assert rc == 1
+    assert "src/a.py" in capsys.readouterr().out
+
+
+def test_coeditor_who_did_not_author_marker_can_review_FU_2(tmp_path, capsys):
+    # complement (not over-strict): codex edited a NON-marker line, so codex is
+    # NOT the marker's author and CAN review claude's justified marker.
+    proj = _git_setup(
+        tmp_path,
+        {"a.py": "def f():\n    pass  # TODO  # JUSTIFIED: deferred\n"},
+    )
+    init = _git(proj, "rev-parse", "HEAD").strip()
+    _git(proj, "notes", "--ref=peers-attest", "add", "-f", "-m", "claude", init)
+    (proj / "src" / "a.py").write_text(
+        "def f():\n    pass  # TODO  # JUSTIFIED: deferred\n\n")
+    _git(proj, "add", "-A")
+    _git(proj, "commit", "-q", "-m", "codex trivial")
+    edit = _git(proj, "rev-parse", "HEAD").strip()
+    _git(proj, "notes", "--ref=peers-attest", "add", "-f", "-m", "codex", edit)
+    _attested_review(proj, "src/a.py", "codex")  # codex (not marker author) reviews
+    rc = no_shortcut_markers.main(str(proj))
+    assert rc == 0
+
+
+def test_self_review_does_not_bless_FU_2(tmp_path, capsys):
+    """FU-2 sad: the file's own author cannot self-bless its shortcut — a
+    peers-review commit attested to the author (codex) is excluded."""
+    proj = _git_setup(
+        tmp_path,
+        {"a.py": "def f():\n    pass  # TODO  # JUSTIFIED: self\n"},
+    )
+    # attest the initial commit (the author of src/a.py) to codex
+    init = _git(proj, "rev-parse", "HEAD").strip()
+    _git(proj, "notes", "--ref=peers-attest", "add", "-f", "-m", "codex", init)
+    _attested_review(proj, "src/a.py", "codex")  # codex reviewing its own file
+    rc = no_shortcut_markers.main(str(proj))
+    assert rc == 1
+    assert "src/a.py" in capsys.readouterr().out

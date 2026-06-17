@@ -97,16 +97,23 @@ def test_no_step_change_keeps_counter() -> None:
     assert state["last_plan_steps_done"] == 2
 
 
-def test_only_resets_configured_gates_not_regression() -> None:
-    """Completing a feature step must NOT forgive a regression streak."""
+def test_only_resets_configured_gates_not_arbitrary_others() -> None:
+    """Step progress forgives the configured reset gates only.
+
+    Both watched-halt gates (tests-pass + no-prior-regression) are in the
+    implement reset set (BUG-STUCK-01), but a gate that is NOT in the reset
+    set — e.g. acceptance-pass, red by design and not watched for a
+    convergence-wall halt — must keep its streak.
+    """
     from peers.driver_tick_hooks import reset_stuck_on_progress
     state = _state(
-        {"tests-pass": 4, "no-prior-regression": 4},
+        {"tests-pass": 4, "no-prior-regression": 4, "acceptance-pass": 4},
         last_plan_steps_done=1,
     )
     reset_stuck_on_progress(state, plan_steps_done=2, mode_name="implement")
     assert "tests-pass" not in state["stuck_counter"]
-    assert state["stuck_counter"]["no-prior-regression"] == 4
+    assert "no-prior-regression" not in state["stuck_counter"]
+    assert state["stuck_counter"]["acceptance-pass"] == 4
 
 
 def test_non_implement_mode_is_noop() -> None:
@@ -164,3 +171,82 @@ def test_progress_averts_halt_end_to_end() -> None:
     # but a PLAN step was just completed this tick:
     reset_stuck_on_progress(state, plan_steps_done=3, mode_name="implement")
     assert compute_stuck_gate_halt_reason(state) is None
+
+
+# ---- BUG-STUCK-01: no-prior-regression progress reset ---------------------
+# The convergence-wall halt watches BOTH tests-pass AND no-prior-regression
+# (_DEFAULT_STUCK_HALT_GATES), but the implement progress-reset originally
+# forgave only tests-pass — so a progressing band was false-halted
+# `stuck:no-prior-regression` on band-external env drift (a re-snapshot-
+# fragile baseline: -n worker count, mid-run toolchain installs, flaky
+# async-under-xdist). The reset set must match the watched-halt set.
+
+def test_step_increase_clears_no_prior_regression_in_implement() -> None:
+    """Happy path: a progressing implement band forgives the env-fragile
+    no-prior-regression streak just as it forgives tests-pass."""
+    from peers.driver_tick_hooks import reset_stuck_on_progress
+    state = _state({"no-prior-regression": 4}, last_plan_steps_done=1)
+    reset_stuck_on_progress(state, plan_steps_done=2, mode_name="implement")
+    assert "no-prior-regression" not in state["stuck_counter"]
+    assert state["last_plan_steps_done"] == 2
+
+
+def test_step_increase_clears_both_watched_gates_in_implement() -> None:
+    """Happy path: both watched-halt gates are forgiven together on step
+    progress — the reset set is symmetric with the halt-watch set."""
+    from peers.driver_tick_hooks import reset_stuck_on_progress
+    state = _state(
+        {"tests-pass": 4, "no-prior-regression": 4}, last_plan_steps_done=1,
+    )
+    reset_stuck_on_progress(state, plan_steps_done=2, mode_name="implement")
+    assert "tests-pass" not in state["stuck_counter"]
+    assert "no-prior-regression" not in state["stuck_counter"]
+
+
+def test_no_prior_regression_not_forgiven_in_audit_mode() -> None:
+    """Sad path: outside implement-mode a red no-prior-regression IS a real
+    stuck signal — progress must NOT forgive it, and the implement-only
+    baseline key must not leak into the state."""
+    from peers.driver_tick_hooks import reset_stuck_on_progress
+    state = _state({"no-prior-regression": 4})
+    reset_stuck_on_progress(state, plan_steps_done=2, mode_name="audit")
+    assert state["stuck_counter"]["no-prior-regression"] == 4
+    assert "last_plan_steps_done" not in state
+
+
+def test_no_step_change_keeps_no_prior_regression() -> None:
+    """Sad path: no PLAN progress this tick → the no-prior-regression streak
+    stands, so a genuinely stalled band still halts."""
+    from peers.driver_tick_hooks import reset_stuck_on_progress
+    state = _state({"no-prior-regression": 4}, last_plan_steps_done=2)
+    reset_stuck_on_progress(state, plan_steps_done=2, mode_name="implement")
+    assert state["stuck_counter"]["no-prior-regression"] == 4
+
+
+def test_no_prior_regression_progress_averts_halt_end_to_end() -> None:
+    """Edge: the R4 scenario — a band one tick from
+    stuck:no-prior-regression that completes a PLAN step survives instead of
+    being false-halted on band-external env drift."""
+    from peers.driver_tick_hooks import (
+        compute_stuck_gate_halt_reason,
+        reset_stuck_on_progress,
+    )
+    state = _state({"no-prior-regression": 5}, last_plan_steps_done=2)
+    assert compute_stuck_gate_halt_reason(state) == "stuck:no-prior-regression"
+    reset_stuck_on_progress(state, plan_steps_done=3, mode_name="implement")
+    assert compute_stuck_gate_halt_reason(state) is None
+
+
+def test_config_override_can_exclude_no_prior_regression() -> None:
+    """Edge: an operator can still opt out — a reset-gate list of only
+    tests-pass keeps no-prior-regression watched-but-unforgiven even in
+    implement-mode (the new default is overridable)."""
+    from peers.driver_tick_hooks import reset_stuck_on_progress
+    state = _state(
+        {"tests-pass": 4, "no-prior-regression": 4},
+        last_plan_steps_done=1,
+        config={"goals": {"stuck_progress_reset_gates": ["tests-pass"]}},
+    )
+    reset_stuck_on_progress(state, plan_steps_done=2, mode_name="implement")
+    assert "tests-pass" not in state["stuck_counter"]
+    assert state["stuck_counter"]["no-prior-regression"] == 4

@@ -178,3 +178,162 @@ def test_ensure_skip_baseline_grandfathers_inherited_skip(
         "import pytest\n@pytest.mark.skip\ndef test_new():\n    pass\n"
     )
     assert cmd_run_check(repo, "no_skipped_tests", ()) == 1
+
+
+# --- FU-1: substrate-held baseline digest anchor (forgery resistance) ------
+#
+# The baseline files (.peers/passing-baseline.txt, .peers/skip-baseline.txt)
+# are agent-writable. A peer that forges them defeats the no-prior-regression
+# and no-skipped-tests HARD gates (P0 review, 2026-06-12). The run-start
+# baseline is a one-shot snapshot taken BEFORE any peer touches code and is
+# NEVER legitimately rewritten mid-run — so the orchestrator captures its
+# SHA-256 digest in process memory at run start (snapshot_baseline_digests)
+# and, at the convergence decision, re-derives the live digest and refuses to
+# converge if it diverged (verify_baseline_digests). The anchor lives in the
+# orchestrator's memory, which a separate short-lived agent subprocess cannot
+# reach, so it cannot be forged the way the on-disk file can.
+
+
+def _peer_dir_with_baselines(tmp_path: Path) -> Path:
+    peer_dir = tmp_path / ".peers"
+    peer_dir.mkdir()
+    (peer_dir / "passing-baseline.txt").write_text(
+        "tests.test_calc::test_addition\ntests.test_calc::test_subtraction\n"
+    )
+    (peer_dir / "skip-baseline.txt").write_text(
+        "tests/test_s.py|pytest.mark.skip|test_old|@pytest.mark.skip|abcdef0123456789\n"
+    )
+    return peer_dir
+
+
+def test_snapshot_baseline_digests_captures_present_baselines(
+    tmp_path: Path,
+) -> None:
+    # happy: both baseline files present → both gate-ids anchored with a
+    # 64-hex sha256 digest, keyed by the gate id the file backs.
+    from peers.regression_baseline import snapshot_baseline_digests
+    peer_dir = _peer_dir_with_baselines(tmp_path)
+    anchor = snapshot_baseline_digests(peer_dir)
+    assert set(anchor) == {"no-prior-regression", "no-skipped-tests"}
+    for digest in anchor.values():
+        assert len(digest) == 64
+        int(digest, 16)  # is hex
+
+
+def test_snapshot_baseline_digests_empty_when_no_baselines(
+    tmp_path: Path,
+) -> None:
+    # edge: no baseline files (gate not configured / never snapshotted) →
+    # empty anchor; nothing to verify, the gate's own missing-baseline
+    # fail-closed path handles the never-snapshotted case.
+    from peers.regression_baseline import snapshot_baseline_digests
+    peer_dir = tmp_path / ".peers"
+    peer_dir.mkdir()
+    assert snapshot_baseline_digests(peer_dir) == {}
+
+
+def test_verify_baseline_digests_clean_when_unchanged(tmp_path: Path) -> None:
+    # happy: snapshot then verify with the file untouched → no forgery.
+    from peers.regression_baseline import (
+        snapshot_baseline_digests,
+        verify_baseline_digests,
+    )
+    peer_dir = _peer_dir_with_baselines(tmp_path)
+    anchor = snapshot_baseline_digests(peer_dir)
+    assert verify_baseline_digests(peer_dir, anchor) == []
+
+
+def test_verify_baseline_digests_detects_forged_passing_baseline(
+    tmp_path: Path,
+) -> None:
+    # sad/security: the PoC forge — drop a (now-red) test from the passing
+    # baseline so the no-prior-regression gate would not flag the regression.
+    # The digest anchor MUST catch it.
+    from peers.regression_baseline import (
+        snapshot_baseline_digests,
+        verify_baseline_digests,
+    )
+    peer_dir = _peer_dir_with_baselines(tmp_path)
+    anchor = snapshot_baseline_digests(peer_dir)
+    (peer_dir / "passing-baseline.txt").write_text(
+        "tests.test_calc::test_addition\n"  # dropped test_subtraction
+    )
+    assert verify_baseline_digests(peer_dir, anchor) == ["no-prior-regression"]
+
+
+def test_verify_baseline_digests_detects_forged_skip_baseline(
+    tmp_path: Path,
+) -> None:
+    # sad/security: the PoC forge — grandfather a NEW skip by adding its
+    # signature to the skip baseline. The digest anchor MUST catch it.
+    from peers.regression_baseline import (
+        snapshot_baseline_digests,
+        verify_baseline_digests,
+    )
+    peer_dir = _peer_dir_with_baselines(tmp_path)
+    anchor = snapshot_baseline_digests(peer_dir)
+    with (peer_dir / "skip-baseline.txt").open("a") as f:
+        f.write(
+            "tests/test_new.py|pytest.mark.skip|test_new|@pytest.mark.skip|0000000000000000\n"
+        )
+    assert verify_baseline_digests(peer_dir, anchor) == ["no-skipped-tests"]
+
+
+def test_verify_baseline_digests_detects_deleted_baseline(
+    tmp_path: Path,
+) -> None:
+    # sad/edge: deleting an anchored baseline after snapshot is also tamper
+    # (a peer cannot dodge verification by removing the file) → flagged.
+    from peers.regression_baseline import (
+        snapshot_baseline_digests,
+        verify_baseline_digests,
+    )
+    peer_dir = _peer_dir_with_baselines(tmp_path)
+    anchor = snapshot_baseline_digests(peer_dir)
+    (peer_dir / "passing-baseline.txt").unlink()
+    assert verify_baseline_digests(peer_dir, anchor) == ["no-prior-regression"]
+
+
+def test_verify_baseline_digests_detects_both_forged(tmp_path: Path) -> None:
+    # sad: forging BOTH baselines flags BOTH gates (sorted, deterministic).
+    from peers.regression_baseline import (
+        snapshot_baseline_digests,
+        verify_baseline_digests,
+    )
+    peer_dir = _peer_dir_with_baselines(tmp_path)
+    anchor = snapshot_baseline_digests(peer_dir)
+    (peer_dir / "passing-baseline.txt").write_text("only::one\n")
+    (peer_dir / "skip-baseline.txt").write_text("")
+    assert verify_baseline_digests(peer_dir, anchor) == [
+        "no-prior-regression",
+        "no-skipped-tests",
+    ]
+
+
+def test_verify_baseline_digests_empty_anchor_is_clean(tmp_path: Path) -> None:
+    # edge: an empty anchor (no baseline gate configured at run-start) means
+    # there is nothing to verify — even a baseline appearing on disk later is
+    # not checked here (it was not part of the run-start snapshot).
+    from peers.regression_baseline import verify_baseline_digests
+    peer_dir = _peer_dir_with_baselines(tmp_path)
+    assert verify_baseline_digests(peer_dir, {}) == []
+
+
+def test_verify_baseline_digests_refuses_symlinked_baseline(
+    tmp_path: Path,
+) -> None:
+    # sad/security: a peer cannot dodge the digest by replacing the baseline
+    # with a symlink to an attacker-controlled file — the no-symlink read
+    # raises, which the verifier treats as a tamper (digest != anchor).
+    from peers.regression_baseline import (
+        snapshot_baseline_digests,
+        verify_baseline_digests,
+    )
+    peer_dir = _peer_dir_with_baselines(tmp_path)
+    anchor = snapshot_baseline_digests(peer_dir)
+    target = tmp_path / "evil.txt"
+    target.write_text("tests.test_calc::test_addition\n")
+    baseline = peer_dir / "passing-baseline.txt"
+    baseline.unlink()
+    baseline.symlink_to(target)
+    assert "no-prior-regression" in verify_baseline_digests(peer_dir, anchor)

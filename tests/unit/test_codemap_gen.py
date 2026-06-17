@@ -1,5 +1,6 @@
 import stat as _stat
 from pathlib import Path
+import pytest
 from peers.codemap import iter_public_entries, enumerate_public_symbols
 from peers.codemap_gen import (
     build_structural_codemap, serialize_codemap, render_digest, MAX_DIGEST_BYTES,
@@ -43,6 +44,23 @@ def test_iter_public_entries_matches_enumerate_ids(tmp_path):
 
 def test_iter_public_entries_no_src_is_empty(tmp_path):
     assert iter_public_entries(tmp_path) == []
+
+
+def test_iter_public_entries_skips_symlinked_python_files(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src" / "pkg").mkdir(parents=True)
+    outside = tmp_path / "outside.py"
+    outside.write_text("def leaked(secret):\n    return secret\n", encoding="utf-8")
+    link = repo / "src" / "pkg" / "leak.py"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable for this platform: {exc}")
+
+    entries = iter_public_entries(repo)
+    ids = {e.id for e in entries}
+    assert "pkg.leak" not in ids
+    assert "pkg.leak.leaked" not in ids
 
 
 def test_build_and_serialize_round_trips_clean(tmp_path):

@@ -68,6 +68,16 @@ def test_read_project_budget_cap_malformed_state_is_zero(tmp_path):
     assert _read_project_budget_cap(target) == 0
 
 
+def test_read_project_budget_cap_deep_malformed_state_is_zero_BUG_516(
+    tmp_path,
+):
+    from peers_ctl.cli import _read_project_budget_cap
+
+    _cfg, target = _project_with_state(tmp_path, "[" * 10000)
+
+    assert _read_project_budget_cap(target) == 0
+
+
 def test_cmd_start_additive_ignores_symlinked_state_BUG_221(
     tmp_path, monkeypatch,
 ):
@@ -92,8 +102,10 @@ def test_cmd_start_additive_ignores_symlinked_state_BUG_221(
     def fake_start(
         store, project, max_ticks=None, max_usd=None,
         max_runtime_s=None, reset_budget=False, force=False,
+        trust_egress_allow=False, skip_claude_smoke=False,
         extra_args=(), container=False,
     ):
+        assert trust_egress_allow is False
         seen.append(max_runtime_s)
         store.update(project.name, state="running", pid=12345)
         return 12345

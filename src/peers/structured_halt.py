@@ -35,7 +35,9 @@ _HALT_VOCAB = re.compile(
     r"|hit your usage limit"
     r"|usage[ _-]?limit[ _-]?(?:reached|exceeded|exhausted)"
     r"|authentication[ _-]?(?:failed|error)"
-    r"|(?:invalid|missing|expired)[ _-]?api[ _-]?key)",
+    r"|(?:invalid|missing|expired)[ _-]?api[ _-]?key"
+    r"|not[ _-]?(?:logged|signed)[ _-]?in"
+    r"|(?:please\s+)?run\s+/login)",
     re.IGNORECASE,
 )
 

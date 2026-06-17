@@ -5,9 +5,11 @@ import os
 import stat
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 from peers.driver_helpers import _hash_goals_yaml
+from peers.driver_host import _DriverHost
 from peers.safe_io import (
     atomic_write_text_in_dir_no_symlink,
     read_bytes_no_symlink,
@@ -20,7 +22,7 @@ def _driver_module() -> Any:
     return driver_orchestrator
 
 
-class DriverLifecycleMixin:
+class DriverLifecycleMixin(_DriverHost):
     def _capture_peer_dir_identity(self) -> tuple[int, int]:
         try:
             st = self.peer_dir.lstat()
@@ -40,12 +42,62 @@ class DriverLifecycleMixin:
             )
         return (st.st_dev, st.st_ino)
 
+    def _open_peer_dir_identity_fd(self, expected: tuple[int, int]) -> int:
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(str(self.peer_dir), flags)
+        except OSError as e:
+            raise RuntimeError(
+                f"{self.peer_dir} is unavailable; refusing to operate: {e}"
+            ) from e
+        st = os.fstat(fd)
+        current = (st.st_dev, st.st_ino)
+        if current != expected:
+            os.close(fd)
+            raise RuntimeError(
+                f"{self.peer_dir} changed while the loop was running; "
+                "refusing control-plane IO. Restore the original .peers "
+                "directory and restart."
+            )
+        return fd
+
+    def _close_peer_dir_identity_fd(self) -> None:
+        fd = getattr(self, "_peer_dir_identity_fd", None)
+        if fd is None:
+            return
+        self._peer_dir_identity_fd = None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
     def _verify_peer_dir_identity(self) -> None:
         current = self._capture_peer_dir_identity()
         if self._peer_dir_identity is None:
             self._peer_dir_identity = current
+            if getattr(self, "_peer_dir_identity_fd", None) is None:
+                self._peer_dir_identity_fd = self._open_peer_dir_identity_fd(
+                    current
+                )
             return
-        if current != self._peer_dir_identity:
+        expected = self._peer_dir_identity
+        fd = getattr(self, "_peer_dir_identity_fd", None)
+        if fd is None:
+            self._peer_dir_identity_fd = self._open_peer_dir_identity_fd(
+                expected
+            )
+            return
+        try:
+            st = os.fstat(fd)
+        except OSError as e:
+            raise RuntimeError(
+                f"{self.peer_dir} identity handle is unavailable; "
+                "refusing control-plane IO."
+            ) from e
+        expected = (st.st_dev, st.st_ino)
+        if current != expected:
             raise RuntimeError(
                 f"{self.peer_dir} changed while the loop was running; "
                 "refusing control-plane IO. Restore the original .peers "
@@ -146,6 +198,18 @@ class DriverLifecycleMixin:
                 file=sys.stderr,
             )
 
+    # CAP-14 FINDING-1 DE-SCOPE: the STEP-5 convergence-time regenerator hooks
+    # (`_run_regenerate_architecture_actual_step` and
+    # `_maybe_regenerate_architecture_actual_on_convergence`) were REMOVED. They
+    # wrote ARCHITECTURE.actual.md from the live tree with STRUCTURAL module-H2
+    # headings, but a production ARCHITECTURE.intended.md is PEER-AUTHORED PROSE
+    # with SEMANTIC H2s (disjoint heading sets) — so the soft architecture-
+    # coherent gate WARNed permanently on every converged implement run
+    # regardless of real drift. The gate is now back to its prior honest
+    # behaviour (actual_missing -> soft no-op). A REAL arch-coherent check is a
+    # tracked follow-up requiring a design decision (AST-vs-AST drift or a
+    # normalized comparison), NOT delivered here.
+
     def _verify_no_control_symlinks(self) -> None:
         """L1: refuse to operate on a .peers/ where any of the
         control files (or substrate-written log/report files) are
@@ -202,6 +266,133 @@ class DriverLifecycleMixin:
                         "otherwise write through). Remove it manually."
                     )
         self._verify_checks_manifest()
+        self._verify_checks_template_version()
+
+    def _verify_checks_template_version(self) -> None:
+        """CAP-14 (defense-in-depth, STACKED on `_verify_checks_manifest`):
+        fail CLOSED when a deployed gate script has drifted from the CURRENT
+        template source it was provisioned from.
+
+        ``_verify_checks_manifest`` only proves the deployed copy still matches
+        ``checks.sha256`` — a digest written from the SAME bytes at provision
+        time (cli.py). So a snapshot deployed BEFORE a template fix (e.g. the
+        BUG-011 whole-word `xit`/`xdescribe` fix in no_skipped_tests.py) matches
+        its own manifest and passes silently. That stale gate forced two false
+        product-convergence calls.
+
+        This second layer reads the provision-time companion
+        ``.peers/checks.template.sha256`` (written by ``peers init``), and for
+        every name it records compares the DEPLOYED ``.peers/checks/<name>``
+        bytes against the CURRENT template source bytes (resolved live from
+        ``peers.modes``). Any mismatch raises — re-run ``peers init`` to
+        re-deploy the corrected gate.
+
+        Inert by design until provisioned: a missing ``.peers/checks/`` dir, a
+        missing companion (legacy trees), or a name with no resolvable template
+        source all return cleanly. A PRESENT-but-stale companion is a hard stop.
+        Never fabricates a digest; on uncertainty it errs toward inert, NOT
+        toward a false pass (the deployed-vs-template byte compare is exact).
+        """
+        checks_dir = self.peer_dir / "checks"
+        if not checks_dir.is_dir():
+            return
+        companion = self.peer_dir / "checks.template.sha256"
+        if not companion.exists():
+            # Legacy tree provisioned before CAP-14 — nothing to enforce.
+            return
+        try:
+            companion_text = read_text_no_symlink(
+                companion, max_bytes=256 * 1024,
+            )
+        except OSError as e:
+            raise RuntimeError(
+                f"failed to read {companion}: {e}; refusing to operate."
+            ) from e
+
+        tracked: dict[str, str] = {}
+        for lineno, raw_line in enumerate(companion_text.splitlines(), 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                raise RuntimeError(
+                    f"{companion}:{lineno}: malformed "
+                    "checks.template.sha256 line"
+                )
+            digest, name = parts[0].lower(), parts[1].strip()
+            if (
+                len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+            ):
+                raise RuntimeError(
+                    f"{companion}:{lineno}: malformed sha256 digest"
+                )
+            if name in ("", ".", "..") or os.path.basename(name) != name:
+                raise RuntimeError(
+                    f"{companion}:{lineno}: check name must be a single path "
+                    f"component, got {name!r}"
+                )
+            tracked[name] = digest
+
+        if not tracked:
+            return
+
+        template_sources = self._resolve_template_check_sources()
+
+        for name in sorted(tracked):
+            tmpl_path = template_sources.get(name)
+            if tmpl_path is None:
+                # No current template ships this name (the mode set changed, or
+                # a user-supplied check). Stay inert rather than guess.
+                continue
+            try:
+                tmpl_bytes = read_bytes_no_symlink(tmpl_path)
+            except OSError:
+                # Template unreadable — cannot prove drift, do not fabricate.
+                continue
+            deployed_path = checks_dir / name
+            try:
+                deployed_bytes = read_bytes_no_symlink(deployed_path)
+            except OSError as e:
+                raise RuntimeError(
+                    f"failed to read deployed check {deployed_path}: {e}; "
+                    "refusing to operate."
+                ) from e
+            tmpl_digest = hashlib.sha256(tmpl_bytes).hexdigest()
+            dep_digest = hashlib.sha256(deployed_bytes).hexdigest()
+            if tmpl_digest != dep_digest:
+                raise RuntimeError(
+                    f"{name}: deployed gate is STALE vs template "
+                    f"(expected {tmpl_digest}, got {dep_digest}); "
+                    "re-run `peers init` to re-deploy the corrected gate."
+                )
+
+    @staticmethod
+    def _resolve_template_check_sources() -> dict[str, Path]:
+        """Map check-script basename -> current template source Path.
+
+        Resolved live from ``peers.modes.discover()`` so a template fix
+        (re-vendored gate) changes the bytes this guard enforces. Scans each
+        discovered mode's ``checks/`` dir AND its ``checks/lang_*/`` subdirs so
+        language-specific gates resolve too. A user mode overriding a builtin
+        name wins (last writer), matching ``merge``'s override semantics.
+        """
+        from peers import modes as _modes
+
+        sources: dict[str, Path] = {}
+        for mode in _modes.discover().values():
+            cdir = mode.path / "checks"
+            if not cdir.is_dir():
+                continue
+            for entry in sorted(cdir.iterdir()):
+                if entry.is_file() and entry.name.endswith(".py"):
+                    sources[entry.name] = entry
+                elif entry.is_dir() and entry.name.startswith("lang_"):
+                    for sub in sorted(entry.iterdir()):
+                        if sub.is_file() and sub.name.endswith(".py"):
+                            sources[sub.name] = sub
+        return sources
 
     def _verify_checks_manifest(self) -> None:
         """Fail closed when installed gate scripts drift from checks.sha256.

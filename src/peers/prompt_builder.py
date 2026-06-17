@@ -182,12 +182,31 @@ Example commit body:
 """.strip()
 
 
+GRAPHIFY_BLOCK = """
+CODE KNOWLEDGE GRAPH (available this run via MCP tools):
+An AST-built code knowledge graph is served over MCP. It reflects the repo at
+run-start and may lag commits made since — re-check source for code you just
+changed. For code navigation, dependency/call tracing, blast-radius, and "who
+uses X / how does A reach B", PREFER these tools over grep/find/read — they
+return compact, precise answers and cost far fewer tokens:
+  - query_graph    — search the graph (BFS/DFS) for relevant nodes/edges
+  - get_neighbors  — direct callers/callees/refs of a node
+  - get_node       — full details of one symbol
+  - shortest_path  — how two symbols connect (impact / blast-radius)
+  - god_nodes      — the most-connected core abstractions (where to start)
+  - graph_stats    — overview (node / edge / community counts)
+If the graph tools are unavailable or error, fall back to grep/find/read — do
+NOT block on them. Use grep only for literal-text search the graph can't cover.
+""".strip()
+
+
 CORE_DIRECTIVE = """
-NO SLOP. NO FAKES. NO SKELETONS. BE HONEST.
+NO SLOP. NO FAKES. NO SKELETONS. BE HONEST. ROOT-CAUSE FIRST.
 - No slop: no vague filler or hand-waving — every claim is specific and grounded in the code.
 - No fakes: never fabricate results, evidence, test output, or citations. Run it; report what actually happened.
 - No skeletons: no stubs, placeholders, or TODO/`pass`/`NotImplementedError` bodies passed off as done.
 - Be honest: report the real state — if something failed, is unverified, or was skipped, say so plainly.
+- Root-cause first: no fix without a stated, reproduced root cause. Before changing code, diagnose WHY it fails and name the cause; a fix that does not address a named root cause is not done.
 """.strip()
 
 
@@ -202,6 +221,7 @@ def build_prompt(
     soft_reviews_pending: list[Goal] | None = None,
     comm_variant: str = "git",
     all_peer_names: list[str] | None = None,
+    graphify_mcp: bool = False,
 ) -> str:
     parts: list[str] = []
     if all_peer_names and len(all_peer_names) > 2:
@@ -219,6 +239,10 @@ def build_prompt(
 
     parts.append(PROJECT_CONTEXT_BLOCK)
     parts.append("")
+
+    if graphify_mcp:
+        parts.append(GRAPHIFY_BLOCK)
+        parts.append("")
 
     if goals:
         parts.append("GOAL STATUS:")

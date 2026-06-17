@@ -1,18 +1,29 @@
 from __future__ import annotations
 
 import re
+import sys
 from typing import Any
 
 from peers.driver_helpers import _extract_first_json_object
+from peers.driver_host import _DriverHost
 from peers.goals import Goal
+from peers.regression_baseline import verify_baseline_digests
 
 
 _SOFT_CONSENSUS_FALSY = frozenset({"false", "0", "no", "off", ""})
 _GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_REVIEW_SECTION_RE = re.compile(r"(?im)^##[ \t]+Review[ \t]*\r?$")
 
 
 def _looks_like_git_sha(value: str) -> bool:
     return bool(_GIT_SHA_RE.fullmatch(value.strip()))
+
+
+def _review_section_body(body: str) -> str | None:
+    match = _REVIEW_SECTION_RE.search(body)
+    if match is None:
+        return None
+    return body[match.end():]
 
 
 def _default_soft_status() -> dict[str, Any]:
@@ -107,7 +118,7 @@ def soft_consensus_required_for_convergence(state: dict[str, Any]) -> bool:
     return bool(raw)
 
 
-class DriverSoftReviewsMixin:
+class DriverSoftReviewsMixin(_DriverHost):
     def _soft_reviews_pending(self, state: dict[str, Any],
                               current_peer: str) -> list[Goal]:
         """Return soft goals whose consensus isn't yet reached AND the
@@ -177,13 +188,15 @@ class DriverSoftReviewsMixin:
             recent = history[-g.quorum_den:]
             if len(recent) < g.quorum_den:
                 return False
-            return (
-                sum(
-                    1 for r in recent
-                    if isinstance(r, dict) and r.get("pass") is True
-                )
-                >= g.quorum_num
-            )
+            # full-depth-analysis #5: the quorum_num passes must come from
+            # quorum_num DISTINCT reviewers — a single peer passing its own work
+            # repeatedly does not form an independent quorum.
+            distinct_passers = {
+                r.get("reviewer") for r in recent
+                if isinstance(r, dict) and r.get("pass") is True
+                and r.get("reviewer") is not None
+            }
+            return len(distinct_passers) >= g.quorum_num
         if mode == "both":
             # Every peer must have submitted `consensus_needed`
             # consecutive pass:true reviews. With n=2 that literally
@@ -214,6 +227,25 @@ class DriverSoftReviewsMixin:
         """
         if not self.engine.all_green():
             return False
+        # FU-1: refuse to converge if a peer forged an agent-writable baseline
+        # (.peers/passing-baseline.txt / skip-baseline.txt) mid-run. The
+        # run-start digest anchor lives in the orchestrator's process memory
+        # (self._baseline_digests), unreachable by the agent subprocess, so a
+        # forged on-disk baseline that made a HARD gate "pass" is caught here
+        # and convergence is blocked. Applies regardless of soft-consensus
+        # opt-out, since it guards a HARD-gate integrity property.
+        anchored = getattr(self, "_baseline_digests", {})
+        if anchored:
+            forged = verify_baseline_digests(self.peer_dir, anchored)
+            if forged:
+                print(
+                    "peers: REFUSING convergence — run-start baseline forged "
+                    f"(digest mismatch) for gate(s): {', '.join(forged)}. The "
+                    "no-prior-regression / no-skipped-tests guarantee for "
+                    "these gates is void; failing closed.",
+                    file=sys.stderr, flush=True,
+                )
+                return False
         if not soft_consensus_required_for_convergence(state):
             return True
         n = len(state["peer_order"])
@@ -277,7 +309,7 @@ class DriverSoftReviewsMixin:
                 "that id exists in goals.yaml."
             )
             return False
-        # Extract first JSON object from body.
+        # Extract first JSON object from the required Review section.
         #
         # the old regex
         # `\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}` only handled ONE level of
@@ -286,7 +318,15 @@ class DriverSoftReviewsMixin:
         # silently rejected. Use a brace-counter so arbitrary nesting
         # works (same logic as bug_hunt._first_json_block).
         body = commit.body
-        payload = _extract_first_json_object(body)
+        review_body = _review_section_body(body)
+        if review_body is None:
+            state.setdefault("warnings", []).append(
+                f"soft-review ignored: commit {commit.sha[:8]} for "
+                f"goal {goal_id!r} is missing a `## Review` section "
+                "before its JSON object."
+            )
+            return False
+        payload = _extract_first_json_object(review_body)
         if payload is None:
             state.setdefault("warnings", []).append(
                 f"soft-review ignored: commit {commit.sha[:8]} for "
@@ -294,7 +334,15 @@ class DriverSoftReviewsMixin:
                 "Re-emit as a fresh commit with a single `{...}` block."
             )
             return False
-        passed = bool(payload.get("pass"))
+        pass_value = payload.get("pass")
+        if not isinstance(pass_value, bool):
+            state.setdefault("warnings", []).append(
+                f"soft-review ignored: commit {commit.sha[:8]} for "
+                f"goal {goal_id!r} has non-boolean `pass` value "
+                f"{pass_value!r}. Re-emit with pass:true or pass:false."
+            )
+            return False
+        passed = pass_value
         soft_status = _mutable_soft_status_map(state)
         soft = _mutable_soft_goal_status(soft_status, goal_id)
         mode = target_goal.reviewer or "other"
@@ -304,7 +352,13 @@ class DriverSoftReviewsMixin:
         # user later edits the goal to `reviewer: other`.
         if mode in ("other", "alternating"):
             if passed:
-                if soft.get("last_pass") is True:
+                # full-depth-analysis #5: only ADVANCE consensus when the new pass
+                # comes from a DIFFERENT reviewer than the prior counted pass — else
+                # ONE peer reviewing its OWN work across consecutive turns (the other
+                # peer benched/degraded) self-satisfies the n>=2 independent-review
+                # premise. A same-reviewer repeat resets to a single distinct vote.
+                if (soft.get("last_pass") is True
+                        and soft.get("last_reviewer") != reviewer):
                     soft["consensus_count"] = _next_consensus_count(soft)
                 else:
                     soft["consensus_count"] = 1
@@ -312,6 +366,7 @@ class DriverSoftReviewsMixin:
             else:
                 soft["consensus_count"] = 0
                 soft["last_pass"] = False
+            soft["last_reviewer"] = reviewer
 
         # Per-peer counter (used by `both`).
         per_peer = soft.get("per_peer", {})

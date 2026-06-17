@@ -53,6 +53,35 @@ def test_guard_classifies_test_only_diff(tmp_path: Path):
     assert "only test files" in guard.classify_cheating({})
 
 
+def test_guard_classifies_suffix_test_py_diff_BUG_706(tmp_path: Path):
+    repo = _init_repo(tmp_path / "r")
+    before = _head(repo)
+    (repo / "calc_test.py").write_text("def test_calc(): pass\n")
+    _git(repo, "add", "calc_test.py")
+    _git(repo, "commit", "-q", "-m", "weaken suffix test\n\nPeer: claude\n")
+
+    guard = AntiCheatGuard(repo, before, lambda: _head(repo))
+
+    assert is_test_only_commit(repo, "HEAD") is True
+    assert guard.diff_stats_since_invoke() == (1, 0)
+    assert "only test files" in guard.classify_cheating({})
+
+
+def test_guard_treats_source_only_diff_as_source(tmp_path: Path):
+    repo = _init_repo(tmp_path / "r")
+    before = _head(repo)
+    (repo / "src").mkdir()
+    (repo / "src" / "contest.py").write_text("def run(): return 1\n")
+    _git(repo, "add", "src/contest.py")
+    _git(repo, "commit", "-q", "-m", "production change\n\nPeer: claude\n")
+
+    guard = AntiCheatGuard(repo, before, lambda: _head(repo))
+
+    assert is_test_only_commit(repo, "HEAD") is False
+    assert guard.diff_stats_since_invoke() == (0, 1)
+    assert guard.classify_cheating({}) is None
+
+
 def test_guard_reads_justified_test_only_marker(tmp_path: Path):
     repo = _init_repo(tmp_path / "r")
     before = _head(repo)

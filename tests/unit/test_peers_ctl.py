@@ -9,6 +9,7 @@ Coverage:
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import shutil
@@ -20,7 +21,7 @@ import pytest
 
 from peers_ctl.cli import (
     cmd_add, cmd_list, cmd_remove, cmd_start, cmd_status, cmd_stop,
-    cmd_logs, cmd_report,
+    cmd_logs, cmd_peek, cmd_report,
 )
 from peers_ctl.runner import start_project
 from peers_ctl.store import (
@@ -717,6 +718,32 @@ def test_stop_project_returns_promptly_when_child_dies_immediately(
     assert p_after.pid is None
 
 
+@pytest.mark.parametrize("bad_pid", [None, 0])
+def test_stop_project_invalid_registry_pid_marks_stopped_without_signal(
+    tmp_path: Path,
+    monkeypatch,
+    bad_pid,
+):
+    cfg = tmp_path / "ctl"
+    s = Store(cfg)
+    target = _stub_target(tmp_path)
+    s.add(Project(name="snake", path=str(target), state="running", pid=bad_pid))
+
+    import peers_ctl.runner as runner_mod
+
+    def fail_signal(*_args, **_kwargs):
+        pytest.fail("invalid registry PID must not reach signal delivery")
+
+    monkeypatch.setattr(runner_mod, "_safe_getpgid", fail_signal)
+    monkeypatch.setattr(runner_mod, "_signal", fail_signal)
+
+    assert runner_mod.stop_project(s, s.get("snake"), grace_s=0) == 0
+
+    p_after = s.get("snake")
+    assert p_after.state == "stopped"
+    assert p_after.pid is None
+
+
 def test_stop_project_escalates_to_kill_process_group_after_leader_exits(
     tmp_path: Path, monkeypatch,
 ):
@@ -1120,11 +1147,17 @@ def test_start_passes_max_usd_to_peers_run(tmp_path: Path, monkeypatch):
         s, s.get("snake"), max_ticks=2, max_usd=1.25,
     )
     try:
-        for _ in range(30):
+        # Wait for the stub to actually WRITE its argv (the `>` redirect
+        # creates the file before printf fills it; under load the old
+        # exists()-only/3s wait raced an empty file). Poll for non-empty
+        # content with a generous ceiling.
+        args: list[str] = []
+        for _ in range(100):  # up to 10s
             if argv_log.exists():
-                break
+                args = argv_log.read_text().splitlines()
+                if args:
+                    break
             time.sleep(0.1)
-        args = argv_log.read_text().splitlines()
         assert args == [
             "-C", str(target), "run",
             "--max-ticks", "2",
@@ -1594,7 +1627,12 @@ def test_start_refuses_late_logs_parent_symlink(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(s, "safe_log_path_for", swap_logs_dir_after_validation)
 
-    with pytest.raises(OSError):
+    # full-depth-analysis #8: start_project now re-reads the registry under the
+    # start-lock, which validates the logs dir (safe_log_path_for) — so a late
+    # comms/logs symlink swap is refused EARLIER (a ValueError refusal) rather than
+    # only at the eventual write (OSError). Either is a valid refusal; the security
+    # guarantee is that nothing is written into the attacker-controlled dir.
+    with pytest.raises((OSError, ValueError)):
         runner_mod.start_project(s, project)
 
     assert not (outside / "snake.log").exists()
@@ -1729,6 +1767,97 @@ def test_prune_logs_warns_on_unlink_failure(
 
 
 # --- CLI ---------------------------------------------------------------
+
+def _write_claude_event(path: Path, text: str) -> None:
+    path.write_text(json.dumps({
+        "timestamp": "2026-06-15T01:02:03Z",
+        "type": "assistant",
+        "message": {"content": text},
+    }) + "\n")
+
+
+def _peek_project(tmp_path: Path, monkeypatch):
+    import peers.health_guard as health_guard
+
+    cfg = tmp_path / "ctl"
+    target = tmp_path / "repo"
+    target.mkdir()
+    session_dir = tmp_path / "home" / ".claude" / "projects" / "-work"
+    session_dir.mkdir(parents=True)
+    Store(cfg).add(Project(name="snake", path=str(target)))
+    monkeypatch.setattr(
+        health_guard, "claude_session_jsonl_path", lambda _cwd: session_dir,
+    )
+    return cfg, session_dir
+
+
+def test_cmd_peek_specific_session_reads_named_session(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    cfg, session_dir = _peek_project(tmp_path, monkeypatch)
+    _write_claude_event(session_dir / "sess1.jsonl", "HAPPY-SESSION")
+
+    rc = cmd_peek(
+        "snake", session="sess1", no_follow=True, config_dir=cfg,
+    )
+
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "HAPPY-SESSION" in out.out
+
+
+def test_cmd_peek_specific_session_allows_dotted_dashed_id(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    cfg, session_dir = _peek_project(tmp_path, monkeypatch)
+    _write_claude_event(session_dir / "sess.1-alpha.jsonl", "EDGE-SESSION")
+
+    rc = cmd_peek(
+        "snake", session="sess.1-alpha", no_follow=True, config_dir=cfg,
+    )
+
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "EDGE-SESSION" in out.out
+
+
+def test_cmd_peek_rejects_traversal_session_id(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    cfg, session_dir = _peek_project(tmp_path, monkeypatch)
+    _write_claude_event(session_dir.parent / "escape.jsonl", "TRAVERSAL-PROOF")
+
+    rc = cmd_peek(
+        "snake", session="../escape", no_follow=True, config_dir=cfg,
+    )
+
+    out = capsys.readouterr()
+    assert rc == 2
+    assert "invalid session id" in out.err
+    assert "TRAVERSAL-PROOF" not in out.out
+
+
+def test_cmd_peek_specific_session_rejects_symlinked_file(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    cfg, session_dir = _peek_project(tmp_path, monkeypatch)
+    outside = tmp_path / "outside.jsonl"
+    _write_claude_event(outside, "SYMLINK-PROOF")
+    link = session_dir / "sesslink.jsonl"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable for this platform: {exc}")
+
+    rc = cmd_peek(
+        "snake", session="sesslink", no_follow=True, config_dir=cfg,
+    )
+
+    out = capsys.readouterr()
+    assert rc == 1
+    assert "no session jsonl" in out.err
+    assert "SYMLINK-PROOF" not in out.out
+
 
 def test_cmd_add_and_remove_round_trip(tmp_path: Path, capsys):
     cfg = tmp_path / "ctl"
@@ -1884,6 +2013,34 @@ def test_cmd_report_refuses_symlinked_report_file(tmp_path: Path, capsys):
     assert bait.read_text() == "keep me\n"
 
 
+def test_cmd_research_builds_container_research_subcmd(tmp_path: Path, monkeypatch):
+    """`peers-ctl research <proj>` launches `peers research /work ...` inside a
+    container (reusing the sidecar/auth/egress plumbing), NOT the `peers run`
+    loop. The repo is mounted at /work."""
+    from peers_ctl.cli import cmd_research
+    cfg = tmp_path / "ctl"
+    target = _stub_target(tmp_path)
+    cmd_add("snake", target, cfg)
+
+    seen: dict = {}
+
+    def fake_start(store, project, **kwargs):
+        seen.update(kwargs)
+        store.update(project.name, state="running", pid=999)
+        return 999
+
+    import peers_ctl.cli as cli_mod
+    monkeypatch.setattr(cli_mod, "start_project", fake_start)
+    rc = cmd_research("snake", modalities="codebase,web", peer="claude",
+                      convergence_budget=4, config_dir=cfg)
+    assert rc == 0
+    assert seen.get("container") is True
+    assert seen.get("research_subcmd") == [
+        "research", "/work", "--modalities", "codebase,web",
+        "--peer", "claude", "--convergence-budget", "4",
+    ]
+
+
 def test_cmd_start_uses_runner(tmp_path: Path, monkeypatch, capsys):
     cfg = tmp_path / "ctl"
     target = _stub_target(tmp_path)
@@ -1893,10 +2050,13 @@ def test_cmd_start_uses_runner(tmp_path: Path, monkeypatch, capsys):
 
     def fake_start(store, project, max_ticks=None, max_usd=None,
                    max_runtime_s=None, reset_budget=False, force=False,
+                   trust_egress_allow=False, skip_claude_smoke=False,
                    extra_args=(), container=False):
         invocations.append({
             "name": project.name, "max_ticks": max_ticks,
             "max_usd": max_usd, "container": container,
+            "trust_egress_allow": trust_egress_allow,
+            "skip_claude_smoke": skip_claude_smoke,
         })
         store.update(project.name, state="running", pid=12345)
         return 12345
@@ -1907,7 +2067,8 @@ def test_cmd_start_uses_runner(tmp_path: Path, monkeypatch, capsys):
     assert rc == 0
     assert invocations == [
         {"name": "snake", "max_ticks": 3, "max_usd": 0.5,
-         "container": False},
+         "container": False, "trust_egress_allow": False,
+         "skip_claude_smoke": False},
     ]
 
 
@@ -2140,6 +2301,39 @@ def test_persist_budget_override_refuses_symlinked_peers_ancestor_BUG_238(
     )
 
 
+def test_persist_budget_override_deep_overrides_json_falls_back_BUG_515(
+    tmp_path: Path,
+) -> None:
+    """BUG-515: controller-side mirror of BUG-514.
+
+    `_persist_budget_override` reads the prior
+    `.peers/budget-overrides.json` before merging, and only catches
+    `(OSError, ValueError)`. Python's `json.loads()` raises
+    `RecursionError` (NOT a ValueError) on a sufficiently deep
+    malformed JSON array, so a same-UID adversary that pre-stages a
+    deeply nested override sidecar crashes `peers-ctl start` instead
+    of falling back to an empty merge dict.
+
+    Symmetric to BUG-514 on the peer-side reader; same fail-closed
+    contract, same fix shape (catch RecursionError as malformed input).
+    """
+    import json
+    import peers_ctl.runner as runner_mod
+    from peers.budget_accountant import OPERATOR_BUDGET_OVERRIDE_FILE
+
+    target = _stub_target(tmp_path)
+    proj = Project(name="x", path=str(target))
+
+    sidecar = target / ".peers" / OPERATOR_BUDGET_OVERRIDE_FILE
+    sidecar.write_text("[" * 10000, encoding="utf-8")
+
+    runner_mod._persist_budget_override(proj, max_runtime_s=43200)
+
+    # Reader fell back to {} on malformed-deep JSON, controller wrote
+    # only the new operator caps; no crash escaped.
+    assert json.loads(sidecar.read_text()) == {"max_runtime_s": 43200}
+
+
 def test_write_state_happy_path_writes_atomic_no_symlink_BUG_196(
     tmp_path: Path,
 ) -> None:
@@ -2232,3 +2426,21 @@ def test_acquire_start_lock_edge_hardlink_refused_BUG_210(
     with pytest.raises(OSError):
         with runner_mod._acquire_start_lock(lock_path, timeout=0.2):
             pass
+
+
+def test_start_project_rereads_pid_under_lock(tmp_path):
+    # full-depth-analysis #8: start_project must re-read the authoritative record
+    # UNDER the start-lock. A STALE pre-lock snapshot (pid=None) must NOT let a
+    # second start proceed when the registry already records a LIVE pid (the race
+    # that clobbered the first start's pid and orphaned the live loop).
+    import os
+    s = Store(tmp_path / "ctl")
+    proj_dir = tmp_path / "snake"
+    proj_dir.mkdir()
+    s.add(Project(name="snake", path=str(proj_dir)))
+    # a "first start" persisted a LIVE pid into the registry
+    s.update("snake", pid=os.getpid())
+    # the caller still holds the STALE pre-lock snapshot (pid=None)
+    stale = Project(name="snake", path=str(proj_dir), pid=None)
+    with pytest.raises(ValueError, match="already running"):
+        start_project(s, stale)

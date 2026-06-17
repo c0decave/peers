@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import stat as _stat
 import time
 from collections import deque
 from pathlib import Path
-from typing import Iterator
+from typing import IO, Iterator
 
 
 NOISE_TYPES = {"queue-operation", "ai-title", "last-prompt", "attachment"}
@@ -67,9 +68,40 @@ def newest_session_jsonl(jsonl_dir: Path) -> Path | None:
         candidates = list(jsonl_dir.glob("*.jsonl"))
     except OSError:
         return None
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    newest: tuple[float, Path] | None = None
+    for path in candidates:
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if not _stat.S_ISREG(st.st_mode):
+            continue
+        if newest is None or st.st_mtime > newest[0]:
+            newest = (st.st_mtime, path)
+    return newest[1] if newest is not None else None
+
+
+def _is_regular_session_jsonl(path: Path) -> bool:
+    """True iff ``path`` is a regular file entry, without following symlinks."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return _stat.S_ISREG(st.st_mode)
+
+
+def _open_session_jsonl(path: Path) -> IO[str]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise OSError(f"refusing non-regular session jsonl: {path}")
+        return os.fdopen(fd, "r", encoding="utf-8", errors="replace")
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _read_existing_lines(
@@ -77,14 +109,14 @@ def _read_existing_lines(
     last: int | None,
 ) -> tuple[list[str], int, tuple[int, int] | None]:
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
+        with _open_session_jsonl(path) as f:
             stat = os.fstat(f.fileno())
             if last is None:
                 lines = list(f)
             else:
                 lines = list(deque(f, maxlen=last))
             return lines, f.tell(), (stat.st_dev, stat.st_ino)
-    except FileNotFoundError:
+    except OSError:
         return [], 0, None
 
 
@@ -107,7 +139,7 @@ def tail_session(
         return
     while True:
         try:
-            with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+            with _open_session_jsonl(jsonl_path) as f:
                 stat = os.fstat(f.fileno())
                 current_identity = (stat.st_dev, stat.st_ino)
                 if identity is not None and current_identity != identity:
@@ -127,7 +159,7 @@ def tail_session(
                         continue
                     if isinstance(ev, dict):
                         yield from decode_event(ev)
-        except FileNotFoundError:
+        except OSError:
             pos = 0
             identity = None
         time.sleep(0.5)

@@ -181,6 +181,22 @@ def _container_run_in(target: Path, *peers_args: str) -> int:
 
 _KNOWN_TEMPLATES = ("internal testing",)
 
+
+def _valid_claude_session_id(session: object) -> bool:
+    """True iff ``session`` is a single Claude session-id component.
+
+    ``peers-ctl peek --session`` appends ``.jsonl`` under Claude's session
+    directory. The argument is an id, not a path; accepting separators would let
+    a caller escape the session directory before the tailer opens the file.
+    """
+    if not isinstance(session, str) or session in ("", ".", ".."):
+        return False
+    return (
+        "/" not in session
+        and "\\" not in session
+        and Path(session).name == session
+    )
+
 _PLACEHOLDER_SELF_AUDIT_SPEC = """\
 # peers — Specification (Self-Audit Snapshot, placeholder)
 
@@ -1173,7 +1189,7 @@ def _read_project_state_for_cli(proj_dir: Path) -> dict | None:
         if len(raw) > _CLI_STATE_MAX_BYTES:
             return None
         data = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -1236,6 +1252,8 @@ def cmd_resume(
     max_runtime: str | None = None,
     reset_budget: bool = False,
     force: bool = False,
+    trust_egress_allow: bool = False,
+    skip_claude_smoke: bool = False,
     start_run: bool = False,
     container: bool = False,
     config_dir: Path | None = None,
@@ -1305,6 +1323,8 @@ def cmd_resume(
             max_runtime=max_runtime,
             reset_budget=reset_budget,
             force=force,
+            trust_egress_allow=trust_egress_allow,
+            skip_claude_smoke=skip_claude_smoke,
             container=container,
             config_dir=config_dir,
         )
@@ -1358,7 +1378,7 @@ def _project_rollup(repo: Path) -> tuple[int, int, str]:
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
         if not isinstance(entry, dict):
             continue
@@ -1383,7 +1403,7 @@ def _load_dashboard_state(repo: Path) -> dict:
             max_bytes=_DASHBOARD_STATE_MAX_BYTES + 1,
         )
         data = json.loads(raw)
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError, RecursionError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -1644,7 +1664,7 @@ def _load_project_state(repo: Path) -> dict:
             max_bytes=_CLI_STATE_MAX_BYTES + 1,
         )
         data = json.loads(raw)
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError, RecursionError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -1666,7 +1686,7 @@ def _load_project_ticks(repo: Path) -> list[dict]:
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
         if isinstance(entry, dict):
             out.append(entry)
@@ -1751,7 +1771,11 @@ def cmd_peek(
         print(f"peers-ctl: no such project: {name}", file=sys.stderr)
         return 1
     from peers.health_guard import claude_session_jsonl_path
-    from peers.peek import newest_session_jsonl, tail_session
+    from peers.peek import (
+        _is_regular_session_jsonl,
+        newest_session_jsonl,
+        tail_session,
+    )
 
     cwd = "/work" if "container=1" in (project.notes or "") else project.path
     jsonl_dir = claude_session_jsonl_path(cwd)
@@ -1759,10 +1783,18 @@ def cmd_peek(
         print("peers-ctl peek: HOME unset or project cwd is not absolute",
               file=sys.stderr)
         return 1
-    jsonl = jsonl_dir / f"{session}.jsonl" if session else (
-        newest_session_jsonl(jsonl_dir)
-    )
-    if jsonl is None or not jsonl.exists():
+    jsonl: Path | None
+    if session is not None:
+        if not _valid_claude_session_id(session):
+            print(
+                f"peers-ctl peek: invalid session id: {session!r}",
+                file=sys.stderr,
+            )
+            return 2
+        jsonl = jsonl_dir / f"{session}.jsonl"
+    else:
+        jsonl = newest_session_jsonl(jsonl_dir)
+    if jsonl is None or not _is_regular_session_jsonl(jsonl):
         print(f"peers-ctl peek: no session jsonl in {jsonl_dir}",
               file=sys.stderr)
         return 1
@@ -1774,11 +1806,52 @@ def cmd_peek(
     return 0
 
 
+def cmd_research(name: str, *,
+                 modalities: str = "codebase,web",
+                 peer: str | None = None,
+                 convergence_budget: int | None = None,
+                 skip_claude_smoke: bool = False,
+                 trust_egress_allow: bool = False,
+                 config_dir: Path | None = None) -> int:
+    """Launch `peers research /work ...` inside the isolated peers container.
+
+    Reuses the full container plumbing (egress-proxy allow-list, auth-proxy,
+    claude-smoke preflight, lifecycle/registry) but runs the research mode
+    instead of the `peers run` loop. The project's repo is mounted at /work and
+    a cited RESEARCH.md is committed+attested there on convergence. Web modality
+    requires the project's `.peers/config.yaml` to opt in (research.web +
+    egress_allow), reviewed via --trust-egress-allow."""
+    store = _store(config_dir)
+    reconcile(store)
+    p = store.get(name)
+    if p is None:
+        print(f"peers-ctl: no such project: {name}", file=sys.stderr)
+        return 1
+    subcmd = ["research", "/work", "--modalities", modalities]
+    if peer:
+        subcmd += ["--peer", peer]
+    if convergence_budget is not None:
+        subcmd += ["--convergence-budget", str(convergence_budget)]
+    try:
+        pid = start_project(
+            store, p, container=True, research_subcmd=subcmd,
+            skip_claude_smoke=skip_claude_smoke,
+            trust_egress_allow=trust_egress_allow,
+        )
+    except (RuntimeError, ValueError) as e:
+        print(f"peers-ctl: {e}", file=sys.stderr)
+        return 1
+    print(f"Started research '{name}' (container, pid {pid}); log → {p.log_path}")
+    return 0
+
+
 def cmd_start(name: str, max_ticks: int | None = None,
               max_usd: float | None = None,
               max_runtime: str | None = None,
               reset_budget: bool = False,
               force: bool = False,
+              trust_egress_allow: bool = False,
+              skip_claude_smoke: bool = False,
               container: bool = False,
               config_dir: Path | None = None,
               without_recon: bool = False,
@@ -1846,6 +1919,8 @@ def cmd_start(name: str, max_ticks: int | None = None,
                             max_runtime_s=max_runtime_s,
                             reset_budget=reset_budget,
                             force=force,
+                            trust_egress_allow=trust_egress_allow,
+                            skip_claude_smoke=skip_claude_smoke,
                             container=container,
                             extra_args=extra_args)
     except (RuntimeError, ValueError) as e:
@@ -2069,6 +2144,118 @@ def cmd_doctor(config_dir: Path | None = None, *,
     """
     from peers_ctl.doctor import run_doctor
     return run_doctor(claude_smoke=claude_smoke)
+
+
+def cmd_tui(config_dir: Path | None = None) -> int:
+    """Launch the live TUI cockpit. Lazy-imports the optional `tui` extra.
+
+    The TUI (Textual-based) is shipped as the optional ``[tui]`` extra so
+    the core stays dependency-light. The import is deferred to call time:
+    if Textual (or ``peers_ctl.tui.app``, added by a later wave) is absent,
+    print an install hint and return 1 instead of crashing.
+    """
+    import importlib
+
+    try:
+        app_mod = importlib.import_module("peers_ctl.tui.app")
+    except ImportError:
+        print(
+            "peers-ctl tui requires the optional GUI extra.\n"
+            "  Install it with:  pip install -e .[tui]\n"
+            "  (adds Textual + textual-window; the core stays "
+            "dependency-light)",
+            file=sys.stderr,
+        )
+        return 1
+    return app_mod.run(config_dir=config_dir)
+
+
+def _print_fleet_summary(res) -> None:
+    print(f"peers-ctl fleet: {res.cause} after {res.ticks} tick(s).")
+    if res.landed:
+        print(f"  landed: {res.landed}")
+    if res.tier2:
+        print(f"  Tier-2 (needs human review): {res.tier2}")
+    if res.needs_review:
+        print(f"  needs-review: {res.needs_review}")
+    if res.halt_reason:
+        print(f"  halt: {res.halt_reason}")
+    if res.error:
+        print(f"  error: {res.error}")
+    done = sum(1 for s in res.statuses.values() if s in ("converged", "landed"))
+    print(f"  runs: {done}/{len(res.statuses)} converged-or-landed")
+
+
+def cmd_fleet(manifest_path, *, ledger=None, max_ticks=None, once=False,
+              dry_run=False, _conduct=None, _make_slot_runner=None) -> int:
+    """Run a multi-tool/multi-run fleet from a manifest: spawn peers runs across
+    leased worktrees and drive the conductor tick loop to an HONEST terminal.
+
+    Returns 2 on a bad/unreadable manifest (fail-closed — a malformed program
+    never schedules), 0 on a clean ``complete`` (every run converged/landed, no
+    failures / Tier-2 / needs-review), and 1 otherwise (halted / stalled /
+    ceiling / max-ticks / aborted / incomplete) so an operator / CI sees that work
+    remains. The SlotRunner is torn down on every exit."""
+    import yaml
+
+    from peers.fleet.daemon import conduct_fleet
+    from peers.fleet.fleet_ledger import FleetLedger
+    from peers.fleet.manifest import load_fleet_manifest
+    from peers.fleet.slot_runner import ProcessSlotRunner
+
+    mpath = Path(manifest_path)
+    try:
+        raw = yaml.safe_load(mpath.read_text(encoding="utf-8"))
+        manifest = load_fleet_manifest(raw if isinstance(raw, dict) else {})
+    except (OSError, ValueError, yaml.YAMLError) as e:
+        print(f"peers-ctl fleet: cannot load manifest {mpath}: {e}",
+              file=sys.stderr)
+        return 2
+
+    # Default the in-tree frontend builders so a fleet run can actually execute
+    # a mode (e.g. develop) out of the box; an operator override still wins.
+    # The spawned run_one subprocess inherits this env (FLEET-02 / SPEC-03 fix).
+    os.environ.setdefault("PEERS_FLEET_BUILDERS", "peers.fleet.builders")
+
+    if dry_run:
+        print(f"peers-ctl fleet: manifest OK — {len(manifest.program.runs)} run(s), "
+              f"{len(manifest.pool.slots)} slot(s), "
+              f"ceiling tokens={manifest.ceiling.max_tokens}/"
+              f"runs={manifest.ceiling.max_runs}")
+        for s in manifest.program.runs:
+            print(f"  - {s.run_id}: {s.mode} on {s.tool} "
+                  f"(deps: {s.depends_on or '-'}, landing: {s.op_config.landing})")
+        return 0
+
+    ledger_path = Path(ledger) if ledger else (mpath.parent / "fleet.jsonl")
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    fl = FleetLedger(ledger_path)
+
+    conduct = _conduct or conduct_fleet
+    make_sr = _make_slot_runner or (
+        lambda m: ProcessSlotRunner(m.pool, m.repos_by_id,
+                                    idle_timeout_s=m.daemon.idle_timeout_s))
+    slot_runner = make_sr(manifest)
+
+    eff_max_ticks = 1 if once else (
+        max_ticks if max_ticks is not None else manifest.daemon.max_ticks)
+    try:
+        res = conduct(
+            fl, manifest.program, manifest.pool, manifest.ceiling,
+            slot_runner=slot_runner, repos_by_id=manifest.repos_by_id,
+            target_ref=manifest.daemon.target_ref, max_ticks=eff_max_ticks,
+            tick_sleep_s=manifest.daemon.tick_sleep_s)
+    except Exception as e:                       # noqa: BLE001 — honest report + cleanup
+        print(f"peers-ctl fleet: aborted: {e}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            slot_runner.shutdown()
+        except Exception:                        # noqa: BLE001 — best-effort teardown
+            pass
+
+    _print_fleet_summary(res)
+    return 0 if res.ok else 1
 
 
 _HELP_MAN_HINT = "\n(use --help-man for detailed docs + examples)"
@@ -2337,6 +2524,20 @@ def build_parser() -> argparse.ArgumentParser:
              "knows the project is done.",
     )
     p_start.add_argument(
+        "--trust-egress-allow", action="store_true",
+        help="with --container, record the exact digest of the current "
+             ".peers/config.yaml egress_allow list after host-side review. "
+             "This is separate from --force because egress_allow is "
+             "peer-writable project policy.",
+    )
+    p_start.add_argument(
+        "--skip-claude-smoke", action="store_true",
+        help="with --container, skip the pre-flight live claude smoke that "
+             "verifies a configured claude peer can authenticate in-container "
+             "(default: refuse to start if it can't, so a broken auth never "
+             "silently degrades the run to codex-solo).",
+    )
+    p_start.add_argument(
         "--container", action="store_true",
         help="run the loop inside the peers:dev podman image "
              "(mounts target + ~/.claude + ~/.codex). Use when "
@@ -2377,6 +2578,33 @@ def build_parser() -> argparse.ArgumentParser:
              "`peers-ctl start <project>`. Default: OFF (autonomous).",
     )
 
+    p_research = _add_help_man_subparser(
+        sub, "research",
+        help_text=(
+            "run `peers research /work ...` inside the isolated peers "
+            "container (egress allow-list + auth-proxy + claude-smoke "
+            "preflight + lifecycle), instead of the `peers run` loop. The "
+            "repo is mounted at /work; a cited RESEARCH.md is committed there "
+            "on convergence. Web modality needs research.web + egress_allow in "
+            ".peers/config.yaml (review with --trust-egress-allow)."
+        ),
+    )
+    p_research.add_argument("name")
+    p_research.add_argument(
+        "--modalities", default="codebase,web",
+        help="comma-separated evidence modalities (codebase[,web]); "
+             "default codebase,web.",
+    )
+    p_research.add_argument("--peer", default=None,
+                            help="which configured peer drives research "
+                                 "(default: first peer in config).")
+    p_research.add_argument("--convergence-budget", type=int, default=None,
+                            metavar="N")
+    p_research.add_argument("--trust-egress-allow", action="store_true",
+                            help="record the host-reviewed egress_allow digest "
+                                 "(required for web seed_urls).")
+    p_research.add_argument("--skip-claude-smoke", action="store_true")
+
     p_resume = _add_help_man_subparser(
         sub, "resume",
         help_text=(
@@ -2394,6 +2622,8 @@ def build_parser() -> argparse.ArgumentParser:
                           metavar="DURATION")
     p_resume.add_argument("--reset-budget", action="store_true")
     p_resume.add_argument("--force", action="store_true")
+    p_resume.add_argument("--trust-egress-allow", action="store_true")
+    p_resume.add_argument("--skip-claude-smoke", action="store_true")
     p_resume.add_argument("--start", action="store_true",
                           help="start the project after clearing markers")
     p_resume.add_argument("--container", action="store_true",
@@ -2444,6 +2674,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    _add_help_man_subparser(
+        sub, "tui",
+        help_text=(
+            "launch the live TUI cockpit (optional `tui` extra; "
+            "install with `pip install -e .[tui]`)."
+        ),
+    )
+
     p_compare = _add_help_man_subparser(
         sub, "compare",
         help_text=(
@@ -2459,6 +2697,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     from peers_ctl.replay import register_subparser as _register_replay
     _register_replay(sub)
+
+    p_fleet = _add_help_man_subparser(
+        sub, "fleet",
+        help_text=("run a multi-tool/multi-run fleet from a manifest: spawn peers "
+                   "runs across leased worktrees, drive the conductor tick loop to "
+                   "an honest terminal, and auto-land trusted converged runs."))
+    p_fleet.add_argument("--manifest", required=True,
+                         help="path to the fleet manifest YAML "
+                              "(pool / ceiling / daemon / runs).")
+    p_fleet.add_argument("--ledger", default=None,
+                         help="fleet-ledger path "
+                              "(default: <manifest dir>/fleet.jsonl).")
+    p_fleet.add_argument("--max-ticks", type=int, default=None,
+                         help="override the manifest's daemon.max_ticks.")
+    p_fleet.add_argument("--once", action="store_true",
+                         help="run a single conductor tick then stop.")
+    p_fleet.add_argument("--dry-run", action="store_true",
+                         help="validate the manifest + print the plan; do not run.")
 
     p_modes = _add_help_man_subparser(
         sub, "modes", help_text="inspect available audit modes")
@@ -2486,6 +2742,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cmd is None:
         parser.error("the following arguments are required: cmd")
     cd = args.config_dir
+    if args.cmd == "fleet":
+        return cmd_fleet(args.manifest, ledger=args.ledger,
+                         max_ticks=args.max_ticks, once=args.once,
+                         dry_run=args.dry_run)
     if args.cmd == "add":
         return cmd_add(args.name, args.path, cd)
     if args.cmd == "new":
@@ -2535,11 +2795,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.name, session=args.session, no_follow=args.no_follow,
             last=args.last, config_dir=cd,
         )
+    if args.cmd == "research":
+        return cmd_research(
+            args.name,
+            modalities=args.modalities,
+            peer=args.peer,
+            convergence_budget=args.convergence_budget,
+            skip_claude_smoke=args.skip_claude_smoke,
+            trust_egress_allow=args.trust_egress_allow,
+            config_dir=cd,
+        )
     if args.cmd == "start":
         return cmd_start(args.name, args.max_ticks, args.max_usd,
                          max_runtime=args.max_runtime,
                          reset_budget=args.reset_budget,
                          force=args.force,
+                         trust_egress_allow=args.trust_egress_allow,
+                         skip_claude_smoke=args.skip_claude_smoke,
                          container=args.container,
                          config_dir=cd,
                          without_recon=args.without_recon,
@@ -2554,6 +2826,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_runtime=args.max_runtime,
             reset_budget=args.reset_budget,
             force=args.force,
+            trust_egress_allow=args.trust_egress_allow,
+            skip_claude_smoke=args.skip_claude_smoke,
             start_run=args.start,
             container=args.container,
             config_dir=cd,
@@ -2572,6 +2846,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_prune(args.older_than_days, cd)
     if args.cmd == "doctor":
         return cmd_doctor(cd, claude_smoke=args.claude_smoke)
+    if args.cmd == "tui":
+        return cmd_tui(config_dir=cd)
     if args.cmd == "compare":
         from peers_ctl.compare import cmd_compare
         return cmd_compare(list(args.names), cd)
