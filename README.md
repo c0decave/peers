@@ -73,6 +73,11 @@ peers-ctl new myfeature --container --modes=implement --plan ./PLAN.md
 # see docs/MODES_IMPLEMENT.md for the PLAN.md schema + escape valves.
 ```
 
+> **One-shot workflows** (no controller, run on your current branch):
+> `peers develop <repo> --dimensions correctness,security,perf` finds-AND-fixes,
+> and `peers research <repo>` turns a `TOPIC.md` into a cited `RESEARCH.md`.
+> See [Operator-runnable workflows — `develop` and `research`](#operator-runnable-workflows--develop-and-research).
+
 **Automatic hooks** (opt-out flags):
 - **`recon` pre-tick** (default on): substrate scans the repo once before tick 1 and writes `.peers/recon.md` (detected languages, key docs, entry-point candidates, top-level tree). Free + fast — no LLM call. Eliminates the "blind tick 1" penalty. Opt out: `peers-ctl start <name> --without-recon`.
 - **`codemap` pre-tick** (default on): substrate builds a structural CODEMAP from the AST and writes `.peers/CODEMAP.yaml` (machine-readable: every public symbol, its `file:line` and signature) plus `.peers/codemap.md` (a compact, byte-capped digest peers read as context). Free + fast — no LLM call. Primes peers with the codebase's public-API shape before tick 1, on top of recon's file-level view. Opt out: `peers-ctl start <name> --no-codemap`.
@@ -286,6 +291,73 @@ reviewer-only checkoffs, escape valves (`[PARTIAL]` / `[BLOCKED]` /
 | Implement a planned feature | `--modes=implement --plan ./PLAN.md` |
 
 `peers-ctl modes list` always shows the current built-in set.
+
+---
+
+## Operator-runnable workflows — `develop` and `research`
+
+Besides the stackable `--modes=…` audit loop above, `peers` ships two
+**one-shot workflows** driven directly off the inner `peers` CLI (not
+`peers-ctl new`). Both run against a single git repo that already carries a
+configured peer in `.peers/config.yaml` — run `peers init` once if it
+doesn't — drive that peer, and leave their result on your **current
+branch**: no controller, no long-lived run directory.
+
+### `peers develop` — autonomously improve this repo
+
+Audits the repo for the dimensions you name, **authors a frozen implement
+contract** from the surviving findings, then converges that contract to an
+**attested commit** — the same blind-review + acceptance-gate machinery as
+`implement` mode, except the plan is generated from the audit instead of a
+hand-written `PLAN.md`.
+
+```sh
+cd /path/to/your-repo
+peers init                       # once, if .peers/ is absent
+peers develop . --dimensions correctness,security,perf
+```
+
+| Argument | Meaning |
+|---|---|
+| `repo` (positional) | path to the target git repository |
+| `--dimensions` (required) | comma-separated audit dimensions, e.g. `correctness,security,perf` |
+| `--peer <name>` | which configured peer drives the agent (default: first peer in `.peers/config.yaml`) |
+| `--convergence-budget <N>` | max implement attempts per contract before giving up (default: 5) |
+
+Reach for it when you want the substrate to *find AND fix*: pick the
+dimensions, walk away, review the attested commit it lands.
+
+### `peers research` — synthesize a cited report from a `TOPIC.md`
+
+Reads an operator-authored **`TOPIC.md`** (a `## Scope` + `## Questions`
+brief) at the repo root, decomposes it into sub-questions, sweeps the
+enabled evidence modalities for corroborating sources, and synthesizes a
+**cited `RESEARCH.md`** from the claims it can confirm — onto your current
+branch. It is a generic KNOWLEDGE workflow: a non-security topic ("cloning
+plants in Alaska") is fine. Fails CLOSED on a missing or invalid `TOPIC.md`.
+
+```sh
+cd /path/to/your-repo
+cat > TOPIC.md <<'MD'
+## Scope
+What I want answered, and the boundaries of the question.
+
+## Questions
+- First concrete question?
+- Second concrete question?
+MD
+peers research . --modalities codebase,web
+```
+
+| Argument | Meaning |
+|---|---|
+| `repo` (positional) | path to the git repository (must hold `TOPIC.md`) |
+| `--modalities <list>` | comma-separated evidence modalities: `codebase` (default) and/or `web` |
+| `--peer <name>` | which configured peer drives the agent (default: first peer) |
+
+`codebase` corroborates claims from the repo itself; add `web` to let the
+agent cite primary-source URLs. Every load-bearing claim in `RESEARCH.md`
+is citation-gated — uncorroborated claims are dropped, never guessed.
 
 ---
 

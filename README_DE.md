@@ -155,6 +155,73 @@ peers-ctl new myfeature --container --modes=implement --plan ./PLAN.md
 
 `peers-ctl modes list` zeigt immer den aktuellen eingebauten Satz.
 
+## Operator-Workflows — `develop` und `research`
+
+Neben der stapelbaren `--modes=…`-Audit-Loop bringt `peers` zwei
+**One-Shot-Workflows** mit, die direkt über die innere `peers`-CLI laufen
+(nicht über `peers-ctl new`). Beide arbeiten auf einem einzelnen Git-Repo,
+das bereits einen konfigurierten Peer in `.peers/config.yaml` hat — sonst
+einmal `peers init` —, steuern diesen Peer und legen ihr Ergebnis auf deinem
+**aktuellen Branch** ab: kein Controller, kein langlebiges Run-Verzeichnis.
+
+### `peers develop` — dieses Repo autonom verbessern
+
+Auditiert das Repo entlang der genannten Dimensionen, **friert aus den
+übrig gebliebenen Findings einen Implement-Vertrag ein** und konvergiert
+diesen zu einem **attestierten Commit** — dieselbe Blind-Review- +
+Akzeptanz-Gate-Maschinerie wie `implement`, nur dass der Plan aus dem Audit
+erzeugt wird statt aus einer handgeschriebenen `PLAN.md`.
+
+```sh
+cd /pfad/zu/deinem-repo
+peers init                       # einmalig, falls .peers/ fehlt
+peers develop . --dimensions correctness,security,perf
+```
+
+| Argument | Bedeutung |
+|---|---|
+| `repo` (positional) | Pfad zum Ziel-Git-Repository |
+| `--dimensions` (Pflicht) | kommaseparierte Audit-Dimensionen, z. B. `correctness,security,perf` |
+| `--peer <name>` | welcher konfigurierte Peer den Agenten treibt (Default: erster Peer in `.peers/config.yaml`) |
+| `--convergence-budget <N>` | max. Implement-Versuche pro Vertrag, bevor aufgegeben wird (Default: 5) |
+
+Für „finden UND fixen": Dimensionen wählen, weggehen, den attestierten
+Commit reviewen, den es landet.
+
+### `peers research` — zitierten Report aus einer `TOPIC.md` synthetisieren
+
+Liest eine vom Operator verfasste **`TOPIC.md`** (ein `## Scope` +
+`## Questions`-Brief) im Repo-Root, zerlegt sie in Teilfragen, sweept die
+aktivierten Evidenz-Modalitäten nach belegenden Quellen und synthetisiert
+eine **zitierte `RESEARCH.md`** aus den bestätigten Behauptungen — auf
+deinen aktuellen Branch. Es ist ein generischer WISSENS-Workflow: ein
+nicht-sicherheitsbezogenes Thema („Pflanzen klonen in Alaska") ist
+erlaubt. Bricht GESCHLOSSEN ab bei fehlender/ungültiger `TOPIC.md`.
+
+```sh
+cd /pfad/zu/deinem-repo
+cat > TOPIC.md <<'MD'
+## Scope
+Was beantwortet werden soll und die Grenzen der Frage.
+
+## Questions
+- Erste konkrete Frage?
+- Zweite konkrete Frage?
+MD
+peers research . --modalities codebase,web
+```
+
+| Argument | Bedeutung |
+|---|---|
+| `repo` (positional) | Pfad zum Git-Repository (muss `TOPIC.md` enthalten) |
+| `--modalities <liste>` | kommaseparierte Evidenz-Modalitäten: `codebase` (Default) und/oder `web` |
+| `--peer <name>` | welcher konfigurierte Peer den Agenten treibt (Default: erster Peer) |
+
+`codebase` belegt Behauptungen aus dem Repo selbst; `web` ergänzen, damit
+der Agent Primärquellen-URLs zitiert. Jede tragende Behauptung in
+`RESEARCH.md` ist zitations-gegated — unbelegte Behauptungen werden
+verworfen, nie geraten.
+
 ## Mehrere Projekte — `peers-ctl`
 
 `peers-ctl` ist der Host-seitige Controller, der mehrere Peers-Loops

@@ -29,9 +29,9 @@ def test_peers_version_module_attr_matches_pyproject():
     assert peers.__version__ == _pyproject_version()
 
 
-def test_release_version_is_1_6_7():
+def test_release_version_is_1_6_8():
     import peers
-    assert peers.__version__ == "1.6.7"
+    assert peers.__version__ == "1.6.8"
 
 
 def test_peers_ctl_version_module_attr_matches_pyproject():
